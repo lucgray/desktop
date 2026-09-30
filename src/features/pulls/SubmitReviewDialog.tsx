@@ -1,0 +1,283 @@
+import { useEffect, useId, useRef, useState } from "react";
+import { toast } from "sonner";
+import { DIALOG_SCROLL_X_HIDDEN } from "@/components/dialog-scroll";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { MarkdownEditor } from "@/components/markdown-editor";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Radio, RadioGroup } from "@/components/ui/radio-group";
+import type { ReviewVerdict } from "@/lib/git/api";
+import { useSubmitReview } from "@/lib/git/queries";
+import type { DraftCommentIn, RemoteLens } from "@/lib/git/types";
+import {
+  useClearReviewDrafts,
+  useReviewDrafts,
+} from "@/lib/pulls/review-drafts";
+import { errorMessage } from "@/lib/tauri/invoke";
+import { toastError } from "@/lib/toast";
+import { cn } from "@/lib/utils";
+import { useTranslation } from "@/lib/i18n";
+
+/**
+ * One verdict option. An unavailable verdict stays VISIBLE and disabled, its reason
+ * taking the hint's place — the radio twin of `DisabledReasonButton` (wrapper title +
+ * `aria-describedby`), except the reason renders visibly: a natively-disabled radio
+ * can't take focus, so a hover-only tooltip would reach neither keyboard nor AT users.
+ */
+function VerdictOption({
+  value,
+  label,
+  hint,
+  reason,
+}: {
+  value: ReviewVerdict;
+  label: string;
+  /** What choosing this verdict does — shown when it's available. */
+  hint: string;
+  /** Why it isn't available; absent when it is. */
+  reason?: string;
+}) {
+  const hintId = useId();
+  return (
+    <label
+      className={cn(
+        "flex items-center gap-2",
+        reason ? "cursor-not-allowed text-muted-foreground" : "cursor-pointer",
+      )}
+      title={reason}
+    >
+      <Radio
+        value={value}
+        disabled={Boolean(reason)}
+        aria-describedby={hintId}
+      />
+      {label}
+      <span id={hintId} className="text-muted-foreground">
+        — {reason ?? hint}
+      </span>
+    </label>
+  );
+}
+
+/**
+ * The submit-a-review dialog: a verdict radio (Comment always; Approve / Request
+ * changes disabled-with-reason until the provider allows them), an optional summary
+ * (REQUIRED for Request changes), and a submit that posts the pending drafts as
+ * one batch review. On success it clears the drafts, closes, and toasts the
+ * posted count; on error it stays open and surfaces the error verbatim (it may
+ * disclose partial posting on GitLab/Bitbucket, so it's shown untruncated).
+ * Usable with zero drafts too (a plain verdict + summary review).
+ */
+export function SubmitReviewDialog({
+  repoPath,
+  number,
+  open,
+  onOpenChange,
+  caps,
+  remoteLabel,
+  lens,
+}: {
+  repoPath: string;
+  number: number;
+  open: boolean;
+  onOpenChange: (o: boolean) => void;
+  caps: { canApprove: boolean; canRequestChanges: boolean };
+  remoteLabel: string;
+  /** The origin|upstream lens the parent PR view resolved. */
+  lens: RemoteLens;
+}) {
+  const { t } = useTranslation();
+  const drafts = useReviewDrafts(repoPath, lens, number);
+  const submitReview = useSubmitReview(repoPath, lens);
+  // Silent: the post already landed by the time this runs, so a clear failure is
+  // reported below in words that say the drafts are still safe — not as a bare error.
+  const clearDrafts = useClearReviewDrafts(repoPath, lens, number, {
+    silent: true,
+  });
+  const [verdict, setVerdict] = useState<ReviewVerdict>("comment");
+  const [summary, setSummary] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  // The parent re-keys this dialog on the PR identity, so a switch can unmount it
+  // mid-submit — past `handleOpenChange`'s pending guard. That takes away BOTH of
+  // this component's report channels: the inline error below has nowhere to render
+  // (hence the catch's toast fallback), and react-query stops delivering `mutate`
+  // callbacks once the observer loses its listeners (hence `mutateAsync` in the
+  // cleanup). Either loss would let a failed or PARTIAL post read as success.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  const draftList = drafts.data ?? [];
+  const count = draftList.length;
+  // Clamp to a verdict whose radio is actually offered: a stale
+  // `approve`/`request_changes` (e.g. caps changed while the dialog was closed,
+  // or the option was never shown) must never submit. Comment is always offered.
+  const verdictOffered =
+    verdict === "comment" ||
+    (verdict === "approve" && caps.canApprove) ||
+    (verdict === "request_changes" && caps.canRequestChanges);
+  const effectiveVerdict: ReviewVerdict = verdictOffered ? verdict : "comment";
+  // Request changes must say why — GitHub/GitLab reject an empty-body one.
+  const summaryRequired = effectiveVerdict === "request_changes";
+  const summaryMissing = summaryRequired && summary.trim() === "";
+  const pending = submitReview.isPending || clearDrafts.isPending;
+  // Both verdicts are gated on the same thing (`usePrCapabilities`): the host's
+  // approve / request-changes wiring, which reads as unavailable until the forge
+  // connection resolves. One reason serves both, and "connects" holds in every
+  // reachable state: GitLab and Bitbucket both implement the verdicts
+  // (forge/model.rs `for_provider`), so a false cap on them means disconnected,
+  // and GitHub never reaches the disabled arm (`canWrite ||` at the call site).
+  const unavailable = `available once GitDesktop connects to ${remoteLabel}`;
+
+  // Reset transient state whenever the dialog closes (for ANY reason — Cancel,
+  // Esc, backdrop, or a successful submit), so a reopen never shows a stale
+  // verdict/summary/error. Blocked while a submit is in flight.
+  function handleOpenChange(next: boolean) {
+    if (pending) return;
+    if (!next) {
+      setVerdict("comment");
+      setSummary("");
+      setError(null);
+    }
+    onOpenChange(next);
+  }
+
+  async function submit() {
+    if (summaryMissing || pending) return;
+    setError(null);
+    const comments: DraftCommentIn[] = draftList.map((d) => ({
+      path: d.path,
+      line: d.line,
+      side: d.side,
+      ...(d.startLine ? { startLine: d.startLine } : {}),
+      body: d.body,
+    }));
+    let result: Awaited<ReturnType<typeof submitReview.mutateAsync>>;
+    try {
+      result = await submitReview.mutateAsync({
+        number,
+        verdict: effectiveVerdict,
+        summary: summary.trim() || undefined,
+        comments,
+      });
+    } catch (e) {
+      // The post itself failed — keep the dialog open, Submit re-armed, and show
+      // the message verbatim (on GitLab/Bitbucket it can disclose partial posting,
+      // which the user needs to see in full). Unmounted mid-submit, that surface is
+      // gone, so the failure rides a toast rather than vanishing.
+      if (mounted.current) {
+        setError(errorMessage(e));
+      } else {
+        toastError(e);
+      }
+      return;
+    }
+    // The review posted. From here Submit must NEVER re-arm — a second click
+    // would double-post the batch. Always close + confirm, regardless of what
+    // clearing the local drafts does next.
+    handleOpenChange(false);
+    toast.success(t("pullDetail.submittedReviewCount", { count: result.posted, host: remoteLabel }));
+    // Clearing the (client-only) drafts is a best-effort cleanup AFTER the post
+    // landed; a failure here can't un-post, so surface it as a non-blocking
+    // warning pointing at the pending bar's Discard — never as a submit error.
+    clearDrafts
+      .mutateAsync()
+      .catch(() =>
+        toast.warning(
+          t("pullDetail.clearDraftsFailed"),
+        ),
+      );
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent className="grid max-h-[85vh] sm:max-w-md">
+        <DialogHeader className="min-w-0">
+          <DialogTitle>{t("pullRequests.submitReview")}</DialogTitle>
+          <DialogDescription>
+            {count > 0
+              ? t("pullDetail.reviewSubmitDescriptionWithComments", { count, host: remoteLabel })
+              : t("pullDetail.reviewSubmitDescriptionNoComments", { host: remoteLabel })}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className={cn(DIALOG_SCROLL_X_HIDDEN, "min-w-0 space-y-3")}>
+          <RadioGroup
+            value={effectiveVerdict}
+            onValueChange={(v) => setVerdict(v as ReviewVerdict)}
+            className="gap-2 text-xs"
+          >
+            <VerdictOption
+              value="comment"
+              label={t("pullRequests.comment")}
+              hint={t("pullDetail.leaveFeedbackNoApproval")}
+            />
+            <VerdictOption
+              value="approve"
+              label={t("pullRequests.approve")}
+              hint={t("pullDetail.approveChanges")}
+              reason={caps.canApprove ? undefined : unavailable}
+            />
+            <VerdictOption
+              value="request_changes"
+              label={t("pullRequests.requestChanges")}
+              hint={t("pullDetail.askForChangesBeforeMerge")}
+              reason={caps.canRequestChanges ? undefined : unavailable}
+            />
+          </RadioGroup>
+
+          <MarkdownEditor
+            aria-label={t("pullRequests.reviewSummary")}
+            placeholder={
+              summaryRequired
+                ? t("pullRequests.summaryRequiredPlaceholder")
+                : t("pullRequests.summaryOptionalPlaceholder")
+            }
+            value={summary}
+            onChange={setSummary}
+            rows={4}
+            textareaClassName="max-h-48 min-h-20 resize-y"
+          />
+
+          {error && (
+            <p className="whitespace-pre-wrap break-words text-destructive">
+              {error}
+            </p>
+          )}
+        </div>
+
+        <DialogFooter>
+          <Button
+            variant="outline"
+            disabled={pending}
+            onClick={() => handleOpenChange(false)}
+          >
+            {t("common.cancel")}
+          </Button>
+          <DisabledReasonButton
+            disabled={summaryMissing || pending}
+            reason={
+              summaryMissing
+                ? t("pullDetail.summaryRequiredForChanges")
+                : undefined
+            }
+            onClick={submit}
+          >
+            {t("pullDetail.submitReview")}
+          </DisabledReasonButton>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}

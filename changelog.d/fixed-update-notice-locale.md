@@ -1,0 +1,1 @@
+- Update notices now follow the selected interface language, including when the language changes while a notice is visible.

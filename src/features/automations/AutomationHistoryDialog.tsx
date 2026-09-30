@@ -1,0 +1,935 @@
+import {
+  ArrowCounterClockwiseIcon,
+  ArrowsClockwiseIcon,
+  GitCommitIcon,
+  GitPullRequestIcon,
+  InfoIcon,
+  LightningIcon,
+  MagnifyingGlassIcon,
+  PlayIcon,
+  WarningIcon,
+} from "@phosphor-icons/react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  type KeyboardEvent,
+  type ReactNode,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { create } from "zustand";
+import { ListRowSkeletons } from "@/components/list-row-skeleton";
+import { RelativeTime } from "@/components/relative-time";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  type AutomationHistoryEntry,
+  type AutomationOutcomeCode,
+  type AutomationTrigger,
+  automationHistoryKey,
+  listAutomationHistory,
+  recordAutomationPauseMarker,
+  STEADY_OUTCOME_CODES,
+} from "@/lib/automations/history";
+import { useAutomations } from "@/lib/automations/queries";
+import { openAutomationResult } from "@/lib/automations/results";
+import {
+  type ActionId,
+  effectiveActions,
+  LIFECYCLE_EVENTS,
+  repoEntry,
+} from "@/lib/automations/types";
+import { clipTitle, clipTitleFromText } from "@/lib/clip-title";
+import { useRepoIdentity } from "@/lib/git/queries";
+import { repoIdentity } from "@/lib/git/repo-identity";
+import { useModalGateRegistration } from "@/lib/hotkeys/modal-gate";
+import { listKeyboardNav } from "@/lib/list-keyboard-nav";
+import { applyRepoLens } from "@/lib/repo-lens/queries";
+import { useAiEnabled, useSettings } from "@/lib/settings/queries";
+import { useReviewTasks } from "@/lib/stores/reviews";
+import { useUiStore } from "@/lib/stores/ui";
+import { useTranslation, type TranslationKey } from "@/lib/i18n";
+import { COLD_START_AUTOMATIONS_OFF } from "@/lib/test-mode";
+import { validEpochMs } from "@/lib/time";
+import { useRetained } from "@/lib/use-retained";
+import { cn } from "@/lib/utils";
+
+interface AutomationHistoryDialogState {
+  /** Repo path whose history is open, or null when closed. */
+  openFor: string | null;
+  open: (repoPath: string) => void;
+  close: () => void;
+}
+
+/** Open-state for the one mounted {@link AutomationHistoryDialogHost} (the
+ *  AutomationResultDialog precedent), so any surface — the repo menu, the
+ *  activity dock's footer — opens it without threading props or a second mount. */
+export const useAutomationHistoryDialog =
+  create<AutomationHistoryDialogState>()((set) => ({
+    openFor: null,
+    open: (repoPath) => set({ openFor: repoPath }),
+    close: () => set({ openFor: null }),
+  }));
+
+type TargetKind = AutomationHistoryEntry["targetKind"];
+type Outcome = AutomationHistoryEntry["outcomes"][number];
+type Tone = "success" | "destructive" | "warning" | "info" | "muted";
+
+/** Tone → semantic token. Always applied to the WORDS of a reason line, never to
+ *  the row's glyph, so no state is carried by color alone (WCAG AA). */
+const TONE_CLASS: Record<Tone, string> = {
+  success: "text-success",
+  destructive: "text-destructive",
+  warning: "text-warning",
+  info: "text-info",
+  muted: "text-muted-foreground",
+};
+
+/** Glyph per trigger — the shape says what fired. Read with a plain string from
+ *  the log, so an entry written by a newer build must miss into the fallback
+ *  rather than fail. */
+const TRIGGER_GLYPH: Partial<Record<AutomationTrigger, typeof LightningIcon>> =
+  {
+    commit: GitCommitIcon,
+    "pr-open": GitPullRequestIcon,
+    "pr-sync": ArrowsClockwiseIcon,
+    "catch-up": MagnifyingGlassIcon,
+    "run-now": PlayIcon,
+    "re-run": ArrowCounterClockwiseIcon,
+  };
+
+/** Where a delivered result landed, which is a property of the target, not of
+ *  the outcome code. */
+const DELIVERED_TEXT: Record<TargetKind, TranslationKey> = {
+  remote: "automationUi.postedComment",
+  local: "automationUi.postedComment",
+  commit: "automationUi.reviewSaved",
+  none: "automationUi.delivered",
+};
+
+interface ReasonLine {
+  text: string;
+  tone: Tone;
+}
+
+const UNKNOWN_REASON: ReasonLine = { text: "", tone: "muted" };
+
+/**
+ * Reason copy + tone per outcome code, total over the union so a code added
+ * later can't render as silence. `delivered` reads the entry (where the output
+ * went); `started` reads `live` — whether THIS instance holds a running run for
+ * the row's target.
+ */
+const OUTCOME_REASON: Record<
+  AutomationOutcomeCode,
+  (entry: AutomationHistoryEntry, outcome: Outcome, live: boolean, t: (key: TranslationKey, values?: Record<string, string | number>) => string) => ReasonLine
+> = {
+  delivered: (entry) => ({
+    text: DELIVERED_TEXT[entry.targetKind] ?? "automationUi.delivered",
+    tone: "success",
+  }),
+  // Liveness, never the clock: instances share this store, so a row's age says
+  // nothing about whether its run is still going. "Running" is claimed only
+  // where this instance can show the row it points at; everything else — a
+  // crash mid-run, or a run another instance owns and will still post — is the
+  // same honest statement about the RECORD, which never settled.
+  started: (entry, _outcome, live) =>
+    live
+      ? { text: "automationUi.runningWatchActivity", tone: "info" }
+      : {
+          // Commit runs register a degenerate live target (no commit kind, empty
+          // ref), so their rows can never match liveness — the honest set for
+          // them includes "still running here".
+          text:
+            entry.targetKind === "commit"
+              ? "automationUi.unsettledCommit"
+              : "automationUi.unsettledOther",
+          tone: "warning",
+        },
+  "branch-skip": () => ({
+    text: "automationUi.skippedBranchConditions",
+    tone: "muted",
+  }),
+  "needs-first-review": () => ({
+    text: "automationUi.skippedFirstReview",
+    tone: "muted",
+  }),
+  "head-covered": () => ({
+    text: "automationUi.skippedCovered",
+    tone: "muted",
+  }),
+  "head-dismissed": () => ({
+    text: "automationUi.skippedDismissed",
+    tone: "muted",
+  }),
+  "already-reviewed": () => ({
+    text: "automationUi.skippedAlreadyReviewed",
+    tone: "muted",
+  }),
+  "draft-skipped": () => ({
+    text: "automationUi.skippedDraft",
+    tone: "muted",
+  }),
+  // The recorder attaches a detail when it could NOT measure the PR's age, so
+  // the 14-day claim is only made where an age was actually read.
+  "too-old": (_entry, outcome) => ({
+    text: asText(outcome.detail) || "automationUi.skippedTooOld",
+    tone: "muted",
+  }),
+  "empty-diff": () => ({
+    text: "automationUi.skippedEmptyDiff",
+    tone: "muted",
+  }),
+  cancelled: () => ({ text: "automationUi.cancelled", tone: "muted" }),
+  // Not an ending: the run holding the claim is producing this review, so the
+  // "Skipped — " grammar the other skips share would read as a dead end.
+  "claim-held": () => ({
+    text: "automationUi.handedOff",
+    tone: "muted",
+  }),
+  // The Run-now toast sends users HERE for the error, so the recorded detail
+  // must render (the row truncates with a full-text hover tooltip).
+  "eligibility-error": (_entry, outcome) => ({
+    text: asText(outcome.detail)
+      ? `automationUi.historyReadFailedDetail|${asText(outcome.detail)}`
+      : "automationUi.historyReadFailed",
+    tone: "warning",
+  }),
+  failed: (_entry, outcome) => ({
+    text: asText(outcome.detail)
+      ? `automationUi.failedDetail|${asText(outcome.detail)}`
+      : "automationUi.failed",
+    tone: "destructive",
+  }),
+  "timed-out": () => ({
+    text: "automationUi.timedOutPartial",
+    tone: "destructive",
+  }),
+  paused: () => ({
+    text: "automationUi.aiHidden",
+    tone: "muted",
+  }),
+  resumed: () => ({
+    text: "automationUi.aiShown",
+    tone: "muted",
+  }),
+};
+
+/** Latched (PR, head) pairs the poller won't return to AND the user can act on.
+ *  `claim-held` latches too but is excluded — the run holding the claim is
+ *  producing the review, so the footer would read as a dead end. */
+const LATCHING_CODES = new Set<string>(["eligibility-error", "failed"]);
+
+/** Every field below is read back from a JSON file a user can hand-edit, so a
+ *  non-string reaches JSX as an object React refuses to render. */
+function asText(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+/** A stamp's epoch-ms, or null when it isn't a date `RelativeTime` can render —
+ *  a hand-edited value must drop its cell, not take down the dialog. */
+function stampMs(ts: string): number | null {
+  const ms = new Date(asText(ts)).getTime();
+  return validEpochMs(ms) ? ms : null;
+}
+
+/** Coalesced-entry count, floored at 1 — a hand-edited or absent value must read
+ *  as a single event, never as a negative or fractional one. */
+function asCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 1
+    ? Math.floor(value)
+    : 1;
+}
+
+function actionLabel(
+  action: ActionId | null,
+  t: (key: TranslationKey) => string,
+): string {
+  // A row can record a decision that belongs to no single action (a marker, a
+  // whole-event skip), and the stored id may be one this build doesn't know.
+  const key = action === "general"
+    ? "automationUi.reviewAction"
+    : action === "security"
+      ? "automationUi.securityAction"
+      : "automationUi.title";
+  return t(key);
+}
+
+/**
+ * Row glyph. Target kind decides first: a pause marker is stored with the
+ * user-initiated trigger, and a Play glyph would claim a run that never was.
+ * The trigger lookup is OWN-property only — a hand-edited `"__proto__"` would
+ * otherwise resolve up the prototype chain to a truthy non-component that `??`
+ * can't catch and JSX throws on. (`action` and `targetKind` are
+ * membership-validated at the store's guard, so their Record lookups stay plain.)
+ */
+function glyphFor(entry: AutomationHistoryEntry): typeof LightningIcon {
+  if (entry.targetKind === "none") return LightningIcon;
+  if (!Object.hasOwn(TRIGGER_GLYPH, entry.trigger)) return LightningIcon;
+  return TRIGGER_GLYPH[entry.trigger] ?? LightningIcon;
+}
+
+/**
+ * One outcome's reason line. Own-property only, for the same reason
+ * {@link glyphFor} is: a hand-edited code resolves up the prototype chain
+ * otherwise — `"__proto__"` to a non-function the optional call throws on,
+ * `"toString"` to a real function that returns a string and renders as blanks.
+ */
+function reasonFor(
+  entry: AutomationHistoryEntry,
+  outcome: Outcome,
+  live: boolean,
+  t: (key: TranslationKey, values?: Record<string, string | number>) => string,
+): ReasonLine {
+  if (!Object.hasOwn(OUTCOME_REASON, outcome.code)) return { ...UNKNOWN_REASON, text: t("automationUi.unknown") };
+  const reason = OUTCOME_REASON[outcome.code]?.(entry, outcome, live, t) ?? UNKNOWN_REASON;
+  if (reason.text.includes("|")) {
+    const [key, detail] = reason.text.split("|", 2);
+    return { ...reason, text: t(key as TranslationKey, { detail }) };
+  }
+  return reason.text.startsWith("automationUi.")
+    ? { ...reason, text: t(reason.text as TranslationKey) }
+    : reason;
+}
+
+/**
+ * The stored result this outcome can open, or null. Only a commit review has a
+ * record of its own, and only where the run got far enough to write one — a
+ * delivered review, or a timed-out run whose partial was kept. Untrusted like
+ * every other stored field: a hand-edited non-string (or an empty id, which
+ * could only ever dead-end) renders no affordance rather than a dead click.
+ */
+function viewableResultId(
+  entry: AutomationHistoryEntry,
+  outcome: Outcome,
+): string | null {
+  if (entry.targetKind !== "commit") return null;
+  if (outcome.code !== "delivered" && outcome.code !== "timed-out") return null;
+  // Trimmed for the emptiness test only — an id is opaque and matched exactly,
+  // so what gets returned is the stored string itself.
+  return typeof outcome.resultId === "string" && outcome.resultId.trim() !== ""
+    ? outcome.resultId
+    : null;
+}
+
+/** Self-contained button label: "View result" alone is ambiguous in a list, and
+ *  two of these can sit on one row. The visible label leads, contiguous and
+ *  unmodified, so speech input can address the button by what it reads (WCAG
+ *  2.5.3). A commit made on a detached HEAD with no subject titles as "", where
+ *  the comma join would trail against nothing. */
+function viewResultLabel(
+  action: ActionId | null,
+  title: string,
+  t: (key: TranslationKey, values?: Record<string, string | number>) => string,
+): string {
+  return t("automationUi.resultLabel", {
+    action: actionLabel(action, t),
+    titlePart: title ? `, ${title}` : "",
+  });
+}
+
+/** Marker rows carry no target, so their title comes from what was recorded. */
+function markerTitle(
+  outcomes: Outcome[],
+  t: (key: TranslationKey) => string,
+): string {
+  if (outcomes.some((o) => o.code === "resumed")) return t("automationUi.resumedTitle");
+  if (outcomes.some((o) => o.code === "paused")) return t("automationUi.pausedTitle");
+  return t("automationUi.title");
+}
+
+const TITLE_FOR: Record<
+  TargetKind,
+  (entry: AutomationHistoryEntry, outcomes: Outcome[], t: (key: TranslationKey) => string) => string
+> = {
+  remote: (entry) => {
+    const title = asText(entry.title);
+    const ref = asText(entry.ref);
+    return title ? `#${ref} · ${title}` : `#${ref}`;
+  },
+  local: (entry) => asText(entry.title),
+  commit: (entry) => {
+    const title = asText(entry.title);
+    // ref is the BRANCH, which a commit made on a detached HEAD records as ""
+    // — the separator must not render against an empty side.
+    const ref = asText(entry.ref);
+    if (!title) return ref;
+    return ref ? `${ref} · ${title}` : title;
+  },
+  none: (_entry, outcomes, t) => markerTitle(outcomes, t),
+};
+
+/** A coalesced row must read as a summary, not as one event: commit rows count
+ *  the commits inside the skip, PR rows count the times the same decision
+ *  recurred for one pull request. Only steady outcomes coalesce, so only they
+ *  carry the count into their words. */
+function joinCount(
+  text: string,
+  count: number,
+  kind: TargetKind,
+  code: AutomationOutcomeCode,
+  t: (key: TranslationKey, values?: Record<string, string | number>) => string,
+): string {
+  if (count <= 1 || !STEADY_OUTCOME_CODES.includes(code)) return text;
+  if (kind !== "commit") return t("automationUi.coalescedCount", { text, count });
+  const isSkipped = [
+    "branch-skip",
+    "needs-first-review",
+    "head-covered",
+    "head-dismissed",
+    "already-reviewed",
+    "draft-skipped",
+    "too-old",
+    "empty-diff",
+  ].includes(code);
+  if (isSkipped)
+    return t("automationUi.coalescedCommits", { count, text });
+  return t("automationUi.coalescedCommitCount", { text, count });
+}
+
+type BannerTone = "info" | "warning";
+
+const BANNER_CLASS: Record<BannerTone, string> = {
+  info: "bg-info/10 text-info",
+  warning: "bg-warning/10 text-warning",
+};
+
+const BANNER_GLYPH: Record<BannerTone, typeof InfoIcon> = {
+  info: InfoIcon,
+  warning: WarningIcon,
+};
+
+/** A present-tense state, in the layout flow above the records — it pushes the
+ *  list down rather than covering any of it. */
+function Banner({ tone, children }: { tone: BannerTone; children: ReactNode }) {
+  const Glyph = BANNER_GLYPH[tone];
+  return (
+    <p
+      className={cn(
+        "flex items-start gap-1.5 border-b px-3 py-1.5 text-[11px]",
+        BANNER_CLASS[tone],
+      )}
+    >
+      <Glyph className="mt-px size-3.5 shrink-0" weight="fill" />
+      <span className="min-w-0">{children}</span>
+    </p>
+  );
+}
+
+/**
+ * What this repository's automations ran, skipped, and why — the durable
+ * decision log, read-only. Mounted once at the app root and opened by store
+ * flag, so the repo menu and the activity dock share one instance.
+ *
+ * Historical rows carry no actions: a record is evidence, and re-running from
+ * one would spend money and post publicly from a surface that reads as a log.
+ */
+export function AutomationHistoryDialogHost() {
+  const { t } = useTranslation();
+  const openFor = useAutomationHistoryDialog((s) => s.openFor);
+  const close = useAutomationHistoryDialog((s) => s.close);
+  // Retained so the body keeps its repo through the close fade instead of
+  // blanking the dialog as it animates out.
+  const shownRepo = useRetained(openFor);
+  // App's repo/settings actions stay reachable from the macOS menu bar, which
+  // sits outside this dialog's modal overlay — register so they refuse while it
+  // owns the screen. Keyed on the live flag, not the retained one, so the close
+  // fade releases the gate.
+  useModalGateRegistration(openFor !== null);
+
+  // Mark the pause and the resume in the log itself, so a repository whose
+  // automations went quiet says why in line. It watches the SAVED setting, not
+  // a Settings draft, and lives on this always-mounted host rather than in the
+  // General panel — that panel only renders while it is the active one, so a
+  // flip saved from another panel would record nothing. The first observation
+  // seeds the ref: a mount is not a flip.
+  const savedHideAi = useSettings().data?.hideAi;
+  const recordedHideAi = useRef<boolean | undefined>(undefined);
+  useEffect(() => {
+    if (savedHideAi === undefined) return;
+    const previous = recordedHideAi.current;
+    recordedHideAi.current = savedHideAi;
+    if (previous === undefined || previous === savedHideAi) return;
+    // Fire-and-forget: a marker that can't be written must never surface as a
+    // failure of the settings save that triggered it.
+    void recordAutomationPauseMarker(savedHideAi).catch(() => undefined);
+  }, [savedHideAi]);
+
+  return (
+    <Dialog
+      open={openFor !== null}
+      onOpenChange={(open) => {
+        if (!open) close();
+      }}
+    >
+      {/* Capped flex column: the header stays pinned while the banners, the
+          config summary, and the records scroll as one body. */}
+      <DialogContent className="flex max-h-[85vh] flex-col sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{t("automationUi.historyTitle")}</DialogTitle>
+          <DialogDescription>
+            {t("automationUi.historyDescription")}
+          </DialogDescription>
+        </DialogHeader>
+        {shownRepo !== null && (
+          <AutomationHistoryBody
+            repoPath={shownRepo}
+            open={openFor !== null}
+            onClose={close}
+          />
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function AutomationHistoryBody({
+  repoPath,
+  open,
+  onClose,
+}: {
+  repoPath: string;
+  open: boolean;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const aiEnabled = useAiEnabled();
+  const queryClient = useQueryClient();
+  const reviewTasks = useReviewTasks();
+  const openPr = useUiStore((s) => s.openPr);
+  const openSettings = useUiStore((s) => s.openSettings);
+  const automations = useAutomations();
+  // Worktree-stable identity, so a worktree checkout reads the same overrides as
+  // its main checkout; the raw path stands in while it resolves, and stays in once
+  // the lookup has failed for good — until a remount refetches it.
+  const identity = useRepoIdentity(repoPath).data;
+  const history = useQuery({
+    queryKey: automationHistoryKey(repoPath),
+    queryFn: () => listAutomationHistory(repoPath),
+    enabled: open,
+    // Local reads must not park on react-query's default "online" mode offline;
+    // the same holds for every `networkMode` in this file.
+    networkMode: "always",
+  });
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+
+  // An entry with no id can't be keyed, focused, or arrow-navigated, so it is
+  // dropped rather than rendered into a list the keyboard can't address.
+  const rows = (history.data ?? []).filter(
+    (entry) => typeof entry?.id === "string" && entry.id !== "",
+  );
+
+  const config = automations.data;
+  const lifecycleRows = LIFECYCLE_EVENTS.map((lifecycle) => ({
+    lifecycle,
+    actions: config
+      ? effectiveActions(
+          config,
+          repoEntry(config, identity ?? repoPath, repoPath),
+          lifecycle,
+        )
+      : [],
+  }));
+  const anyEnabled = lifecycleRows.some((l) => l.actions.length > 0);
+
+  const newest = rows[0];
+  const newestStamp = newest && stampMs(newest.ts) !== null ? newest.ts : null;
+
+  // Live automation runs in this instance — same discriminator as reviews.ts'
+  // imperative `hasLiveAutomationRun` (phase + the automation-only `rerun`); a
+  // shared reactive hook is a homed backlog follow-up. Filtered BEFORE the
+  // signature so the query key churns only on runs that could match.
+  const liveTasks = reviewTasks.filter(
+    (t) =>
+      (t.phase === "running" || t.phase === "queued") && t.rerun !== undefined,
+  );
+  const liveSignature = liveTasks
+    .map(
+      (t) => `${t.target.repoPath}#${t.target.kind}#${t.target.ref}#${t.mode}`,
+    )
+    .join("|");
+  // Matched by worktree-stable IDENTITY, never raw path: linked worktrees of one
+  // repo share this history, so a run started in a worktree is live for the main
+  // checkout's dialog too. A query because identities resolve over IPC and render
+  // can't await one per task; the signature in the key is what keeps it reactive,
+  // so a run starting or settling re-resolves the set.
+  const liveKeys = useQuery({
+    queryKey: [
+      "automation-live-targets",
+      repoPath,
+      identity ?? repoPath,
+      liveSignature,
+    ],
+    queryFn: async () => {
+      // Both sides go through the same memoized resolver, so the comparison can
+      // never straddle a raw path and an identity.
+      const mine = await repoIdentity(repoPath);
+      const resolved = await Promise.all(
+        liveTasks.map(async (t) => ({
+          key: `${t.target.kind}#${t.target.ref}#${t.mode}`,
+          identity: await repoIdentity(t.target.repoPath),
+        })),
+      );
+      return resolved.filter((r) => r.identity === mine).map((r) => r.key);
+    },
+    enabled: open,
+    networkMode: "always",
+  }).data;
+  // Set built here, not returned from the query: structural sharing only
+  // recurses plain objects and arrays.
+  const liveTargets = new Set(liveKeys ?? []);
+  // Per OUTCOME, not per row: the outcome's action IS the run's mode, so an
+  // interrupted row can't light up because a NEW run for the same pull request
+  // is live. A null action (records are untrusted) matches nothing. Accepted
+  // residual: the live task carries no headSha, so two same-mode runs on one PR
+  // stay indistinguishable — head-granular matching needs the spine to register
+  // the head, and that follow-up is backlog-homed.
+  const isLive = (entry: AutomationHistoryEntry, action: ActionId | null) =>
+    action !== null &&
+    liveTargets.has(`${entry.targetKind}#${asText(entry.ref)}#${action}`);
+
+  const onListKeyDown = listKeyboardNav({
+    items: rows,
+    activeIndex: focusedId ? rows.findIndex((r) => r.id === focusedId) : -1,
+    onActivate: (entry) => setFocusedId(entry.id),
+    rowKey: (entry) => entry.id,
+  });
+
+  const openTarget = (entry: AutomationHistoryEntry) => {
+    onClose();
+    const kind = entry.targetKind === "remote" ? "remote" : "local";
+    // Land under the lens the record was written for. Every automation path is
+    // origin-pinned, so a remote row always names an origin pull request, and a
+    // fork sitting on the upstream lens would otherwise open upstream's
+    // same-numbered one. Session-only (`persist: false`): a click is navigation,
+    // not a choice of lens. REMOTE only — a local PR is lens-independent, so
+    // applying one there would be a side effect its navigation never implied.
+    // No selection clears: the same call selects this PR.
+    const applyLens =
+      kind === "remote"
+        ? () =>
+            applyRepoLens(queryClient, repoPath, "origin", {
+              clearSelections: false,
+              persist: false,
+            })
+        : undefined;
+    openPr({
+      kind,
+      repoPath,
+      repoName: repoPath.split(/[/\\]/).pop() ?? repoPath,
+      ref: asText(entry.ref),
+      section: null,
+      reviewId: null,
+      // Run inside openPr's view-transition callback, so the lens and the
+      // selection reach the same commit; applied here it would land a render
+      // early and fetch the new lens against the OLD number.
+      beforeSelect: applyLens,
+    });
+  };
+
+  // Close first, then open: both are dialogs, and the result must land on top of
+  // a settled stack rather than race the history dialog's close. The result
+  // dialog is mounted at the app root, so it opens for this row's repository
+  // whether or not it is the one in view.
+  const viewResult = (resultId: string) => {
+    onClose();
+    void openAutomationResult(repoPath, resultId);
+  };
+
+  return (
+    // Full-bleed to the dialog's edges so the banners read as strips and the
+    // rows as a list, not as inset cards.
+    <div className="-mx-4 -mb-4 min-h-0 flex-1 overflow-x-hidden overflow-y-auto border-t">
+      {COLD_START_AUTOMATIONS_OFF && (
+        <Banner tone="info">
+          {t("automationUi.coldStartOff")}
+        </Banner>
+      )}
+      {!aiEnabled && (
+        <Banner tone="info">
+          {t("automationUi.aiHiddenPaused")}
+        </Banner>
+      )}
+      {/* The effective config IS the answer to "why did nothing run for that
+          event" — stated once here rather than repeated on every absent row. */}
+      <div className="border-b px-3 py-2">
+        {lifecycleRows.map(({ lifecycle, actions }) => (
+          <p
+            key={lifecycle}
+            className="truncate text-[11px] text-muted-foreground"
+            onMouseEnter={clipTitleFromText}
+          >
+            <span className="font-medium">{t(lifecycle === "commit" ? "automationUi.lifecycleCommit" : lifecycle === "pr-open" ? "automationUi.lifecyclePrOpen" : "automationUi.lifecyclePrSync")}:</span>{" "}
+            {actions.length === 0
+              ? t("automationUi.off")
+              : actions.map((a) => actionLabel(a.action, t)).join(" + ")}
+          </p>
+        ))}
+      </div>
+      {rows.length > 0 && !anyEnabled && (
+        <Banner tone="warning">
+          {t("automationUi.noAutomationEnabled")}
+          {newestStamp ? (
+            <>
+              {" — the most recent decision here was recorded "}
+              <RelativeTime date={newestStamp} />
+              {"."}
+            </>
+          ) : (
+            "."
+          )}
+        </Banner>
+      )}
+      {history.isPending ? (
+        <ListRowSkeletons rows={4} lines={2} name="automation history" />
+      ) : (
+        <HistoryList
+          rows={rows}
+          anyEnabled={anyEnabled}
+          isLive={isLive}
+          onListKeyDown={onListKeyDown}
+          onOpenTarget={openTarget}
+          onViewResult={viewResult}
+          onFocusRow={setFocusedId}
+          onSetUp={() => {
+            onClose();
+            openSettings("automations");
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function HistoryList({
+  rows,
+  anyEnabled,
+  isLive,
+  onListKeyDown,
+  onOpenTarget,
+  onViewResult,
+  onFocusRow,
+  onSetUp,
+}: {
+  rows: AutomationHistoryEntry[];
+  anyEnabled: boolean;
+  /** Whether THIS instance holds a running/queued automation run for the row's
+   *  target in that outcome's mode. */
+  isLive: (entry: AutomationHistoryEntry, action: ActionId | null) => boolean;
+  onListKeyDown: (e: KeyboardEvent) => void;
+  onOpenTarget: (entry: AutomationHistoryEntry) => void;
+  onViewResult: (resultId: string) => void;
+  /** Seats the arrow-key cursor on a row the user reached with Tab, so the next
+   *  arrow steps from there rather than to the start or the end of the list. */
+  onFocusRow: (id: string) => void;
+  onSetUp: () => void;
+}) {
+  const { t } = useTranslation();
+  if (rows.length === 0) {
+    return (
+      <div className="px-3 pt-4 pb-6 text-center">
+        <p className="text-xs font-medium">
+          {anyEnabled
+            ? t("automationUi.noDecisions")
+            : t("automationUi.noRepoAutomations")}
+        </p>
+        {anyEnabled ? (
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {t("automationUi.decisionsAppear")}
+          </p>
+        ) : (
+          <Button
+            variant="outline"
+            size="xs"
+            className="mt-2"
+            onClick={onSetUp}
+          >
+            {t("automationUi.setUpAutomations")}
+          </Button>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    // Roving tabindex: the arrows walk the rows from this one container stop, so
+    // Tab doesn't step through fifty records. The View result buttons inside
+    // qualifying commit rows are native tab stops of their own.
+    <div
+      // The container is the tab stop, so it carries the name a reader hears on
+      // arrival; `group` is the generic role that can hold one.
+      role="group"
+      tabIndex={0}
+      aria-label={t("automationUi.recordedDecisions")}
+      className="outline-none"
+      onKeyDown={onListKeyDown}
+    >
+      {rows.map((entry) => (
+        <HistoryRow
+          key={entry.id}
+          entry={entry}
+          isLive={isLive}
+          onOpenTarget={onOpenTarget}
+          onViewResult={onViewResult}
+          onFocusRow={onFocusRow}
+        />
+      ))}
+    </div>
+  );
+}
+
+const ROW_CLASS =
+  "flex w-full items-start gap-2 border-b px-3 py-2 text-left outline-none focus-visible:bg-muted";
+
+function HistoryRow({
+  entry,
+  isLive,
+  onOpenTarget,
+  onViewResult,
+  onFocusRow,
+}: {
+  entry: AutomationHistoryEntry;
+  isLive: (entry: AutomationHistoryEntry, action: ActionId | null) => boolean;
+  onOpenTarget: (entry: AutomationHistoryEntry) => void;
+  onViewResult: (resultId: string) => void;
+  onFocusRow: (id: string) => void;
+}) {
+  const { t } = useTranslation();
+  const outcomes = Array.isArray(entry.outcomes) ? entry.outcomes : [];
+  const Glyph = glyphFor(entry);
+  const title =
+    TITLE_FOR[entry.targetKind]?.(entry, outcomes, t) ?? markerTitle(outcomes, t);
+  const count = asCount(entry.count);
+  const stamp = stampMs(entry.ts) !== null ? entry.ts : null;
+  // Only a pull request has somewhere to go; a commit or marker row would give
+  // Enter nothing to do, and a button that no-ops is worse than plain text. A
+  // REMOTE ref must be numeric to be addressable — a hand-edited junk ref would
+  // navigate to a NaN PR number — while local ids are opaque strings.
+  const navigable =
+    entry.targetKind === "local"
+      ? asText(entry.ref) !== ""
+      : entry.targetKind === "remote" && /^\d+$/.test(asText(entry.ref));
+  // The catch-up poller latches per (PR, head), so an anomalous outcome there
+  // is the end of the line until a push or a relaunch.
+  const latched =
+    entry.trigger === "catch-up" &&
+    outcomes.some((o) => LATCHING_CODES.has(o.code));
+
+  const body = (
+    <>
+      <Glyph className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+      <span className="min-w-0 flex-1">
+        <span
+          className="block truncate text-xs font-medium"
+          onMouseEnter={clipTitle(title)}
+        >
+          {title}
+        </span>
+        {outcomes.map((outcome, i) => {
+          const reason = reasonFor(
+            entry,
+            outcome,
+            isLive(entry, outcome.action),
+            t,
+          );
+          // Per outcome, not per row: one commit can settle a code review AND a
+          // security audit into the same row, and each keeps its own result.
+          const resultId = viewableResultId(entry, outcome);
+          return (
+            <span
+              // Index key: one entry's outcomes are a fixed list that never reorders.
+              key={i}
+              className="mt-0.5 flex items-start gap-1 text-[11px]"
+            >
+              {/* The truncating element owns the hover tooltip, so the button's
+                  label never joins the text a clipped line reports. */}
+              <span
+                className="min-w-0 flex-1 truncate"
+                onMouseEnter={clipTitleFromText}
+              >
+                <span className="text-muted-foreground">
+                  {actionLabel(outcome.action, t)} ·{" "}
+                </span>
+                <span className={TONE_CLASS[reason.tone]}>
+                  {joinCount(
+                    reason.text,
+                    count,
+                    entry.targetKind,
+                    outcome.code,
+                    t,
+                  )}
+                </span>
+              </span>
+              {/* Only commit outcomes qualify, and a commit row is never
+                  `navigable` — so this button can never nest inside the row's
+                  own <button> arm. */}
+              {resultId !== null && (
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  className="-my-0.5 shrink-0"
+                  aria-label={viewResultLabel(outcome.action, title, t)}
+                  // Tab can land here without the arrow cursor ever moving, and
+                  // an unseated cursor sends the next arrow to the start or the
+                  // end of the list, not to the neighboring row. Same state the
+                  // keyboard nav's onActivate writes.
+                  onFocus={() => onFocusRow(entry.id)}
+                  onClick={() => onViewResult(resultId)}
+                >
+                  {t("automationUi.viewResult")}
+                </Button>
+              )}
+            </span>
+          );
+        })}
+        {latched && (
+          <span className="mt-0.5 block text-[11px] text-muted-foreground">
+            {t("automationUi.noRetryUntilPush")}
+          </span>
+        )}
+      </span>
+      {/* A stamp only had to be a `string` to survive JSON, so an unparseable
+          one drops its cell rather than rendering "in NaN years". */}
+      {stamp && (
+        <span className="shrink-0 text-[11px] text-muted-foreground tabular-nums">
+          <RelativeTime date={stamp} />
+        </span>
+      )}
+    </>
+  );
+
+  // Both arms seat the cursor: a `tabIndex={-1}` row still takes focus on click,
+  // and an unseated cursor sends the next arrow to the start or the end of the
+  // list, not to the neighboring row. Idempotent against the keyboard nav, which
+  // focuses the row it just activated.
+  if (navigable) {
+    return (
+      <button
+        type="button"
+        data-row={entry.id}
+        tabIndex={-1}
+        onFocus={() => onFocusRow(entry.id)}
+        onClick={() => onOpenTarget(entry)}
+        className={cn(ROW_CLASS, "hover:bg-muted/60")}
+      >
+        {body}
+      </button>
+    );
+  }
+  return (
+    <div
+      data-row={entry.id}
+      tabIndex={-1}
+      onFocus={() => onFocusRow(entry.id)}
+      className={ROW_CLASS}
+    >
+      {body}
+    </div>
+  );
+}

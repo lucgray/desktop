@@ -1,0 +1,15 @@
+packages:
+  - "site"
+
+# Don't install versions published less than 3 days ago (4320 minutes), a
+# supply-chain safety delay. Dependabot's cooldown in .github/dependabot.yml
+# is the same idea on its own never-shorter schedule, not kept in step with it.
+minimumReleaseAge: 4320
+
+allowBuilds:
+  core-js: true
+  esbuild: true
+  sharp: true
+
+patchedDependencies:
+  "@git-diff-view/core@0.1.7": patches/@git-diff-view__core@0.1.7.patch

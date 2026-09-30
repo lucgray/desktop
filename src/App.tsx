@@ -1,0 +1,351 @@
+import { useQueryClient } from "@tanstack/react-query";
+import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
+import { ConfirmDialogHost } from "@/components/confirm-dialog-host";
+import { Spinner } from "@/components/ui/spinner";
+import { ReconnectDialog } from "@/features/accounts/ReconnectDialog";
+import { ActivityStrip } from "@/features/activity/ActivityDock";
+import { useMacAppMenu } from "@/features/app-menu/useMacAppMenu";
+import { AutomationHistoryDialogHost } from "@/features/automations/AutomationHistoryDialog";
+import { AutomationResultDialog } from "@/features/automations/AutomationResultDialog";
+import { ExploreScreen } from "@/features/explore/ExploreScreen";
+import { HelpScreen } from "@/features/help/HelpScreen";
+import { MyWorkScreen } from "@/features/mywork/MyWorkScreen";
+import { RepoNotificationsDialogHost } from "@/features/notifications/RepoNotificationsDialog";
+import { RepositoryView } from "@/features/repository/RepositoryView";
+import { usePickAndOpenRepo } from "@/features/repository/useOpenRepoByPath";
+import { SettingsScreen } from "@/features/settings/SettingsScreen";
+import { CommandPalette } from "@/features/shortcuts/CommandPalette";
+import { ShortcutsDialog } from "@/features/shortcuts/ShortcutsDialog";
+import { UpdateChecker } from "@/features/updates/UpdateChecker";
+import { WhatsNew } from "@/features/updates/WhatsNew";
+import { CloneRepoDialog } from "@/features/welcome/CloneRepoDialog";
+import { CreateRepoDialog } from "@/features/welcome/CreateRepoDialog";
+import { GitMissingScreen } from "@/features/welcome/GitMissingScreen";
+import { useRepoDrop } from "@/features/welcome/useRepoDrop";
+import { WelcomeScreen } from "@/features/welcome/WelcomeScreen";
+import { syncAnalytics, track } from "@/lib/analytics";
+import { useBackgroundPrSync } from "@/lib/automations/useBackgroundPrSync";
+import {
+  invalidateRepoOnFocus,
+  useGitInstalled,
+  usePrefetchMyWorkSources,
+} from "@/lib/git/queries";
+import { useHotkeyAction, useHotkeysListener } from "@/lib/hotkeys/hotkeys";
+import { useModalGateOpen } from "@/lib/hotkeys/modal-gate";
+import { MCP_WRITABLE_STORES } from "@/lib/mcp-writable-stores";
+import {
+  notificationsDraftOutOfSync,
+  useNotificationsDraft,
+  useRepoNotificationsDialog,
+} from "@/lib/notifications/matrix";
+import {
+  useApplyTheme,
+  useSaveSettings,
+  useSettings,
+} from "@/lib/settings/queries";
+import { useUiStore } from "@/lib/stores/ui";
+import { COLD_INSTANCE_ID, COLD_START } from "@/lib/test-mode";
+import { nextTheme, type ThemeSetting } from "@/lib/theme";
+import { translate, type TranslationKey } from "@/lib/i18n";
+import { useLatestRef } from "@/lib/use-latest-ref";
+
+function App() {
+  const view = useUiStore((s) => s.view);
+  const openSettings = useUiStore((s) => s.openSettings);
+  const openMcpBrowse = useUiStore((s) => s.openMcpBrowse);
+  const openHelp = useUiStore((s) => s.openHelp);
+  const openExplore = useUiStore((s) => s.openExplore);
+  const openMyWork = useUiStore((s) => s.openMyWork);
+  const toggleActivity = useUiStore((s) => s.toggleActivity);
+  const repoPath = useUiStore((s) => s.repoPath);
+  const openRepoNotifications = useRepoNotificationsDialog((s) => s.open);
+  const publishedNotificationsDraft = useNotificationsDraft((s) => s.signature);
+  const clearNotificationsDraft = useNotificationsDraft((s) => s.clear);
+  const gitInstalled = useGitInstalled();
+  const queryClient = useQueryClient();
+  const settings = useSettings();
+  const saveSettings = useSaveSettings();
+  const applyTheme = useApplyTheme();
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const pickAndOpen = usePickAndOpenRepo();
+  const [cloneOpen, setCloneOpen] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
+  // Screens with their own modals (e.g. Explore's clone dialog) register there.
+  const screenModalOpen = useModalGateOpen();
+  const dialogOpen = cloneOpen || createOpen || screenModalOpen;
+
+  useEffect(() => {
+    document.documentElement.lang = settings.data?.locale ?? "en";
+  }, [settings.data?.locale]);
+
+  // SettingsScreen publishes its notifications draft while it is up, and the
+  // verdict is screen-scoped: App owns the screen's lifetime, so leaving
+  // Settings retires it here.
+  useEffect(() => {
+    if (view !== "settings") clearNotificationsDraft();
+  }, [view, clearNotificationsDraft]);
+  const notificationsDraftHeld = notificationsDraftOutOfSync(
+    publishedNotificationsDraft,
+    settings.data?.notifications,
+  );
+
+  // The dialogs live above the view switch, so navigation doesn't unmount them
+  // (e.g. the clone dialog's "Open Settings → Accounts") — close them when the
+  // screen changes, or the new screen mounts behind a still-open modal.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `view` is an intentional close trigger, not read directly
+  useEffect(() => {
+    setCloneOpen(false);
+    setCreateOpen(false);
+  }, [view]);
+
+  // Show a one-time passive notice on first launch, letting users opt out.
+  const noticeShown = useRef(false);
+  // The notice lingers ~10s; read the LATEST settings at click/dismiss time (not
+  // the value frozen when it was shown) so a setting changed in the meantime
+  // isn't clobbered when we persist `seenAnalyticsNotice`.
+  const settingsRef = useLatestRef(settings.data);
+  useEffect(() => {
+    if (
+      !settings.data ||
+      noticeShown.current ||
+      settings.data.seenAnalyticsNotice ||
+      COLD_START
+    )
+      return;
+    noticeShown.current = true;
+    const persist = (extra?: { analyticsEnabled: false }) => {
+      const latest = settingsRef.current;
+      if (latest)
+        saveSettings.mutate({
+          ...latest,
+          ...extra,
+          seenAnalyticsNotice: true,
+        });
+    };
+    const locale = settingsRef.current?.locale ?? "en";
+    toast(translate(locale, "dataUi.app.analyticsTitle"), {
+      description: translate(locale, "dataUi.app.analyticsBody"),
+      duration: 10000,
+      action: {
+        label: translate(locale, "common.turnOff"),
+        onClick: () => persist({ analyticsEnabled: false }),
+      },
+      onDismiss: () => persist(),
+      onAutoClose: () => persist(),
+    });
+  }, [settings.data, saveSettings]);
+
+  // Reconcile analytics (events) + replay (opt-in) when either setting changes
+  // at runtime. main.tsx already initialized with the persisted values, so skip
+  // the first run to avoid a double-init, then reconcile on later changes.
+  const analyticsSynced = useRef(false);
+  useEffect(() => {
+    if (!settings.data) return;
+    const { analyticsEnabled, recordReplay } = settings.data;
+    if (!analyticsSynced.current) {
+      analyticsSynced.current = true;
+      return;
+    }
+    syncAnalytics(analyticsEnabled, recordReplay).catch(() => {
+      // Best-effort — analytics failures never surface to the user.
+    });
+  }, [settings.data]);
+
+  // Track screen changes.
+  useEffect(() => {
+    track({ name: "screen_viewed", properties: { screen: view } });
+  }, [view]);
+
+  // The backend owns the window-close behavior, so mirror the preference to it.
+  const closeToTray = settings.data?.closeToTray;
+  useEffect(() => {
+    if (closeToTray === undefined) return;
+    invoke("set_close_to_tray", { enabled: closeToTray }).catch(
+      () => undefined,
+    );
+  }, [closeToTray]);
+
+  // Drop a repo folder anywhere on the window to open it.
+  useRepoDrop();
+
+  // Keep pr-sync (auto re-review) automations firing for recent repos that
+  // AREN'T the one currently open — the active repo's own poller covers it, but
+  // this catches pushes to repos you've switched away from. Always mounted (any
+  // view, welcome included); no-op unless a recent repo carries a pr-sync rule.
+  useBackgroundPrSync();
+
+  // Warm the work inbox's sources probe here rather than on its first render:
+  // it reads two CLI configs plus the keyring over IPC, and paying for that at
+  // app open keeps it off the critical path of the welcome → My work jump.
+  usePrefetchMyWorkSources();
+
+  // The app-wide hotkey dispatcher plus the always-available actions.
+  useHotkeysListener();
+  // The macOS menu bar routes into the same action dispatch; inert elsewhere.
+  useMacAppMenu();
+  // Settings… is exposed in the macOS menu bar, which stays clickable on the
+  // git-missing screen — without the gate it would flip the view to a Settings
+  // screen that never renders, surfacing only after Retry.
+  useHotkeyAction(
+    "open-settings",
+    openSettings,
+    gitInstalled.isSuccess && !dialogOpen,
+  );
+  // App owns the three repo actions outright: they must work on every screen
+  // (Settings/Help/Explore mount neither the welcome list nor the repo
+  // switcher), and duplicate registrations would shadow by mount order.
+  // Disabled until git resolves — the dialogs render below the early returns,
+  // so a click before then would stash a stale `open` that pops later. Any open
+  // dialog suppresses all four: the native menu bar sits outside the webview's
+  // modal overlay, so a menu click there would stack a second.
+  useHotkeyAction(
+    "add-local-repository",
+    pickAndOpen,
+    gitInstalled.isSuccess && !dialogOpen,
+  );
+  useHotkeyAction(
+    "clone-repository",
+    () => setCloneOpen(true),
+    gitInstalled.isSuccess && !dialogOpen,
+  );
+  useHotkeyAction(
+    "new-repository",
+    () => setCreateOpen(true),
+    gitInstalled.isSuccess && !dialogOpen,
+  );
+  // Palette-only deep link; hidden alongside the panel when AI features are off.
+  useHotkeyAction(
+    "open-mcp-servers-settings",
+    () => openSettings("mcp-servers"),
+    !settings.data?.hideAi,
+  );
+  useHotkeyAction("browse-mcp-registry", openMcpBrowse, !settings.data?.hideAi);
+  useHotkeyAction(
+    "open-notifications-settings",
+    () => openSettings("notifications"),
+    gitInstalled.isSuccess && !dialogOpen,
+  );
+  // The palette closes before it dispatches, so both the repo and the settings
+  // draft are re-read at fire time rather than captured — the dialog's
+  // mint-on-match baseline is the SAVED matrix, so it must not open over a
+  // settings form still holding notification edits.
+  useHotkeyAction(
+    "open-repo-notification-settings",
+    () => {
+      const path = useUiStore.getState().repoPath;
+      if (!path) return;
+      if (
+        notificationsDraftOutOfSync(
+          useNotificationsDraft.getState().signature,
+          settings.data?.notifications,
+        )
+      )
+        return;
+      openRepoNotifications(path);
+    },
+    Boolean(repoPath) && !notificationsDraftHeld && !dialogOpen,
+  );
+  useHotkeyAction("show-help", openHelp);
+  useHotkeyAction("open-explore", openExplore);
+  useHotkeyAction("open-my-work", openMyWork);
+  useHotkeyAction("toggle-notifications", toggleActivity);
+  useHotkeyAction("show-shortcuts", () => setShortcutsOpen(true));
+  useHotkeyAction("command-palette", () => setPaletteOpen(true));
+  useHotkeyAction("cycle-theme", () => {
+    const current = settingsRef.current;
+    if (!current) return;
+    // Step System → Light → Dark → Slate. Shares useApplyTheme with the
+    // Appearance picker so both paths apply optimistically + persist identically.
+    const next = nextTheme(current.theme);
+    applyTheme(current, next);
+    const locale = current.locale ?? "en";
+    const themeKeys: Record<ThemeSetting, TranslationKey> = {
+      system: "appearanceHelp.themeSystem",
+      light: "appearanceHelp.themeLight",
+      dark: "appearanceHelp.themeDark",
+      slate: "appearanceHelp.themeSlate",
+    };
+    toast.success(
+      translate(locale, "appearanceHelp.themeToast", {
+        theme: translate(locale, themeKeys[next]),
+      }),
+    );
+  });
+
+  // The webview stays "visible" when the window loses focus, so TanStack's
+  // own focus refetch never fires in Tauri; bridge the native focus event.
+  // Board lenses a date-shift chase is reading are held (see the helper).
+  useEffect(() => {
+    const unlisten = getCurrentWindow().onFocusChanged(
+      ({ payload: focused }) => {
+        if (focused) {
+          invalidateRepoOnFocus(queryClient);
+          // The MCP server (with --allow-write) can mutate these store files on
+          // disk while we're unfocused; reload each from disk BEFORE invalidating
+          // so the refetch sees the external writes. Each store is independent.
+          for (const { reload, queryKey } of MCP_WRITABLE_STORES) {
+            reload()
+              .then(() => queryClient.invalidateQueries({ queryKey }))
+              .catch(() => {
+                // Best-effort: a failed reload just leaves the last known state.
+              });
+          }
+        }
+      },
+    );
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, [queryClient]);
+
+  if (gitInstalled.isPending) {
+    return (
+      <div className="flex h-screen items-center justify-center">
+        <Spinner className="size-6" />
+      </div>
+    );
+  }
+  if (gitInstalled.isError) {
+    return <GitMissingScreen onRetry={() => gitInstalled.refetch()} />;
+  }
+
+  return (
+    <>
+      <div className="flex h-screen flex-col">
+        {view === "welcome" && <WelcomeScreen />}
+        {view === "repo" && <RepositoryView />}
+        {view === "settings" && <SettingsScreen />}
+        {view === "help" && <HelpScreen />}
+        {view === "explore" && <ExploreScreen />}
+        {view === "mywork" && <MyWorkScreen />}
+        {/* A thin activity strip for the headerless screens (the repo view uses
+            its in-header dock instead); only present while a review runs. */}
+        <ActivityStrip />
+      </div>
+      <AutomationResultDialog />
+      <AutomationHistoryDialogHost />
+      <RepoNotificationsDialogHost />
+      <CloneRepoDialog open={cloneOpen} onOpenChange={setCloneOpen} />
+      <CreateRepoDialog open={createOpen} onOpenChange={setCreateOpen} />
+      <ConfirmDialogHost />
+      <ReconnectDialog />
+      <UpdateChecker />
+      <WhatsNew />
+      <ShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+      <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} />
+      {COLD_START && (
+        <div className="pointer-events-none fixed right-2 bottom-2 z-50 flex items-center gap-1.5 border border-warning/40 bg-warning/10 px-2 py-1 text-[11px] font-medium text-warning">
+          <span className="size-1.5 rounded-full bg-warning" />
+          {translate(settings.data?.locale ?? "en", "devUi.coldStartTestMode")}
+          {COLD_INSTANCE_ID ? ` · ${COLD_INSTANCE_ID}` : ""}
+        </div>
+      )}
+    </>
+  );
+}
+
+export default App;

@@ -1,0 +1,589 @@
+import {
+  GaugeIcon,
+  GearSixIcon,
+  PlugsConnectedIcon,
+  ShieldCheckIcon,
+  UsersThreeIcon,
+  WarningCircleIcon,
+} from "@phosphor-icons/react";
+import { type ReactNode, useId, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Combobox,
+  ComboboxContent,
+  ComboboxEmpty,
+  ComboboxInput,
+  ComboboxItem,
+  ComboboxList,
+} from "@/components/ui/combobox";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { type AgentKind, isAgentKind } from "@/lib/ai/agent";
+import { modelPickerEmptyText, useAgentModels } from "@/lib/ai/models";
+import { EFFORT_LEVEL_LABELS, EFFORT_LEVELS } from "@/lib/ai/review-effort";
+import type { McpServer } from "@/lib/settings/api";
+import { useUiStore } from "@/lib/stores/ui";
+import { cn } from "@/lib/utils";
+import { useTranslation } from "@/lib/i18n";
+
+// The agent / model / effort pickers, shared by the task composer, the plan
+// composer, the plan's Implement popover, and the best-of-N arm editor. Kept in
+// their own module so those surfaces don't import each other (the composer imports
+// the ensemble dialog, which needs the pickers — a cycle if they lived together).
+
+/** Compact display labels for each agent CLI — for list rows, headers, badges. */
+export const AGENT_LABELS: Record<AgentKind, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  copilot: "Copilot",
+  opencode: "opencode",
+};
+
+/** The warning shown when a container session's agent isn't baked into the image.
+ *  One source so the composer's isolation note and the best-of-N arms can't drift. */
+export function imageMissingAgentText(agent: AgentKind): string {
+  return `The agent image wasn't built with ${AGENT_LABELS[agent]} — add it under Settings → AI and rebuild.`;
+}
+
+/** The model for a run: the agent's models are searchable — its live catalog
+ *  where the CLI can list one (opencode), else that CLI's static suggestions —
+ *  and any other id typed here reaches the CLI verbatim (custom providers publish
+ *  ids no static list can carry). `""` is the account default and shows the
+ *  placeholder. */
+export function ModelPicker({
+  value,
+  onChange,
+  agent,
+}: {
+  value: string;
+  onChange: (m: string) => void;
+  agent: AgentKind;
+}) {
+  const { t } = useTranslation();
+  // Listing a CLI's catalog spawns it, so the probe waits for intent to pick a
+  // model — sticky, so the list stays put for the rest of the picker's life.
+  const [wanted, setWanted] = useState(false);
+  // Agent-tab-scoped by design: every call site renders under the agent tab's
+  // <Activity>, and a hidden subtree still fetches.
+  const agentTabShowing = useUiStore((s) => s.repoTab === "agent");
+  const available = useAgentModels(agent, {
+    enabled: wanted && agentTabShowing,
+  });
+  // Verbatim: the CLI orders its own catalog (its providers first), and the
+  // fallback is that CLI's static suggestions.
+  const models = available.data?.models ?? [];
+
+  return (
+    <Combobox
+      items={models}
+      // The input text is the source of truth — a typed id needs no match.
+      inputValue={value}
+      onInputValueChange={(model) => onChange(model)}
+      // UNCLAMPED on purpose: Base UI syncs the input to the selected item's
+      // label as the popup finishes closing, and a null selection syncs it to
+      // "" — clamping to the suggestion list would wipe a typed id on close.
+      value={value || null}
+      onValueChange={(model) => {
+        if (model) onChange(model);
+      }}
+      openOnInputClick
+      onOpenChange={(open) => {
+        if (open) setWanted(true);
+      }}
+    >
+      {/* Composer-toolbar weight: quiet until focus, matching the sibling
+          Select-based pickers on the same row. */}
+      <ComboboxInput
+        aria-label={t("agentUi.agentModel")}
+        placeholder={t("agentUi.defaultModel")}
+        // Long ids outrun the capped width with the caret hiding the tail, and
+        // an input has no truncation tooltip of its own.
+        title={value || undefined}
+        className="h-7 w-auto max-w-44 min-w-28 border-transparent text-muted-foreground hover:bg-muted dark:bg-transparent"
+        onFocus={() => setWanted(true)}
+      />
+      {/* The input is narrow, so the default `w-(--anchor-width)` popup clips
+          long ids (e.g. `opencode/…`). Size to content, capped on-screen. */}
+      <ComboboxContent className="w-fit max-w-sm">
+        <ComboboxEmpty>
+          {modelPickerEmptyText(available.isFetching)}
+        </ComboboxEmpty>
+        {/* Render FUNCTION, not static rows: only this form maps the store's
+            filtered items, so static children would never narrow as you type. */}
+        <ComboboxList>
+          {(model: string) => (
+            <ComboboxItem key={model} value={model}>
+              <span className="truncate font-mono">{model}</span>
+            </ComboboxItem>
+          )}
+        </ComboboxList>
+      </ComboboxContent>
+    </Combobox>
+  );
+}
+
+const DEFAULT_EFFORT = "default";
+
+/** Labels for the effort Select — without them Base UI shows the raw stored
+ *  value ("xhigh") in the trigger. Same `items` contract as the settings selects,
+ *  and the popup renders from it too so the two can never drift. */
+const EFFORT_ITEMS: Record<string, string> = {
+  [DEFAULT_EFFORT]: "Default",
+  ...EFFORT_LEVEL_LABELS,
+};
+
+/** Reasoning/effort level for the next turn. Mapped per-CLI in Rust (Codex
+ *  `model_reasoning_effort`, Copilot `--effort`, Claude a thinking keyword). The
+ *  gauge icon marks it as effort so the collapsed value isn't mistaken for a model. */
+export function EffortPicker({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (e: string) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <Select
+      items={EFFORT_ITEMS}
+      value={value || DEFAULT_EFFORT}
+      onValueChange={(v) => onChange(v === DEFAULT_EFFORT ? "" : String(v))}
+    >
+      <SelectTrigger
+        size="sm"
+        aria-label={t("agentUi.reasoningEffort")}
+        className="w-auto gap-1 border-0 text-muted-foreground shadow-none hover:bg-muted dark:bg-transparent"
+      >
+        <GaugeIcon className="size-3.5" />
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {Object.entries(EFFORT_ITEMS).map(([level, label]) => (
+          <SelectItem key={level} value={level}>
+            {label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
+/** How a new task runs: one session, or best-of-N across several arms. */
+export type RunMode = "single" | "ensemble";
+
+/** A compact inline segmented control (radio-group of buttons). Used inside the
+ *  composer Options popover for run mode, effort, and isolation — no nested
+ *  dropdown, fully keyboard-operable: the ARIA radiogroup pattern, so the group is
+ *  ONE tab stop (roving tabindex on the checked option) and the arrow keys move the
+ *  selection with focus following it. Clicking is unchanged. */
+function Segmented<T extends string>({
+  value,
+  onChange,
+  options,
+  ariaLabel,
+  describedBy,
+}: {
+  value: T;
+  onChange: (v: T) => void;
+  options: { value: T; label: string }[];
+  ariaLabel: string;
+  /** Id of a caveat rendered beside the group (e.g. the Isolation readiness note),
+   *  so arrowing between options announces the warning with the selection. */
+  describedBy?: string;
+}) {
+  const groupRef = useRef<HTMLDivElement>(null);
+  // The tab stop. A value outside `options` (shouldn't happen) still leaves the
+  // group reachable rather than trapping the keyboard past it.
+  const checked = options.findIndex((o) => o.value === value);
+  const roving = checked < 0 ? 0 : checked;
+
+  // Arrow keys select-and-focus the neighbour, wrapping at the ends. The buttons
+  // are stable DOM children, so the new target can be focused straight away — the
+  // re-render then hands it the tab stop.
+  const move = (delta: number) => {
+    const next = (roving + delta + options.length) % options.length;
+    onChange(options[next].value);
+    const btn = groupRef.current?.children[next];
+    if (btn instanceof HTMLElement) btn.focus();
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+      e.preventDefault();
+      move(1);
+    } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+      e.preventDefault();
+      move(-1);
+    }
+  };
+
+  return (
+    <div
+      ref={groupRef}
+      role="radiogroup"
+      aria-label={ariaLabel}
+      aria-describedby={describedBy}
+      className="flex overflow-hidden rounded-none border border-input"
+    >
+      {options.map((o, i) => (
+        <button
+          key={o.value}
+          type="button"
+          role="radio"
+          aria-checked={value === o.value}
+          tabIndex={i === roving ? 0 : -1}
+          onClick={() => onChange(o.value)}
+          onKeyDown={onKeyDown}
+          className={cn(
+            "flex-1 px-1.5 py-1 text-[11px] transition-colors outline-none focus-visible:ring-1 focus-visible:ring-ring",
+            i > 0 && "border-l border-input",
+            value === o.value
+              ? "bg-accent font-medium text-accent-foreground"
+              : "text-muted-foreground hover:bg-muted hover:text-foreground",
+          )}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** The empty value is this surface's "no level" row — the composer stores an
+ *  absent effort as `""`, not the Select's `"default"` sentinel. */
+const EFFORT_OPTIONS: { value: string; label: string }[] = [
+  { value: "", label: "" },
+  ...EFFORT_LEVELS.map((value) => ({
+    value,
+    label: EFFORT_LEVEL_LABELS[value],
+  })),
+];
+
+const RUN_MODE_OPTIONS: { value: RunMode; label: string }[] = [
+  { value: "single", label: "" },
+  { value: "ensemble", label: "" },
+];
+
+/** How a NEW session is sandboxed: a throwaway worktree on the host, or that
+ *  worktree inside an ephemeral container. Fixed once the session starts. */
+export type Isolation = "worktree" | "container";
+
+const ISOLATION_OPTIONS: { value: Isolation; label: string }[] = [
+  { value: "worktree", label: "" },
+  { value: "container", label: "" },
+];
+
+/** A one-line caveat under the Isolation control — a readiness warning for
+ *  container, or the host-downgrade disclosure. Computed by the call site (this
+ *  module stays presentational). */
+export interface IsolationNote {
+  tone: "warn" | "muted";
+  text: string;
+  /** Offer a jump to Settings → AI (where the runtime/image is set up). */
+  settingsAction?: boolean;
+}
+
+function effortLabel(value: string, t: ReturnType<typeof useTranslation>["t"]): string {
+  const levelKeys: Record<string, string> = { low: "dataUi.sessions.low", medium: "dataUi.sessions.medium", high: "dataUi.sessions.high", xhigh: "dataUi.sessions.max" };
+  return value in levelKeys ? t(levelKeys[value] as "dataUi.sessions.low") : t("dataUi.sessions.auto");
+}
+
+function isolationLabel(value: Isolation, t: ReturnType<typeof useTranslation>["t"]): string {
+  return t(value === "container" ? "dataUi.sessions.container" : "dataUi.sessions.worktree");
+}
+
+/** A labeled field row inside the Options popover. */
+function OptionField({
+  icon,
+  label,
+  children,
+}: {
+  icon: ReactNode;
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <span className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
+        {icon}
+        {label}
+      </span>
+      {children}
+    </div>
+  );
+}
+
+/**
+ * The composer's collapsed "Options" popover. Provider + model stay inline on the
+ * toolbar for quick access; everything else — run mode, reasoning effort, the
+ * per-session isolation override, and the per-session MCP-server opt-in — lives
+ * here so the action row never overflows or shifts as the box grows. Each control
+ * renders only when the parent passes its props: run mode + isolation are
+ * new-session only; effort drops out in best-of-N (each arm sets its own), while the
+ * MCP selection stays and is SHARED across every arm; MCP self-hides when no servers
+ * are registered. Isolation sits directly above MCP
+ * because it gates it (Codex runs MCP only in a container), so the dependency reads
+ * top-down. The trigger shows a count + summary tooltip of the non-default choices
+ * so collapsing them stays discoverable. MCP rules (frozen at turn 1 for a new
+ * session, strict "only these" for Claude, the container/host caveats) are
+ * unchanged — see the call site.
+ */
+export function ComposerOptions({
+  effort,
+  onEffort,
+  mode,
+  onMode,
+  isolation,
+  mcp,
+}: {
+  effort?: string;
+  onEffort?: (e: string) => void;
+  mode?: RunMode;
+  onMode?: (m: RunMode) => void;
+  /** New-session isolation override. `isOverride` = the pick differs from the
+   *  global setting (that's what the badge counts); `note` is the caller-computed
+   *  readiness warning / host-downgrade disclosure. `onSettingsAction` runs the
+   *  note's "Set up in Settings…" jump and is REQUIRED — navigating unmounts the
+   *  composer, so the caller must stash its start-state first; a convenience
+   *  fallback here would silently reintroduce that state loss. */
+  isolation?: {
+    value: Isolation;
+    onChange: (v: Isolation) => void;
+    isOverride: boolean;
+    note?: IsolationNote;
+    onSettingsAction: () => void;
+  };
+  mcp?: {
+    servers: McpServer[];
+    value: string[];
+    onChange: (ids: string[]) => void;
+    disabledReason?: string;
+  };
+}) {
+  const { t } = useTranslation();
+  const openSettings = useUiStore((s) => s.openSettings);
+  // Links the Isolation caveat to its radiogroup (announced with the selection).
+  const isolationNoteId = useId();
+
+  const mcpListable = mcp && !mcp.disabledReason && mcp.servers.length > 0;
+  const mcpCount = mcpListable
+    ? mcp.servers.filter((s) => mcp.value.includes(s.id)).length
+    : 0;
+
+  // A summary of the non-default choices, surfaced as a count badge + tooltip so
+  // the collapsed state reads at a glance without opening the popover.
+  const summary: string[] = [];
+  if (mode === "ensemble") summary.push(t("dataUi.sessions.bestOf"));
+  if (effort) summary.push(`${t("agentUi.reasoningEffort")}: ${effortLabel(effort, t)}`);
+  // Only an EXPLICIT pick that differs from the global setting counts — following
+  // Settings → AI isn't a choice the user made here.
+  if (isolation?.isOverride)
+    summary.push(`${t("agentUi.isolation")}: ${isolationLabel(isolation.value, t)}`);
+  if (mcpCount > 0)
+    summary.push(`${mcpCount} MCP server${mcpCount > 1 ? "s" : ""}`);
+  const count = summary.length;
+
+  const toggleMcp = (id: string, on: boolean) =>
+    mcp?.onChange(on ? [...mcp.value, id] : mcp.value.filter((v) => v !== id));
+
+  return (
+    <Popover>
+      <PopoverTrigger
+        title={count > 0 ? summary.join(" · ") : t("agentUi.runOptions")}
+        render={
+          <Button
+            size="sm"
+            variant="ghost"
+            aria-label={t("agentUi.runOptions")}
+            className="gap-1 border-0 text-muted-foreground shadow-none hover:bg-muted dark:bg-transparent"
+          />
+        }
+      >
+        <GearSixIcon className="size-3.5" />
+        {t("agentUi.options")}
+        {count > 0 && (
+          <span className="ml-0.5 inline-flex min-w-4 items-center justify-center rounded-full bg-primary/15 px-1 text-[10px] font-medium text-primary tabular-nums">
+            {count}
+          </span>
+        )}
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-64">
+        <div className="flex flex-col gap-3">
+          {mode !== undefined && onMode && (
+            <OptionField
+              icon={<UsersThreeIcon className="size-3.5" />}
+              label={t("agentUi.runMode")}
+            >
+              <Segmented
+                ariaLabel={t("agentUi.runMode")}
+                value={mode}
+                onChange={onMode}
+                options={RUN_MODE_OPTIONS.map((o) => ({ ...o, label: t(o.value === "single" ? "dataUi.sessions.single" : "dataUi.sessions.bestOf") }))}
+              />
+            </OptionField>
+          )}
+          {effort !== undefined && onEffort && (
+            <OptionField
+              icon={<GaugeIcon className="size-3.5" />}
+              label={t("agentUi.reasoningEffort")}
+            >
+              <Segmented
+                ariaLabel={t("agentUi.reasoningEffort")}
+                value={effort}
+                onChange={onEffort}
+                options={EFFORT_OPTIONS.map((o) => ({ ...o, label: o.value === "" ? t("dataUi.sessions.auto") : effortLabel(o.value, t) }))}
+              />
+            </OptionField>
+          )}
+          {isolation && (
+            <OptionField
+              icon={<ShieldCheckIcon className="size-3.5" />}
+              label={t("agentUi.isolation")}
+            >
+              <Segmented
+                ariaLabel={t("agentUi.isolation")}
+                value={isolation.value}
+                onChange={isolation.onChange}
+                options={ISOLATION_OPTIONS.map((o) => ({ ...o, label: t(o.value === "container" ? "dataUi.sessions.container" : "dataUi.sessions.worktree") }))}
+                describedBy={isolation.note ? isolationNoteId : undefined}
+              />
+              {isolation.note && (
+                <p
+                  id={isolationNoteId}
+                  className={cn(
+                    "flex items-start gap-1.5 text-[11px]",
+                    isolation.note.tone === "warn"
+                      ? "text-foreground"
+                      : "text-muted-foreground",
+                  )}
+                >
+                  {/* Icon + text, never color alone. */}
+                  {isolation.note.tone === "warn" && (
+                    <WarningCircleIcon
+                      weight="fill"
+                      className="mt-px size-3.5 shrink-0"
+                      aria-hidden
+                    />
+                  )}
+                  <span>{isolation.note.text}</span>
+                </p>
+              )}
+              {isolation.note?.settingsAction && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 justify-start text-muted-foreground"
+                  onClick={isolation.onSettingsAction}
+                >
+                  {t("agentUi.setUpInSettings")}
+                </Button>
+              )}
+            </OptionField>
+          )}
+          {mcp?.disabledReason ? (
+            <OptionField
+              icon={<PlugsConnectedIcon className="size-3.5" />}
+              label={t("agentUi.mcpServers")}
+            >
+              <p className="text-[11px] text-muted-foreground">
+                {mcp.disabledReason}
+              </p>
+            </OptionField>
+          ) : mcpListable ? (
+            <OptionField
+              icon={<PlugsConnectedIcon className="size-3.5" />}
+              label={t("agentUi.mcpServers")}
+            >
+              <div className="flex flex-col gap-0.5">
+                {mcp.servers.map((s) => (
+                  <label
+                    key={s.id}
+                    className="flex cursor-pointer items-center gap-2 rounded px-1 py-1 hover:bg-muted"
+                  >
+                    <Checkbox
+                      checked={mcp.value.includes(s.id)}
+                      onCheckedChange={(on) => toggleMcp(s.id, on === true)}
+                    />
+                    <span
+                      className="min-w-0 flex-1 truncate font-mono text-xs"
+                      title={s.name}
+                    >
+                      {s.name}
+                    </span>
+                    <span className="shrink-0 text-[10px] text-muted-foreground uppercase">
+                      {s.transport}
+                    </span>
+                  </label>
+                ))}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="mt-0.5 h-7 justify-start text-muted-foreground"
+                  onClick={() => openSettings("mcp-servers")}
+                >
+                  {t("agentUi.manageServers")}
+                </Button>
+              </div>
+            </OptionField>
+          ) : null}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/** Trigger + popup labels for the agent Select. Deliberately not AGENT_LABELS:
+ *  this picker spells Copilot out ("GitHub Copilot") where the compact list-row
+ *  label doesn't. One source so the trigger can never drift from the popup. */
+const AGENT_PICKER_ITEMS: Record<AgentKind, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  copilot: "GitHub Copilot",
+  opencode: "opencode",
+};
+
+/** Picks the CLI for a NEW session (fixed once it starts). Every agent runs either
+ *  way — host (worktree-confined; Codex adds its own OS-enforced sandbox) or
+ *  container, provided that agent is baked into the image. Only Codex's MCP support
+ *  is container-only. Reused by the plan composer and the best-of-N arm editor. */
+export function AgentPicker({
+  value,
+  onChange,
+}: {
+  value: AgentKind;
+  onChange: (a: AgentKind) => void;
+}) {
+  return (
+    <Select
+      items={AGENT_PICKER_ITEMS}
+      value={value}
+      onValueChange={(v) => onChange(isAgentKind(v) ? v : "claude")}
+    >
+      <SelectTrigger
+        size="sm"
+        aria-label="Agent"
+        className="w-auto border-0 text-muted-foreground shadow-none hover:bg-muted dark:bg-transparent"
+      >
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {Object.entries(AGENT_PICKER_ITEMS).map(([kind, label]) => (
+          <SelectItem key={kind} value={kind}>
+            {label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}

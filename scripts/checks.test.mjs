@@ -1,0 +1,4292 @@
+// Negative controls for the guard scanners. Their worst failure mode is
+// silent fail-open — a pattern that stops matching still prints "OK" — so every
+// predicate keeps a fixture that MUST hit and a fixture that must not. The
+// scripts export their predicates and gate their CLI body on a main-module path
+// check (`process.argv[1]` vs `import.meta.url` — portable across node versions,
+// unlike `import.meta.main`), so importing them here runs no scan, touches no
+// disk, and cannot silently no-op on a runtime older than the gate.
+//
+// Node's stdlib test runner and node: imports only, no dev dependency, so the
+// CI `guards` job runs `node --test "scripts/*.test.mjs"` with no install step.
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+
+import {
+  CHECKS,
+  okReportLine,
+  reachesGitQueriesInternal,
+  reachesQueriesInternalFromSibling,
+  runCheck,
+  scopePinFailure,
+  stripComments,
+  view,
+} from "./check-banned-patterns.mjs";
+import {
+  footerOf,
+  hasInlineGap,
+  INLINE_GAP,
+} from "./check-built-whitespace.mjs";
+import { fragmentVerdict } from "./check-changelog-fragment.mjs";
+import {
+  parseInvoked,
+  parseRegistered,
+  staleAllowlistEntries as staleCommandEntries,
+} from "./check-dead-surface.mjs";
+import {
+  cardRefOf,
+  frontmatterOf,
+  isAbsoluteRef,
+  servedRelPathsFor,
+} from "./check-og-cards.mjs";
+import {
+  CARRIERS,
+  MOUNTED_CARRIERS,
+  missingSentinels,
+} from "./check-rule-mirrors.mjs";
+import {
+  checkCompareEndpoints,
+  checkRefspecTemplates,
+  checkSecretArgv,
+  checkStderrOnlyGitError,
+  checkSyncCommands,
+  enclosingFn,
+  staleAllowlistEntries,
+} from "./check-rust-invariants.mjs";
+import {
+  diffTrees,
+  EXEMPT,
+  EXPECTED_ABSENT,
+  isTextFile,
+  normalize as normalizeSkill,
+  SINGLE_TREE,
+} from "./check-skill-mirrors.mjs";
+import {
+  crateNameFor,
+  declaredNpmAliases,
+  declaredNpmPackages,
+  duplicateCrateNames,
+  mismatchedPairs,
+  npmNameFor,
+  parseCrateVersions,
+  parseNpmVersions,
+  verdict,
+} from "./check-tauri-plugin-parity.mjs";
+
+// -------------------------------------------------- check-changelog-fragment
+
+for (const [name, changedFiles, presentFiles, prTitle, required, satisfied] of [
+  [
+    "fragment present",
+    ["src/app.ts"],
+    ["changelog.d/added-app.md"],
+    "",
+    true,
+    true,
+  ],
+  ["fragment missing", ["src/app.ts"], [], "", true, false],
+  [
+    "title opt-out",
+    ["src/app.ts"],
+    [],
+    "fix: [SKIP-CHANGELOG] copy",
+    false,
+    true,
+  ],
+  ["site only", ["site/page.astro"], [], "", false, true],
+  [
+    "deleted fragment",
+    ["src/app.ts", "changelog.d/fixed-app.md"],
+    ["src/app.ts"],
+    "",
+    true,
+    false,
+  ],
+  [
+    "wrong category",
+    ["src/app.ts"],
+    ["changelog.d/removed-app.md"],
+    "",
+    true,
+    false,
+  ],
+  ["wrong directory", ["src/app.ts"], ["other/fixed-app.md"], "", true, false],
+  [
+    "directory case",
+    ["src/app.ts"],
+    ["Changelog.d/fixed-app.md"],
+    "",
+    true,
+    false,
+  ],
+  [
+    "basename case",
+    ["src/app.ts"],
+    ["changelog.d/FIXED-app.MD"],
+    "",
+    true,
+    true,
+  ],
+  [
+    "nested fragment",
+    ["src/app.ts"],
+    ["changelog.d/fixed-dir/app.md"],
+    "",
+    true,
+    false,
+  ],
+  ["empty slug", ["src/app.ts"], ["changelog.d/fixed-.md"], "", true, false],
+  ["deleted Rust source", ["src-tauri/src/app.rs"], [], "", true, false],
+  [
+    "source prefix boundary",
+    ["src-other/app.ts", "Src/app.ts"],
+    [],
+    "",
+    false,
+    true,
+  ],
+  ["empty diff", [], [], "", false, true],
+  [
+    "fragment precedes title opt-out",
+    ["src/app.ts"],
+    ["changelog.d/changed-app.md"],
+    "skip-changelog",
+    true,
+    true,
+  ],
+]) {
+  test(`changelog-fragment: ${name}`, () => {
+    const result = fragmentVerdict({ changedFiles, presentFiles, prTitle });
+    assert.equal(result.required, required);
+    assert.equal(result.satisfied, satisfied);
+    assert.ok(result.reason.length > 0);
+    if (!satisfied) {
+      assert.ok(
+        result.reason.startsWith("::error::This PR changes src/ or src-tauri/"),
+      );
+    }
+  });
+}
+
+test("changelog-fragment: invalid inputs fail closed", () => {
+  for (const input of [
+    { changedFiles: null, presentFiles: [], prTitle: "" },
+    { changedFiles: [], presentFiles: [null], prTitle: "" },
+    { changedFiles: [], presentFiles: [], prTitle: null },
+  ]) {
+    assert.throws(() => fragmentVerdict(input), TypeError);
+  }
+});
+
+// ------------------------------------------------------- check-banned-patterns
+
+/** The named check's scanner, applied to a fixture source string. */
+function scanner(name) {
+  const check = CHECKS.find((c) => c.name === name);
+  assert.ok(check, `no check named ${name}`);
+  return (source) => check.scan(view(source));
+}
+
+const hoverReveal = scanner("hover-reveal");
+const modKey = scanner("hand-rolled-mod-key");
+const inlineClipTitle = scanner("inline-clip-title");
+const selectItemClipTitle = scanner("select-item-clip-title");
+const setQueryData = scanner("setQueryData-noop");
+const settingsRollback = scanner("async-settings-rollback");
+const bareMutate = scanner("bare-mutate-in-converted-trees");
+const menuSuppression = scanner("context-menu-suppression");
+const loneActivity = scanner("lone-activity-boundary");
+const seedOnOpen = scanner("seed-effect-on-open");
+const finishAndSurface = scanner("generator-dialog-finish-and-surface");
+const diffStatPair = scanner("hand-rolled-diff-stat");
+const kindBadge = scanner("kind-badge-single-source");
+const nullFallback = scanner("null-suspense-fallback");
+const bareGroupLabel = scanner("bare-group-label");
+const unguardedDispatcher = scanner("unguarded-binding-dispatcher");
+const titledDisabledTrigger = scanner("titled-disabled-trigger");
+const titledBadge = scanner("titled-badge");
+const ungatedProducer = scanner("ungated-notification-producer");
+const handRolledStoreOpen = scanner("hand-rolled-store-open");
+const rawStoreReload = scanner("raw-store-reload");
+const inlineRepoIdentityQuery = scanner("inline-repo-identity-query");
+const queriesInternalImport = scanner("queries-internal-import");
+const queriesBarrelInternal = scanner("queries-barrel-internal-reference");
+const queriesInternalReexport = scanner("queries-internal-reexport");
+const unpinnedMutationIdentity = scanner("mutation-identity-pinning");
+
+test("hover-reveal catches every Tailwind spelling of the idiom", () => {
+  for (const classes of [
+    "opacity-0 group-hover:opacity-100",
+    "invisible group-hover:visible",
+    "hidden group-hover:block",
+    "hidden group-hover:flex",
+    "hidden group-hover:inline",
+    "hidden group-hover:inline-flex",
+  ]) {
+    assert.deepEqual(
+      hoverReveal(`const cls = "${classes}";`),
+      [1],
+      `should flag ${classes}`,
+    );
+  }
+});
+
+test("hover-reveal pairs across a wrapped class list", () => {
+  const source = [
+    "<button",
+    "  className={cn(",
+    '    "invisible transition",',
+    '    "group-hover:visible",',
+    "  )}",
+    "/>",
+  ].join("\n");
+  assert.deepEqual(hoverReveal(source), [3]);
+});
+
+test("hover-reveal does not pair a compound utility that merely ends in the token", () => {
+  // The boundary guard's whole job: `overflow-hidden` is a layout utility, not
+  // a hidden element, and pairing it would flag ordinary scroll containers.
+  assert.deepEqual(
+    hoverReveal('const cls = "overflow-hidden group-hover:block";'),
+    [],
+  );
+  assert.deepEqual(
+    hoverReveal('const cls = "group-hover:visible-ish invisible-thing";'),
+    [],
+  );
+});
+
+test("hover-reveal ignores a hiding utility with no reveal partner", () => {
+  assert.deepEqual(hoverReveal('const cls = "hidden md:flex";'), []);
+  assert.deepEqual(hoverReveal('const cls = "opacity-0 animate-in";'), []);
+});
+
+test("hover-reveal ignores the idiom named in a comment", () => {
+  // src/main.tsx documents the vendored diff widget's own `group-hover:visible`
+  // next to our `.invisible` utility; comment stripping is what keeps it clean.
+  const source = [
+    "// the add-widget button reveals via `group-hover:visible`,",
+    "// which our `.invisible` utility would otherwise beat.",
+    'import "@git-diff-view/react/styles/diff-view.css";',
+  ].join("\n");
+  assert.deepEqual(hoverReveal(source), []);
+});
+
+test("hand-rolled-mod-key flags a single raw flag and each half of a split pair", () => {
+  assert.deepEqual(modKey("if (e.metaKey) submit();"), [1]);
+  assert.deepEqual(modKey("if (e.ctrlKey) submit();"), [1]);
+  const split = ["const mod =", "  e.metaKey ||", "  e.ctrlKey;"].join("\n");
+  assert.deepEqual(modKey(split), [2, 3]);
+});
+
+test("hand-rolled-mod-key ignores other modifiers and the helper's own name", () => {
+  assert.deepEqual(modKey("if (e.shiftKey || e.altKey) return;"), []);
+  assert.deepEqual(modKey("const label = formatBinding(binding);"), []);
+});
+
+test("inline-clip-title flags each local spelling of the clip-tooltip idiom", () => {
+  // The blank-on-else ternary — the ancestor-suppressing defect shape.
+  const ternary = [
+    "onMouseEnter={(e) => {",
+    "  const el = e.currentTarget;",
+    '  el.title = el.scrollWidth > el.clientWidth ? name : "";',
+    "}}",
+  ].join("\n");
+  assert.deepEqual(inlineClipTitle(ternary), [3]);
+  // The corrected if/else form is still an inline copy: the ratchet points
+  // both shapes at the shared helper.
+  const ifElse = [
+    "const el = e.currentTarget;",
+    "if (el.scrollWidth > el.clientWidth) el.title = value;",
+    'else el.removeAttribute("title");',
+  ].join("\n");
+  assert.deepEqual(inlineClipTitle(ifElse), [2]);
+  // The set-if-absent, both-axes variant: the guard READ doesn't pair (no
+  // assignment), but the write downstream is still in range of the measure.
+  const guarded = [
+    "if (",
+    "  !el.title &&",
+    "  (el.scrollWidth > el.clientWidth || el.scrollHeight > el.clientHeight)",
+    ")",
+    '  el.title = el.textContent ?? "";',
+  ].join("\n");
+  assert.deepEqual(inlineClipTitle(guarded), [3]);
+});
+
+test("inline-clip-title leaves title data reads and plain scroll code alone", () => {
+  // A `.title` read is not the idiom — only the write anchors a pair. This is
+  // the PlanView shape: a scroll-to-bottom near `{ title: draft.title }`.
+  const dataRead = [
+    "scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });",
+    "setPendingIssueDraft({ title: draft.title, body: draft.body });",
+  ].join("\n");
+  assert.deepEqual(inlineClipTitle(dataRead), []);
+  assert.deepEqual(
+    inlineClipTitle("<span onMouseEnter={clipTitle(member.title)} />"),
+    [],
+  );
+  // Scroll-stick and textarea autosize measure without touching `title`.
+  assert.deepEqual(inlineClipTitle("el.scrollTop = el.scrollHeight;"), []);
+  assert.deepEqual(
+    inlineClipTitle("ta.style.height = `${Math.min(ta.scrollHeight, 160)}px`;"),
+    [],
+  );
+});
+
+test("inline-clip-title exempts the helper file and vendored ui only", () => {
+  const { appliesTo } = CHECKS.find((c) => c.name === "inline-clip-title");
+  assert.equal(appliesTo("src/lib/clip-title.ts"), false);
+  assert.equal(appliesTo("src/components/ui/select.tsx"), false);
+  assert.equal(appliesTo("src/features/pulls/PrTimeline.tsx"), true);
+});
+
+test("select-item-clip-title flags the superseded item-level handler, wrapped or not", () => {
+  assert.deepEqual(
+    selectItemClipTitle(
+      "<SelectItem key={b} value={b} onMouseEnter={clipTitle(b)}>",
+    ),
+    [1],
+  );
+  // Wrapped props (the shape the WorktreesDialog sites had): the [\s\S] gap is
+  // what reaches past the `=>` an intervening prop expression may carry.
+  const wrapped = [
+    "<SelectItem",
+    "  key={b.name}",
+    "  value={b.name}",
+    "  onMouseEnter={clipTitle(b.name)}",
+    ">",
+  ].join("\n");
+  assert.deepEqual(selectItemClipTitle(wrapped), [1]);
+  // A clip handler on a hand-rolled span INSIDE the item is the same dead
+  // shape: an unbounded span never measures clipped there either.
+  const inner = [
+    "<SelectItem key={b} value={b}>",
+    "  <span onMouseEnter={clipTitleFromText}>{b}</span>",
+    "</SelectItem>",
+  ].join("\n");
+  assert.deepEqual(selectItemClipTitle(inner), [1]);
+  // The pre-conversion dead span carries no clipTitle token at all — only the
+  // block-truncate arm sees this most-likely copy-paste regression.
+  const deadSpan = [
+    "<SelectItem key={b} value={b}>",
+    '  <span className="block truncate">{b}</span>',
+    "</SelectItem>",
+  ].join("\n");
+  assert.deepEqual(selectItemClipTitle(deadSpan), [1]);
+  // A synthetic SELF-BOUNDED span (an explicit max-w keeps its handler live).
+  // At close range it still pairs — the guard cannot see width bounds — so a
+  // real one would need the allowlist. No in-tree site carries this shape
+  // today: in-item path rows route through PathText.
+  const bounded = [
+    "<SelectItem key={i.id} value={i.id}>",
+    "  <span",
+    '    className="max-w-64 truncate font-mono"',
+    "    onMouseEnter={clipTitle(found)}",
+    "  >",
+    "    {found}",
+    "  </span>",
+    "</SelectItem>",
+  ].join("\n");
+  assert.deepEqual(selectItemClipTitle(bounded), [1]);
+});
+
+test("select-item-clip-title leaves the SelectClipText idiom and trigger handlers alone", () => {
+  const converted = [
+    "<SelectItem key={b} value={b}>",
+    "  <SelectClipText>{b}</SelectClipText>",
+    "</SelectItem>",
+  ].join("\n");
+  assert.deepEqual(selectItemClipTitle(converted), []);
+  // The closed field's handler sits on SelectValue, ABOVE the items — the
+  // pairing direction (item first) is what keeps it clean.
+  const trigger = [
+    '<SelectTrigger className="w-full">',
+    "  <SelectValue onMouseEnter={clipTitleFromText} />",
+    "</SelectTrigger>",
+    "<SelectContent>",
+    "  <SelectItem key={b} value={b}>",
+    "    <SelectClipText>{b}</SelectClipText>",
+    "  </SelectItem>",
+    "</SelectContent>",
+  ].join("\n");
+  assert.deepEqual(selectItemClipTitle(trigger), []);
+  // Row-level clipTitle away from any Select stays the sanctioned idiom.
+  assert.deepEqual(
+    selectItemClipTitle("<button onMouseEnter={clipTitle(path)} />"),
+    [],
+  );
+  // Tempering stops the scan at the item's closing tag: an ADJACENT picker's
+  // trigger handler right after a completed item can never pair, however
+  // compact the layout — this exact fixture fired before the tempered step.
+  const stacked = [
+    "<SelectItem value={ALL}>All</SelectItem>",
+    "</SelectContent>",
+    "</Select>",
+    "<Select value={x} onValueChange={setX}>",
+    "  <SelectTrigger>",
+    "    <SelectValue onMouseEnter={clipTitleFromText} />",
+    "  </SelectTrigger>",
+  ].join("\n");
+  assert.deepEqual(selectItemClipTitle(stacked), []);
+});
+
+test("select-item-clip-title exempts vendored ui only", () => {
+  const { appliesTo } = CHECKS.find((c) => c.name === "select-item-clip-title");
+  assert.equal(appliesTo("src/components/ui/select.tsx"), false);
+  assert.equal(appliesTo("src/components/select-clip-text.tsx"), true);
+  assert.equal(appliesTo("src/features/history/HistoryDialogs.tsx"), true);
+});
+
+test("select-item-clip-title flags the flex clip span across the override", () => {
+  // The flex spelling of the dead span: `flex-1` alone never wins against
+  // ItemText's nowrap intrinsic floor, so the truncate cannot engage.
+  const bare = [
+    "<SelectItem key={b} value={b}>",
+    '  <span className="min-w-0 flex-1 truncate">{b}</span>',
+    "</SelectItem>",
+  ].join("\n");
+  assert.deepEqual(selectItemClipTitle(bare), [1]);
+  // SelectControl's real row, minus its clipTitleFromText prop so only this arm
+  // can fire: the item-level override that revives the truncate sits between the
+  // tag and the child, which is why the window doubles PAIR_GAP — the live site
+  // measures 150 normalized chars, and a site drifting past 160 would go missed
+  // with its allowlist entry reading stale.
+  const overridden = [
+    "<SelectItem",
+    "  key={optionValue}",
+    "  value={optionValue}",
+    "  disabled={disabledItems?.has(optionValue)}",
+    '  className="*:first:min-w-0 *:first:shrink"',
+    ">",
+    '  <span className="min-w-0 flex-1 truncate">{display}</span>',
+    "</SelectItem>",
+  ].join("\n");
+  assert.deepEqual(selectItemClipTitle(overridden), [1]);
+  // The arm's bound: the same utility trio is ordinary flex layout anywhere
+  // else, so only the SelectItem anchor makes it the dead span.
+  assert.deepEqual(
+    selectItemClipTitle('<div className="min-w-0 flex-1 truncate">{d}</div>'),
+    [],
+  );
+});
+
+test("select-item-clip-title allowlists the flex spelling per file", () => {
+  const check = CHECKS.find((c) => c.name === "select-item-clip-title");
+  const row = [
+    "<SelectItem key={v} value={v}>",
+    '  <span className="min-w-0 flex-1 truncate">{d}</span>',
+    "</SelectItem>",
+  ].join("\n");
+  const files = [
+    "src/components/form/fields.tsx",
+    "src/features/pulls/SomeNewPicker.tsx",
+  ];
+  const views = new Map(files.map((f) => [f, view(row)]));
+  // The shared control's entry suppresses only its own file; the same markup in
+  // a fresh picker (which carries no override) still reports.
+  const { violations } = runCheck(check, files, views);
+  assert.deepEqual(violations, ["src/features/pulls/SomeNewPicker.tsx:1"]);
+});
+
+test("setQueryData-noop catches a call wrapped across lines", () => {
+  const source = [
+    "queryClient.setQueryData(",
+    "  keys.pullRequest(repo, number),",
+    "  undefined,",
+    ");",
+  ].join("\n");
+  assert.deepEqual(setQueryData(source), [1]);
+});
+
+test("setQueryData-noop sees through nested type arguments", () => {
+  assert.deepEqual(
+    setQueryData("qc.setQueryData<Record<string, Foo>>(key, undefined);"),
+    [1],
+  );
+  assert.deepEqual(
+    setQueryData("qc.setQueryData<Foo[]>(key, undefined);"),
+    [1],
+  );
+});
+
+test("setQueryData-noop resolves the LAST argument past a comma-bearing key", () => {
+  assert.deepEqual(
+    setQueryData("qc.setQueryData(keys.pr(repo, number), undefined);"),
+    [1],
+  );
+});
+
+test("setQueryData-noop leaves real writes alone", () => {
+  assert.deepEqual(setQueryData("qc.setQueryData(key, previous);"), []);
+  assert.deepEqual(
+    setQueryData("qc.setQueryData(key, (old) => ({ ...old, x: 1 }));"),
+    [],
+  );
+});
+
+test("setQueryData-noop does not reach across a `;` statement boundary", () => {
+  // The whole-file view joins lines, so the argument run is `;`-free and
+  // length-bounded — otherwise this pairs one call with the next statement.
+  // The bound is exactly that and no more: `;` is not the only boundary in JS,
+  // so a JSX prop or object member holding `, undefined)` within 200 chars of a
+  // clean call still pairs (a loud false positive, fixable at the call site),
+  // and a `;` inside a string key ends the run early (the one fail-open).
+  const source = [
+    "qc.setQueryData(key, previous);",
+    "logger.debug(label, undefined);",
+  ].join("\n");
+  assert.deepEqual(setQueryData(source), []);
+});
+
+test("async-settings-rollback flags an optimistic patch whose onError refetches", () => {
+  // The pre-fix shape, in both its bodies: the arrow the two settings hooks
+  // used, and the block detail-rail used to clear its focus arm in.
+  const arrow = [
+    "queryClient.setQueryData(settingsKeys.settings, updated);",
+    "saveSettings.mutate(updated, {",
+    "  onError: () =>",
+    "    queryClient.invalidateQueries({ queryKey: settingsKeys.settings }),",
+    "});",
+  ].join("\n");
+  assert.deepEqual(settingsRollback(arrow), [3]);
+  const block = [
+    "queryClient.setQueryData(settingsKeys.settings, updated);",
+    "saveSettings.mutate(updated, {",
+    "  onError: () => {",
+    "    refocus.current = null;",
+    "    queryClient.invalidateQueries({ queryKey: settingsKeys.settings });",
+    "  },",
+    "});",
+  ].join("\n");
+  assert.deepEqual(settingsRollback(block), [3]);
+});
+
+test("async-settings-rollback gates on a TYPED optimistic patch too", () => {
+  // The gate is all-or-nothing per file: a spelling it can't see turns the whole
+  // check off there. The repo already types the sibling read
+  // (`getQueryData<AppSettings>`), so the typed write is a plausible next edit —
+  // including the nested-generic form a `<[^>]*>` group would stop short of.
+  for (const call of [
+    "queryClient.setQueryData<AppSettings>(settingsKeys.settings, updated);",
+    "queryClient.setQueryData<Record<string, AppSettings>>(settingsKeys.settings, u);",
+  ]) {
+    const source = [
+      call,
+      "saveSettings.mutate(updated, {",
+      "  onError: () =>",
+      "    queryClient.invalidateQueries({ queryKey: settingsKeys.settings }),",
+      "});",
+    ].join("\n");
+    assert.deepEqual(settingsRollback(source), [3], `should gate on ${call}`);
+  }
+});
+
+test("async-settings-rollback pairs across functions, not just adjacent code", () => {
+  // The property `onlyWhen` exists for: the gating patch and the mutation it
+  // guards can live in different functions of the same hook file, far outside
+  // any proximity window. Padding is deliberately >PAIR_GAP (160).
+  const source = [
+    "export function useSomethingCollapsed() {",
+    "  function apply(next) {",
+    "    queryClient.setQueryData(settingsKeys.settings, updated);",
+    "  }",
+    "  const pad1 = someHelper(alpha, beta, gamma, delta, epsilon, zeta, eta);",
+    "  const pad2 = someHelper(alpha, beta, gamma, delta, epsilon, zeta, eta);",
+    "  const pad3 = someHelper(alpha, beta, gamma, delta, epsilon, zeta, eta);",
+    "  const pad4 = someHelper(alpha, beta, gamma, delta, epsilon, zeta, eta);",
+    "  function persist(updated) {",
+    "    saveSettings.mutate(updated, {",
+    "      onError: () =>",
+    "        queryClient.invalidateQueries({ queryKey: settingsKeys.settings }),",
+    "    });",
+    "  }",
+    "}",
+  ].join("\n");
+  assert.deepEqual(settingsRollback(source), [11]);
+});
+
+test("async-settings-rollback needs BOTH halves, in the same file", () => {
+  // No live file trips the onError half today — every settings invalidate under
+  // src/ is success-path. The gate is forward-looking: a file that refetches
+  // settings from an onError with nothing optimistic to roll back stays clean.
+  const noPatch = [
+    "remove.mutate(path, {",
+    "  onError: () =>",
+    "    queryClient.invalidateQueries({ queryKey: settingsKeys.settings }),",
+    "});",
+  ].join("\n");
+  assert.deepEqual(settingsRollback(noPatch), []);
+  // The happy-path reconcile every settings mutation carries is onSuccess, so
+  // the patch alone never pairs with it.
+  const onSuccess = [
+    "queryClient.setQueryData(settingsKeys.settings, updated);",
+    "return useMutation({",
+    "  mutationFn: saveSettingsMerged,",
+    "  onSuccess: () =>",
+    "    queryClient.invalidateQueries({ queryKey: settingsKeys.settings }),",
+    "});",
+  ].join("\n");
+  assert.deepEqual(settingsRollback(onSuccess), []);
+});
+
+test("async-settings-rollback leaves the guarded synchronous restore alone", () => {
+  // The useApplyTheme shape this check exists to hold: latest-write guard, then
+  // the snapshot written straight back.
+  const fixed = [
+    "queryClient.setQueryData(settingsKeys.settings, updated);",
+    "saveSettings.mutate(updated, {",
+    "  onError: () => {",
+    "    const latest = queryClient.getQueryData(settingsKeys.settings);",
+    "    if (latest?.theme !== next) return;",
+    "    queryClient.setQueryData(settingsKeys.settings, current);",
+    "  },",
+    "});",
+  ].join("\n");
+  assert.deepEqual(settingsRollback(fixed), []);
+});
+
+test("bare-mutate-in-converted-trees flags every way a call reaches its callbacks", () => {
+  // The reason this check matches the CALL and not the callbacks object: the
+  // hoisted-options pair is the shape most of these sections used, and no
+  // regex anchored on `onSuccess`/`onError` sees it.
+  assert.deepEqual(
+    bareMutate(
+      'del.mutate(hook.id, { onSuccess: () => toast.success("x"), onError: e });',
+    ),
+    [1],
+  );
+  const hoisted = [
+    "const opts = { onSuccess: done, onError: toastError };",
+    "update.mutate({ id, body }, opts);",
+  ].join("\n");
+  assert.deepEqual(bareMutate(hoisted), [2]);
+  assert.deepEqual(
+    bareMutate("setEnforcement.mutate(vars, { onError: toastError });"),
+    [1],
+  );
+});
+
+test("bare-mutate-in-converted-trees flags a bare call carrying no callbacks", () => {
+  // Deliberate: a fire-and-forget mutation here still loses nothing to the
+  // unmount, but the ratchet stays a token match — an exemption is an
+  // allowlist entry with rationale, not a hole in the pattern.
+  assert.deepEqual(bareMutate("ping.mutate(hook.id);"), [1]);
+  assert.deepEqual(bareMutate("refresh.mutate ();"), [1]);
+});
+
+test("bare-mutate-in-converted-trees catches the dot-less destructured route", () => {
+  // `const { mutate } = useX()` reaches the same call with no `.mutate` token
+  // for the first pattern to see — a live idiom elsewhere under src/.
+  assert.deepEqual(
+    bareMutate("const { mutate } = useUpdateLocalPr(repo);"),
+    [1],
+  );
+  assert.deepEqual(
+    bareMutate("const { mutate: save } = useUpdateThing(repo);"),
+    [1],
+  );
+  assert.deepEqual(
+    bareMutate("const { isPending, mutate } = useX(repo);"),
+    [1],
+  );
+  // Wrapped by the formatter: caught because this pattern reads the whole-file
+  // view, where `[^}]*` still can't cross the destructure's own closing brace.
+  const wrapped = [
+    "const {",
+    "  mutate,",
+    "  isPending,",
+    "} = useUpdateSomethingWithALongName(repoPath);",
+  ].join("\n");
+  assert.deepEqual(bareMutate(wrapped), [1]);
+});
+
+test("bare-mutate-in-converted-trees leaves the awaited idiom and comments alone", () => {
+  const awaited = [
+    "await update.mutateAsync(form);",
+    'toast.success("Repository settings saved");',
+  ].join("\n");
+  assert.deepEqual(bareMutate(awaited), []);
+  // The `\b` after `mutate` is the whole reason the destructure pattern can
+  // coexist with the idiom it is enforcing.
+  assert.deepEqual(
+    bareMutate("const { mutateAsync } = useUpdateRepoSettings(repo);"),
+    [],
+  );
+  assert.deepEqual(
+    bareMutate("const { mutateAsync, isPending } = useX(repo);"),
+    [],
+  );
+  const documented = [
+    "// never `.mutate(vars, { onSuccess, onError })` — the callbacks are",
+    "// dropped when the observer unmounts.",
+    "await save.mutateAsync(vars);",
+  ].join("\n");
+  assert.deepEqual(bareMutate(documented), []);
+});
+
+test("bare-mutate-in-converted-trees applies to the converted trees only", () => {
+  // The tier boundary is the deliberate part: the converted trees are in, and
+  // the ones still carrying per-call callbacks in bulk are out until their own
+  // conversion lands. Widening this is a decision, not a drive-by.
+  const { appliesTo } = CHECKS.find(
+    (c) => c.name === "bare-mutate-in-converted-trees",
+  );
+  for (const file of [
+    "src/features/repo-settings/RulesetsSection.tsx",
+    "src/features/explore/ExploreDetail.tsx",
+    "src/features/actions/RunDetailView.tsx",
+    "src/features/pulls/RemotePrView.tsx",
+    "src/features/pulls/useReconcileLocalPrs.ts",
+    // Joined when the repository/commit conversions landed:
+    "src/features/repository/ChangesPanel.tsx",
+    "src/features/commit/CommitBox.tsx",
+    // Joined when the issues/history/discussions/tags conversions landed:
+    "src/features/issues/RemoteIssueView.tsx",
+    "src/features/history/HistoryPanel.tsx",
+    "src/features/discussions/DiscussionView.tsx",
+    "src/features/tags/TagDetailView.tsx",
+  ]) {
+    assert.equal(appliesTo(file), true, `should scan ${file}`);
+  }
+  for (const file of [
+    "src/features/diff/DiffViewer.tsx",
+    "src/features/welcome/WelcomeScreen.tsx",
+    "src/lib/settings/queries.ts",
+  ]) {
+    assert.equal(appliesTo(file), false, `should not scan ${file}`);
+  }
+});
+
+test("context-menu-suppression flags the state-reset-then-preventDefault shape", () => {
+  const inline = [
+    "function handleContextMenu(e) {",
+    "  const row = e.target.closest('[data-repo-path]');",
+    "  if (!row) {",
+    "    setMenuRepo(null);",
+    "    e.preventDefault();",
+    "  }",
+    "}",
+  ].join("\n");
+  assert.deepEqual(menuSuppression(inline), [4]);
+  // stopPropagation written out by hand is the same class: the constraint lives
+  // in the helper's doc comment, so an inline copy is what drifts next.
+  const handRolled = [
+    "setMenuTarget(null);",
+    "e.stopPropagation();",
+    "e.preventDefault();",
+  ].join("\n");
+  assert.deepEqual(menuSuppression(handRolled), [1]);
+});
+
+test("context-menu-suppression leaves the helper route and its definition alone", () => {
+  const fixed = [
+    "setMenuPath(null);",
+    "suppressContextMenu(e);",
+    "return;",
+  ].join("\n");
+  assert.deepEqual(menuSuppression(fixed), []);
+  // The helper itself holds the preventDefault with no state reset to pair with.
+  const helper = [
+    "export function suppressContextMenu(e) {",
+    "  e.stopPropagation();",
+    "  e.preventDefault();",
+    "}",
+  ].join("\n");
+  assert.deepEqual(menuSuppression(helper), []);
+});
+
+test("context-menu-suppression does not pair across a block boundary", () => {
+  // `[^}]` is the bound: an unrelated null reset and an unrelated preventDefault
+  // in two different handlers are not this idiom.
+  const separate = [
+    "function clearSelection() {",
+    "  setMenuRepo(null);",
+    "}",
+    "function onKeyDown(e) {",
+    "  e.preventDefault();",
+    "}",
+  ].join("\n");
+  assert.deepEqual(menuSuppression(separate), []);
+});
+
+test("seed-effect-on-open flags both spellings of the open guard", () => {
+  const guarded = [
+    "useEffect(() => {\n  if (open) seedOnOpen();\n}, [open]);",
+    "useEffect(() => {\n  if (!open) return;\n  setTyped('');\n}, [open]);",
+    "useEffect(() => {\n  if (open && ready) seed();\n}, [open, ready]);",
+    "useLayoutEffect(() => {\n  if (open) setMode(initialMode);\n}, [open]);",
+  ];
+  for (const source of guarded)
+    assert.deepEqual(seedOnOpen(source), [1], `should flag ${source}`);
+});
+
+test("seed-effect-on-open ignores the hook and non-first-statement reads", () => {
+  assert.deepEqual(seedOnOpen("useSeedOnOpen(open, seedOnOpen);"), []);
+  // `open` read somewhere in the body is a gate, not a seed — only an effect
+  // that OPENS with the guard is the shape this check is about.
+  const gate = [
+    "useEffect(() => {",
+    "  const el = ref.current;",
+    "  if (!open || !el) return;",
+    "  place(el);",
+    "}, [open]);",
+  ].join("\n");
+  assert.deepEqual(seedOnOpen(gate), []);
+});
+
+test("generator-dialog-finish-and-surface flags each generator hook", () => {
+  for (const hook of [
+    "useGeneratePrDescription",
+    "useGenerateIssueDraft",
+    "useGenerateReleaseNotes",
+    "useGenerateRepoDescription",
+  ]) {
+    const source = [
+      `  const { generate, generating } = ${hook}(repoPath);`,
+      "  const seedOnOpen = useEffectEvent(() => form.reset(seeds));",
+      "  useSeedOnOpen(open, seedOnOpen);",
+    ].join("\n");
+    assert.deepEqual(finishAndSurface(source), [1], `should flag ${hook}`);
+  }
+});
+
+test("generator-dialog-finish-and-surface needs both halves, and clears on the primitive", () => {
+  // The adopted shape — the negative control for the check.
+  const adopted = [
+    "  const { generate, cancel, generating } = useGeneratePrDescription(repo);",
+    "  const surface = useFinishAndSurface(repo, open, {",
+    "    cancel,",
+    "    generating,",
+    "    readyTitle: t,",
+    "  });",
+    "  useSeedOnOpen(open, seedOnOpen);",
+  ].join("\n");
+  assert.deepEqual(finishAndSurface(adopted), []);
+  // Each half alone is ordinary: a generator on a surface with no open-transition
+  // seed (the edit dialogs), and a seeded dialog with no generator at all.
+  assert.deepEqual(
+    finishAndSurface(
+      "  const { generate } = useGeneratePrDescription(repoPath);",
+    ),
+    [],
+  );
+  assert.deepEqual(finishAndSurface("  useSeedOnOpen(open, seedOnOpen);"), []);
+  // A generator named in a comment is not a call site.
+  const documented = [
+    "  // useGeneratePrDescription() streams into this dialog's form.",
+    "  useSeedOnOpen(open, seedOnOpen);",
+  ].join("\n");
+  assert.deepEqual(finishAndSurface(documented), []);
+});
+
+test("generator-dialog-finish-and-surface applies to .tsx call sites only", () => {
+  // The .ts bound is what keeps each hook's own definition file — whose export
+  // line matches the call pattern — from reading as a violation.
+  const { appliesTo } = CHECKS.find(
+    (c) => c.name === "generator-dialog-finish-and-surface",
+  );
+  assert.equal(
+    appliesTo("src/features/pulls/useGeneratePrDescription.ts"),
+    false,
+  );
+  assert.equal(appliesTo("src/components/ui/dialog.tsx"), false);
+  assert.equal(appliesTo("src/features/pulls/CreatePrDialog.tsx"), true);
+});
+
+test("lone-activity-boundary flags a JSX Activity in either spelling", () => {
+  assert.deepEqual(
+    loneActivity('<Activity mode="hidden">{kids}</Activity>'),
+    [1],
+  );
+  assert.deepEqual(loneActivity("<Activity>{kids}</Activity>"), [1]);
+});
+
+test("lone-activity-boundary ignores same-prefixed components and prose", () => {
+  for (const tag of [
+    "<ActivityDock />",
+    "<ActivityBell />",
+    "<ActivityStrip/>",
+  ])
+    assert.deepEqual(loneActivity(tag), [], `should ignore ${tag}`);
+  // The many comments naming <Activity> are what comment stripping keeps clean.
+  assert.deepEqual(
+    loneActivity("// a hidden <Activity> subtree still fetches"),
+    [],
+  );
+});
+
+test("hand-rolled-diff-stat flags both minus glyphs and a wrapped class list", () => {
+  const ascii = [
+    '<span className="shrink-0 tabular-nums">',
+    '  <span className="text-success">+{file.added}</span>{" "}',
+    '  <span className="text-destructive">-{file.deleted}</span>',
+    "</span>",
+  ].join("\n");
+  assert.deepEqual(diffStatPair(ascii), [2]);
+  // The Insights spelling: U+2212, and counts routed through a formatter.
+  const unicode = [
+    '<span className="text-success">+{fmt(c.additions)}</span>{" "}',
+    '<span className="text-destructive">−{fmt(c.deletions)}</span>',
+  ].join("\n");
+  assert.deepEqual(diffStatPair(unicode), [1]);
+  // A cn()-wrapped class list, each count on its own wrapped line.
+  const wrapped = [
+    '<span className={cn("text-success", PLACEHOLDER_FADE, staleDim)}>',
+    "  +{totalAdded}",
+    "</span>",
+    '<span className={cn("text-destructive", PLACEHOLDER_FADE, staleDim)}>',
+    "  -{totalDeleted}",
+    "</span>",
+  ].join("\n");
+  assert.deepEqual(diffStatPair(wrapped), [1]);
+  // The boundary the 200-char class run exists for: a cn() list carrying
+  // conditional utilities puts 95 chars between the class name and its `>`.
+  const longList = [
+    '<span className={cn("text-success", PLACEHOLDER_FADE, staleDim,',
+    '  isActive && "font-medium", compact ? "text-[10px]" : "text-xs")}>',
+    "  +{a}",
+    "</span>",
+    '<span className={cn("text-destructive", PLACEHOLDER_FADE, staleDim,',
+    '  isActive && "font-medium", compact ? "text-[10px]" : "text-xs")}>',
+    "  -{d}",
+    "</span>",
+  ].join("\n");
+  assert.deepEqual(diffStatPair(longList), [1]);
+});
+
+test("hand-rolled-diff-stat leaves the component route and lone tokens alone", () => {
+  assert.deepEqual(
+    diffStatPair("<DiffStat added={file.added} deleted={file.deleted} />"),
+    [],
+  );
+  // A success/destructive pair with no counts between them — the ordinary use.
+  const statuses = [
+    '<span className="text-success">Passing</span>',
+    '<span className="text-destructive">{failed} failed</span>',
+  ].join("\n");
+  assert.deepEqual(diffStatPair(statuses), []);
+  // Half the idiom is not the idiom.
+  assert.deepEqual(
+    diffStatPair('<span className="text-success">+{added}</span>'),
+    [],
+  );
+});
+
+test("hand-rolled-diff-stat exempts the component file and vendored ui only", () => {
+  const { appliesTo } = CHECKS.find((c) => c.name === "hand-rolled-diff-stat");
+  assert.equal(appliesTo("src/components/diff-stat.tsx"), false);
+  assert.equal(appliesTo("src/components/ui/badge.tsx"), false);
+  assert.equal(appliesTo("src/features/repository/FileRow.tsx"), true);
+});
+
+test("kind-badge-single-source flags a re-declared table, exported or not", () => {
+  // The two duplicates' own shape: a typed Record the formatter splits after
+  // the `=`, so only the keyword-plus-name line has to match.
+  const local = [
+    "const KIND_BADGE: Record<",
+    "  ChangeKind,",
+    "  { letter: string; label: string; className: string }",
+    "> = {",
+    '  added: { letter: "A", label: "Added", className: "text-success" },',
+    "};",
+  ].join("\n");
+  assert.deepEqual(kindBadge(local), [1]);
+  assert.deepEqual(
+    kindBadge('export const KIND_BADGE = { added: { letter: "A" } };'),
+    [1],
+  );
+});
+
+test("kind-badge-single-source leaves imports and reads of the shared table alone", () => {
+  for (const source of [
+    'import { KIND_BADGE } from "@/lib/git/change-kind-badge";',
+    "const badge = KIND_BADGE[kind];",
+    // A differently-named table is outside this check's shape by design.
+    "const KIND_GLYPH = { added: PlusIcon };",
+    // The comment naming the banned shape is what comment stripping keeps clean.
+    "// a second `const KIND_BADGE` drifts from the shared table",
+  ])
+    assert.deepEqual(kindBadge(source), [], `should ignore ${source}`);
+});
+
+test("kind-badge-single-source exempts the shared module only", () => {
+  const { appliesTo } = CHECKS.find(
+    (c) => c.name === "kind-badge-single-source",
+  );
+  assert.equal(appliesTo("src/lib/git/change-kind-badge.ts"), false);
+  assert.equal(appliesTo("src/features/repository/FileRow.tsx"), true);
+  assert.equal(appliesTo("src/features/commit/CommitDialog.tsx"), true);
+});
+
+test("null-suspense-fallback flags the literal on one line or wrapped", () => {
+  assert.deepEqual(
+    nullFallback("<Suspense fallback={null}>{kids}</Suspense>"),
+    [1],
+  );
+  // The formatter's shape: the prop on its own line, with inner spacing.
+  const wrapped = [
+    "<Suspense",
+    "  fallback={ null }",
+    ">",
+    "  <InsightsBoard />",
+    "</Suspense>",
+  ].join("\n");
+  assert.deepEqual(nullFallback(wrapped), [2]);
+});
+
+test("null-suspense-fallback leaves a real fallback and a forwarded prop alone", () => {
+  for (const source of [
+    '<Suspense fallback={<LazyPanelFallback name="Insights" />}>{kids}</Suspense>',
+    // A fallback naming a binding, not a literal — outside the check's shape.
+    "<Suspense fallback={fallback}>{kids}</Suspense>",
+    "<Suspense fallback={compact ? null : <Skeleton />}>{kids}</Suspense>",
+  ])
+    assert.deepEqual(nullFallback(source), [], `should ignore ${source}`);
+});
+
+test("bare-group-label flags an attribute-less Label caption", () => {
+  const caption = [
+    '<div className="space-y-2">',
+    "  <Label>Rules</Label>",
+    '  <RuleToggle label="Require a pull request" checked={d.requirePr} />',
+    "</div>",
+  ].join("\n");
+  assert.deepEqual(bareGroupLabel(caption), [2]);
+  assert.deepEqual(bareGroupLabel("<Label>{label}</Label>"), [1]);
+  // Two captions in one file are two findings, so a partial conversion can't
+  // read as clean once the first is fixed.
+  const two = ["<Label>Features</Label>", "<Label>Commits</Label>"].join("\n");
+  assert.deepEqual(bareGroupLabel(two), [1, 2]);
+});
+
+test("bare-group-label flags a styled caption — className is not association", () => {
+  // The most common spelling of the defect: a caption that looks deliberate
+  // because it carries styling, but still names nothing.
+  for (const source of [
+    '<Label className="text-xs">Rules</Label>',
+    '<Label className="text-xs text-muted-foreground">Pending invitations</Label>',
+    // Styled AND self-closing, in both spellings.
+    '<Label className="text-xs" />',
+    "<Label/>",
+    "<Label />",
+  ])
+    assert.deepEqual(bareGroupLabel(source), [1], `should flag ${source}`);
+});
+
+test("bare-group-label sees an open tag the formatter split across lines", () => {
+  // The joined view is what makes this work: it trims each line and rejoins
+  // with one space, which the `\s` between attributes absorbs.
+  const split = [
+    "<Label",
+    "  key={e.id}",
+    '  className="flex items-center gap-1.5 text-xs"',
+    ">",
+    "  Trigger events",
+    "</Label>",
+  ].join("\n");
+  assert.deepEqual(bareGroupLabel(split), [1]);
+  // A split open tag that DOES associate still passes — the lookahead reaches
+  // across the rejoined attributes.
+  const splitAssociated = [
+    "<Label",
+    "  htmlFor={`${idBase}-name`}",
+    '  className="text-xs"',
+    ">",
+  ].join("\n");
+  assert.deepEqual(bareGroupLabel(splitAssociated), []);
+});
+
+test("bare-group-label leaves every ASSOCIATED label alone", () => {
+  for (const source of [
+    // The single-control idiom.
+    '<Label htmlFor="pages-cname">Custom domain</Label>',
+    // The group idiom LabeledGroup emits — the id is what names the group.
+    "<Label id={id}>{label}</Label>",
+    // Association plus styling: the id still answers for the whole tag.
+    '<Label id={invitesLabelId} className="text-xs text-muted-foreground">',
+    // A lowercase `<label>` is the DOM element, not this component.
+    '<label className="flex items-center gap-2"><Checkbox />Issues</label>',
+    // The LabeledGroup call site itself.
+    '<LabeledGroup label="Rules">{children}</LabeledGroup>',
+  ])
+    assert.deepEqual(bareGroupLabel(source), [], `should ignore ${source}`);
+  // Comment stripping keeps the doc comment that NAMES the banned shape clean.
+  assert.deepEqual(
+    bareGroupLabel("// a bare `<Label>` names nothing for assistive tech"),
+    [],
+  );
+});
+
+test("bare-group-label allowlists whole files, and exempts vendored ui", () => {
+  const check = CHECKS.find((c) => c.name === "bare-group-label");
+  assert.equal(check.appliesTo("src/components/ui/label.tsx"), false);
+  assert.equal(check.appliesTo("src/components/form/labeled-group.tsx"), true);
+  assert.equal(
+    check.appliesTo("src/features/repo-settings/PagesSection.tsx"),
+    true,
+  );
+  // Entries are keyed per file: a WRAPPING label (implicit association, which
+  // neither htmlFor nor id can express) is suppressed by its file's entry, and an
+  // unlisted file still reports.
+  const files = [
+    "src/features/repo-settings/GitLabVariablesSection.tsx",
+    "src/features/repo-settings/GitLabWebhooksSection.tsx",
+    "src/features/repo-settings/PagesSection.tsx",
+  ];
+  const views = new Map([
+    [
+      "src/features/repo-settings/GitLabVariablesSection.tsx",
+      view(
+        '<Label className="flex items-center gap-1.5 text-xs">\n<Checkbox checked={isProtected} />\nProtected\n</Label>',
+      ),
+    ],
+    // A wrapping label whose open tag the formatter split — the webhook shape.
+    [
+      "src/features/repo-settings/GitLabWebhooksSection.tsx",
+      view(
+        [
+          "<Label",
+          "  key={e.id}",
+          '  className="flex items-center gap-1.5 text-xs font-normal"',
+          ">",
+          "  <Checkbox checked={events.includes(e.id)} />",
+          "  {e.label}",
+          "</Label>",
+        ].join("\n"),
+      ),
+    ],
+    [
+      "src/features/repo-settings/PagesSection.tsx",
+      view("<Label>Source</Label>"),
+    ],
+  ]);
+  const { violations } = runCheck(check, files, views);
+  assert.deepEqual(violations, [
+    "src/features/repo-settings/PagesSection.tsx:1",
+  ]);
+});
+
+test("unguarded-binding-dispatcher flags a swallowing dispatch with no guard", () => {
+  // The shape the class fix closed: a second listener matching the live event
+  // against a user binding and swallowing the key, with no editable guard.
+  const source = [
+    "function onKeyDown(e) {",
+    "  const binding = eventToBinding(e);",
+    "  if (binding && binding === effective) {",
+    "    e.preventDefault();",
+    "    run();",
+    "  }",
+    "}",
+  ].join("\n");
+  assert.deepEqual(unguardedDispatcher(source), [2]);
+});
+
+test("unguarded-binding-dispatcher needs both tokens and clears on the full clause", () => {
+  // Each token alone is ordinary: a binding read that swallows nothing, and a
+  // preventDefault with no binding comparison at all.
+  assert.deepEqual(
+    unguardedDispatcher("const hint = eventToBinding(e) ?? null;"),
+    [],
+  );
+  assert.deepEqual(unguardedDispatcher("e.preventDefault();"), []);
+  // The WHOLE clause named ANYWHERE in the file clears it — the coarseness is
+  // the documented trade: presence, not proof it guards this path. Mirrors the
+  // canonical clause in hotkeys.tsx, because fixtures get copied.
+  const guarded = [
+    "function onKeyDown(e) {",
+    "  const binding = eventToBinding(e);",
+    "  if (!binding) return;",
+    "  if (isEditableTarget(e.target) && !firesInEditable(binding)) return;",
+    "  if (",
+    "    !hasModifier(binding) &&",
+    "    isTypeaheadKey(binding) &&",
+    "    isTypeaheadTarget(e.target)",
+    "  )",
+    "    return;",
+    "  if (binding === effective) e.preventDefault();",
+    "}",
+  ].join("\n");
+  assert.deepEqual(unguardedDispatcher(guarded), []);
+});
+
+test("unguarded-binding-dispatcher flags a HALF-guarded dispatcher", () => {
+  // The two guards refuse different surfaces, so one without the other still
+  // steals keys from the surface it does not cover.
+  const editableOnly = [
+    "function onKeyDown(e) {",
+    "  if (isEditableTarget(e.target)) return;",
+    "  const binding = eventToBinding(e);",
+    "  if (binding === effective) e.preventDefault();",
+    "}",
+  ].join("\n");
+  assert.deepEqual(unguardedDispatcher(editableOnly), [3]);
+  const typeaheadOnly = [
+    "function onKeyDown(e) {",
+    "  if (isTypeaheadTarget(e.target)) return;",
+    "  const binding = eventToBinding(e);",
+    "  if (binding === effective) e.preventDefault();",
+    "}",
+  ].join("\n");
+  assert.deepEqual(unguardedDispatcher(typeaheadOnly), [3]);
+  // A key-narrowing helper is NOT a substitute for either target guard.
+  const narrowingOnly = [
+    "function onKeyDown(e) {",
+    "  if (!isTypeaheadKey(binding)) return;",
+    "  const binding = eventToBinding(e);",
+    "  if (binding === effective) e.preventDefault();",
+    "}",
+  ].join("\n");
+  assert.deepEqual(unguardedDispatcher(narrowingOnly), [3]);
+  // Two of three is still a subset: both target guards without the key half
+  // is the drift shape — one dispatcher narrowing by key, its twin not.
+  const targetsOnly = [
+    "function onKeyDown(e) {",
+    "  if (isEditableTarget(e.target)) return;",
+    "  if (isTypeaheadTarget(e.target)) return;",
+    "  const binding = eventToBinding(e);",
+    "  if (binding === effective) e.preventDefault();",
+    "}",
+  ].join("\n");
+  assert.deepEqual(unguardedDispatcher(targetsOnly), [4]);
+});
+
+test("unguarded-binding-dispatcher allowlists the non-rebindable dispatchers", () => {
+  const check = CHECKS.find((c) => c.name === "unguarded-binding-dispatcher");
+  const files = [
+    "src/features/settings/KeyboardSection.tsx",
+    "src/features/pulls/SomeNewView.tsx",
+  ];
+  const dispatcher = [
+    "const binding = eventToBinding(e);",
+    "if (binding === effective) e.preventDefault();",
+  ].join("\n");
+  const views = new Map([
+    ["src/features/settings/KeyboardSection.tsx", view(dispatcher)],
+    ["src/features/pulls/SomeNewView.tsx", view(dispatcher)],
+  ]);
+  // The recorder is exempt by contract; a NEW file with the same shape is not.
+  assert.deepEqual(runCheck(check, files, views).violations, [
+    "src/features/pulls/SomeNewView.tsx:1",
+  ]);
+});
+
+test("titled-disabled-trigger flags both spellings of the hover-only reason", () => {
+  // `disabled` on the trigger — the shape the pickers shipped in.
+  const onTrigger = [
+    "<span",
+    "  title={disabledReason}",
+    '  className={disabledReason ? "inline-flex cursor-not-allowed" : "inline-flex"}',
+    ">",
+    "  <Popover.Trigger",
+    "    disabled={!!disabledReason}",
+    '    render={<Button variant="ghost" size="xs" aria-label="Edit labels" />}',
+    "  >",
+    "    Labels",
+    "  </Popover.Trigger>",
+    "</span>",
+  ].join("\n");
+  // Line 2, not 1: the match starts at the `title`, so a hit points at the
+  // reason carrier rather than at the wrapper's opening tag.
+  assert.deepEqual(titledDisabledTrigger(onTrigger), [2]);
+  // Same class, `disabled` inside the render element instead — the reason is
+  // hover-only either way, which is why the pattern anchors on the wrapper.
+  const inRender = [
+    '<span title={staleReason} className="inline-flex">',
+    "  <DropdownMenuTrigger",
+    "    render={",
+    '      <Button variant="outline" size="xs" disabled={detailsStale} />',
+    "    }",
+    "  >",
+    "    <DotsThreeIcon />",
+    "  </DropdownMenuTrigger>",
+    "</span>",
+  ].join("\n");
+  assert.deepEqual(titledDisabledTrigger(inRender), [1]);
+});
+
+test("titled-disabled-trigger leaves the primitive and the non-trigger wrappers alone", () => {
+  // The fixed composition: no wrapper of its own, and the primitive's name in
+  // the window blocks the match even if one survived for layout.
+  const converted = [
+    "<Popover.Trigger",
+    "  render={",
+    "    <DisabledReasonButton",
+    '      variant="ghost"',
+    '      aria-label="Edit labels"',
+    "      disabled={!!disabledReason}",
+    "      reason={disabledReason}",
+    "    />",
+    "  }",
+    ">",
+    "  Labels",
+    "</Popover.Trigger>",
+  ].join("\n");
+  assert.deepEqual(titledDisabledTrigger(converted), []);
+  const survivingWrapper = [
+    '<span title={disabledReason} className="inline-flex">',
+    "  <Popover.Trigger",
+    "    render={<DisabledReasonButton disabled={!!disabledReason} reason={disabledReason} />}",
+    "  >",
+    "    Labels",
+    "  </Popover.Trigger>",
+    "</span>",
+  ].join("\n");
+  assert.deepEqual(titledDisabledTrigger(survivingWrapper), []);
+  // A titled wrapper around a disabled NON-trigger control is the sanctioned
+  // idiom for inputs the primitive can't wrap — no trigger tag, no match.
+  for (const control of [
+    '  <Input id="issue-due-date" type="date" disabled={blocked} />',
+    '  <Switch id="issue-confidential" disabled={!!disabledReason} />',
+  ]) {
+    const wrapped = [
+      '<span title={disabledReason} className="inline-flex">',
+      control,
+      "</span>",
+    ].join("\n");
+    assert.deepEqual(titledDisabledTrigger(wrapped), []);
+  }
+  // A menu SUB-trigger carries its reason in its own label (a disabled item has
+  // no room for a tooltip), so it is excluded by name as well as by structure —
+  // this fixture puts a titled wrapper around one to prove the name arm.
+  const subTrigger = [
+    '<span title={disabledReason} className="inline-flex">',
+    "  <DropdownMenuSubTrigger",
+    "    disabled={!!disabledReason}",
+    '    className="data-disabled:opacity-50"',
+    "  >",
+    "    Hide…{disabledSuffix}",
+    "  </DropdownMenuSubTrigger>",
+    "</span>",
+  ].join("\n");
+  assert.deepEqual(titledDisabledTrigger(subTrigger), []);
+  // Triggers that take `disabled` with no reason contract at all: nothing titles
+  // them, so the wrapper anchor keeps them out without naming them.
+  const plain = [
+    '<TabsTrigger value="files" disabled={!hasFiles}>Files</TabsTrigger>',
+    '<ContextMenuTrigger disabled={locked} render={<button type="button" />} />',
+  ].join("\n");
+  assert.deepEqual(titledDisabledTrigger(plain), []);
+  // Tempering stops the scan where an element closes: a titled span that already
+  // finished cannot pair with a later sibling's disabled trigger.
+  const stacked = [
+    '<span title={hint} className="inline-flex">',
+    "  <Badge>{count}</Badge>",
+    "</span>",
+    "<DropdownMenuTrigger disabled={busy} render={<Button />}>",
+    "  Menu",
+    "</DropdownMenuTrigger>",
+  ].join("\n");
+  assert.deepEqual(titledDisabledTrigger(stacked), []);
+});
+
+test("titled-disabled-trigger reports every site now that the allowlist is empty", () => {
+  const check = CHECKS.find((c) => c.name === "titled-disabled-trigger");
+  const row = [
+    '<span title={heldReason} className="inline-flex">',
+    "  <Popover.Trigger",
+    "    disabled={!!heldReason}",
+    '    render={<Button variant="ghost" size="xs" />}',
+    "  >",
+    "    Projects",
+    "  </Popover.Trigger>",
+    "</span>",
+  ].join("\n");
+  const files = [
+    "src/features/conversations/ProjectsPopover.tsx",
+    "src/features/issues/SomeNewPicker.tsx",
+  ];
+  const views = new Map(files.map((f) => [f, view(row)]));
+  // Every residual site converted, so the allowlist is empty: this ONE former
+  // entry's path reports again alongside a fresh one, rather than staying
+  // quiet as it did before. The separate stale-allowlist test is what pins
+  // the general mechanism for every entry, past or future.
+  assert.deepEqual(runCheck(check, files, views).violations, [
+    "src/features/conversations/ProjectsPopover.tsx:1",
+    "src/features/issues/SomeNewPicker.tsx:1",
+  ]);
+});
+
+test("titled-badge flags a title on a Badge, on one line or wrapped", () => {
+  assert.deepEqual(
+    titledBadge('<Badge variant="secondary" title="Managed on the group">'),
+    [1],
+  );
+  // The formatter's shape: the title several props into a split open tag, past
+  // an arrow-valued prop the attribute run must step over.
+  const wrapped = [
+    '<div className="flex items-center gap-2">',
+    "  <Badge",
+    '    variant="outline"',
+    "    onClick={() => setOpen(true)}",
+    '    className="shrink-0 text-warning"',
+    '    title={lockReason ? `Locked: ${lockReason}` : "Locked"}',
+    "  >",
+    "    Locked",
+    "  </Badge>",
+    "</div>",
+  ].join("\n");
+  assert.deepEqual(titledBadge(wrapped), [2]);
+});
+
+test("titled-badge leaves untitled badges and titles on other elements alone", () => {
+  for (const source of [
+    '<Badge variant="secondary">protected</Badge>',
+    '<StatusDetailChip variant="secondary" label="Inherited" detail={hint} />',
+    // A clip-titled sibling beside a plain badge: the open tag bounds the scan,
+    // so the neighbour's title never pairs with the badge.
+    '<Badge variant="secondary">inactive</Badge><p className="truncate" title={h.url}>{h.url}</p>',
+    '<p className="truncate" title={h.url}>{h.url}</p><Badge variant="secondary">inactive</Badge>',
+    // Look-alike props and a different component sharing the prefix.
+    '<Badge subtitle="x" data-title="y">z</Badge>',
+    '<BadgeList title="Labels" />',
+  ])
+    assert.deepEqual(titledBadge(source), [], `should ignore ${source}`);
+  // Comment stripping keeps prose that NAMES the banned shape clean.
+  assert.deepEqual(
+    titledBadge('// never <Badge title="…"> — use the chip'),
+    [],
+  );
+});
+
+test("ungated-notification-producer flags both routes around the gate", () => {
+  // The inbox route, in the spellings the seven producers shipped in: the lone
+  // import, the mixed one, and the formatter-wrapped specifier list.
+  assert.deepEqual(
+    ungatedProducer(
+      'import { pushNotification } from "@/lib/stores/notifications";',
+    ),
+    [1],
+  );
+  assert.deepEqual(
+    ungatedProducer(
+      'import { pushNotification, repoNameFromPath } from "@/lib/stores/notifications";',
+    ),
+    [1],
+  );
+  const wrapped = [
+    "import {",
+    "  type NotificationKind,",
+    "  type NotificationTone,",
+    "  pushNotification,",
+    "  repoNameFromPath,",
+    '} from "@/lib/stores/notifications";',
+  ].join("\n");
+  assert.deepEqual(ungatedProducer(wrapped), [1]);
+  // A rename still reaches the same function, so the specifier's SOURCE name is
+  // what the pattern keys on.
+  assert.deepEqual(
+    ungatedProducer(
+      'import { pushNotification as push } from "@/lib/stores/notifications";',
+    ),
+    [1],
+  );
+  // The OS route: every export of the notify module is a direct ping, so the
+  // module path alone is the match — specifier and namespace forms together.
+  for (const source of [
+    'import { notify } from "@/lib/notify";',
+    'import { notifyIfUnfocused } from "@/lib/notify";',
+    'import { notify, notifyIfUnfocused } from "@/lib/notify";',
+    'import * as pings from "@/lib/notify";',
+  ])
+    assert.deepEqual(ungatedProducer(source), [1], `should flag ${source}`);
+  // A file taking both routes reports each on its own line.
+  const both = [
+    'import { notifyIfUnfocused } from "@/lib/notify";',
+    'import { pushNotification } from "@/lib/stores/notifications";',
+  ].join("\n");
+  assert.deepEqual(
+    ungatedProducer(both).sort((a, b) => a - b),
+    [1, 2],
+  );
+});
+
+test("ungated-notification-producer sees past the alias into relative spellings", () => {
+  // Both modules are reachable by path as well as by alias, and a producer may
+  // legitimately sit in either directory — src/lib/stores/ already spells the
+  // inbox module `./notifications` for an unrelated helper. Anchoring on the
+  // trailing path segment is what keeps the alias from being the whole gate.
+  for (const source of [
+    'import { pushNotification } from "./notifications";',
+    'import { pushNotification } from "../stores/notifications";',
+    'import { pushNotification } from "../../lib/stores/notifications";',
+    'import { pushNotification, repoNameFromPath } from "./notifications";',
+    'import { notify } from "./notify";',
+    'import { notifyIfUnfocused } from "../notify";',
+    'import { notifyIfUnfocused } from "../../lib/notify";',
+  ])
+    assert.deepEqual(ungatedProducer(source), [1], `should flag ${source}`);
+});
+
+test("ungated-notification-producer flags a namespace import of the inbox module", () => {
+  // `notifs.pushNotification(row)` names nothing at the import, so the
+  // specifier arm cannot see it — hence its own arm, in every spelling.
+  for (const source of [
+    'import * as notifs from "@/lib/stores/notifications";',
+    'import * as notifs from "./notifications";',
+    'import * as inbox from "../stores/notifications";',
+  ])
+    assert.deepEqual(ungatedProducer(source), [1], `should flag ${source}`);
+  // The namespace arm is scoped to the inbox module: a namespace import of any
+  // OTHER module, the gate's own neighbours included, is ordinary.
+  for (const source of [
+    'import * as overrides from "@/lib/notifications/overrides";',
+    'import * as api from "@/lib/settings/api";',
+  ])
+    assert.deepEqual(ungatedProducer(source), [], `should ignore ${source}`);
+});
+
+test("ungated-notification-producer leaves the gate's own siblings alone", () => {
+  for (const source of [
+    // The converted producer's imports: the gate, the resolution helpers, and
+    // the type-only / helper exports the inbox module also carries.
+    'import { emitNotification } from "@/lib/notifications/emit";',
+    'import { repoNameFromPath } from "@/lib/stores/notifications";',
+    'import type { NotificationTarget } from "@/lib/stores/notifications";',
+    'import { type NotificationKind, repoNameFromPath } from "@/lib/stores/notifications";',
+    // The RELATIVE spellings of those same legal imports — the segment anchor
+    // widened the module match, never the identifier one. The first line is
+    // src/lib/stores/repo-description-generation.ts's real import.
+    'import { repoNameFromPath } from "./notifications";',
+    'import type { NotificationKind } from "../stores/notifications";',
+    // A neighbouring import cannot supply the token: `[^}]*` stops at the
+    // import's own closing brace.
+    'import { pushNotification } from "@/lib/stores/other";\nimport { repoNameFromPath } from "@/lib/stores/notifications";',
+    // A CALL with no import of its own is emit.ts's own shape — the check is
+    // anchored on the import, which is what a producer cannot avoid.
+    "if (channels.inApp) pushNotification(row);",
+    // The comment naming the banned route is what comment stripping keeps clean.
+    '// never import { notifyIfUnfocused } from "@/lib/notify" in a producer',
+  ])
+    assert.deepEqual(ungatedProducer(source), [], `should ignore ${source}`);
+});
+
+test("ungated-notification-producer exempts the gate module only", () => {
+  const { appliesTo } = CHECKS.find(
+    (c) => c.name === "ungated-notification-producer",
+  );
+  assert.equal(appliesTo("src/lib/notifications/emit.ts"), false);
+  assert.equal(appliesTo("src/lib/notifications/overrides.ts"), true);
+  assert.equal(appliesTo("src/lib/stores/notifications.ts"), true);
+  assert.equal(appliesTo("src/features/sessions/store.ts"), true);
+});
+
+test("hand-rolled-store-open flags both routes to a hand-opened store", () => {
+  for (const source of [
+    // The import route, in every spelling a store module used: the value import,
+    // the mixed value + type import the converted files all had, and an alias.
+    'import { load } from "@tauri-apps/plugin-store";',
+    'import { load, type Store } from "@tauri-apps/plugin-store";',
+    'import { load as openStore } from "@tauri-apps/plugin-store";',
+  ])
+    assert.deepEqual(handRolledStoreOpen(source), [1], `should flag ${source}`);
+  // The call route — the backstop for a load the import arm cannot see.
+  assert.deepEqual(
+    handRolledStoreOpen('const s = await load(storeName("x.json"), {});'),
+    [1],
+  );
+});
+
+test("hand-rolled-store-open sees the memo across the wrapped call", () => {
+  const source = [
+    'import * as store from "@tauri-apps/plugin-store";',
+    "",
+    "let storePromise = null;",
+    "function getStore() {",
+    '  storePromise ??= store.load(storeName("x.json"), {',
+    "    autoSave: true,",
+    "    defaults: {},",
+    "  });",
+    "  return storePromise;",
+    "}",
+  ].join("\n");
+  // The namespace import carries no `load` specifier, so only the call arm fires.
+  assert.deepEqual(handRolledStoreOpen(source), [5]);
+});
+
+test("hand-rolled-store-open leaves the helper route and type-only imports alone", () => {
+  for (const source of [
+    // The converted shape: the helper, and the `Store` type the stores that take a
+    // store-typed parameter still need.
+    'import { memoizedStoreLoader } from "@/lib/plugin-store";\nconst getStore = memoizedStoreLoader("x.json");',
+    'import type { Store } from "@tauri-apps/plugin-store";',
+    'import { type Store } from "@tauri-apps/plugin-store";',
+    // A neighbouring import cannot supply the token: `[^}]*` stops at the import's
+    // own closing brace.
+    'import { load } from "./other";\nimport { type Store } from "@tauri-apps/plugin-store";',
+    // A same-named import of something else entirely.
+    'import { load } from "@/lib/settings/api";',
+    // The idiom named in a comment is not a use of it.
+    '// never `storePromise ??= load(storeName("x.json"), …)` — see plugin-store.ts',
+  ])
+    assert.deepEqual(
+      handRolledStoreOpen(source),
+      [],
+      `should ignore ${source}`,
+    );
+});
+
+test("hand-rolled-store-open exempts the helper module only", () => {
+  const { appliesTo } = CHECKS.find((c) => c.name === "hand-rolled-store-open");
+  assert.equal(appliesTo("src/lib/plugin-store.ts"), false);
+  assert.equal(appliesTo("src/lib/jira/store.ts"), true);
+  assert.equal(appliesTo("src/lib/repo-data-migration.ts"), true);
+});
+
+test("raw-store-reload flags a bare store reload, wrapped or not", () => {
+  assert.deepEqual(
+    rawStoreReload("await store.reload({ ignoreDefaults: true });"),
+    [1],
+  );
+  assert.deepEqual(rawStoreReload("await store.reload();"), [1]);
+  const wrapped = [
+    "async function reloadRaw(store) {",
+    "  try {",
+    "    await store.reload({",
+    "      ignoreDefaults: true,",
+    "    });",
+    "  } catch {}",
+    "}",
+  ].join("\n");
+  assert.deepEqual(rawStoreReload(wrapped), [3]);
+});
+
+test("raw-store-reload leaves the helper route and a webview reload alone", () => {
+  for (const source of [
+    // The converted shape.
+    'import { reloadToleratingEmptyStore } from "@/lib/plugin-store";\nawait reloadToleratingEmptyStore(await getStore());',
+    // A different API entirely — excluded by the lookbehind, not by an allowlist.
+    "<button onClick={() => window.location.reload()}>Reload</button>",
+    "location.reload();",
+    // Comment stripping keeps prose about the banned call clean.
+    "// a bare store.reload() would swallow an unreadable file",
+  ])
+    assert.deepEqual(rawStoreReload(source), [], `should ignore ${source}`);
+});
+
+test("raw-store-reload exempts the helper module only", () => {
+  const { appliesTo } = CHECKS.find((c) => c.name === "raw-store-reload");
+  assert.equal(appliesTo("src/lib/plugin-store.ts"), false);
+  assert.equal(appliesTo("src/lib/issues/local.ts"), true);
+  assert.equal(appliesTo("src/components/ErrorBoundary.tsx"), true);
+});
+
+test("inline-repo-identity-query flags an inline observer of the shared key", () => {
+  // The pre-fix shape all three observers had: the key spelled at the call site,
+  // with its own options — which is how they drifted on networkMode.
+  const inline = [
+    "const { data: identity } = useQuery({",
+    '  queryKey: ["repo-identity", repoPath],',
+    "  queryFn: () => repoIdentity(repoPath),",
+    "  enabled: !!repoPath,",
+    "});",
+  ].join("\n");
+  assert.deepEqual(inlineRepoIdentityQuery(inline), [2]);
+  // A cache read or an invalidation reaches the same key without useQuery at all.
+  assert.deepEqual(
+    inlineRepoIdentityQuery(
+      'qc.invalidateQueries({ queryKey: ["repo-identity", repo] });',
+    ),
+    [1],
+  );
+  // Every quote style: the anchor is the quote pair, not the house style — and a
+  // template literal is a valid key segment, so it must not slip past.
+  assert.deepEqual(
+    inlineRepoIdentityQuery("const k = ['repo-identity', r];"),
+    [1],
+  );
+  assert.deepEqual(
+    inlineRepoIdentityQuery("const k = [`repo-identity`, r];"),
+    [1],
+  );
+});
+
+test("inline-repo-identity-query leaves the factory route and the longer key alone", () => {
+  for (const source of [
+    // The converted shape: the options come from the factory, key included.
+    'import { repoIdentityQueryOptions } from "@/lib/git/repo-identity-query";\nconst q = useQuery(repoIdentityQueryOptions(repoPath));',
+    // A neighbouring repo-identity-flavoured key (NotificationsSection's own) that
+    // is not this literal, and a hypothetical one sharing this exact PREFIX — the
+    // closing-quote anchor is the only thing keeping the second out.
+    'queryKey: ["notification-override-repo-identities", recentPaths],',
+    'queryKey: ["repo-identity-scope", repoPath],',
+    // The hook consumers, which never name the key.
+    "const identity = useRepoIdentity(repoPath).data;",
+    // Comment stripping keeps the several doc mentions of the key clean.
+    '// every observer of ["repo-identity", repoPath] spreads the factory',
+  ])
+    assert.deepEqual(
+      inlineRepoIdentityQuery(source),
+      [],
+      `should ignore ${source}`,
+    );
+});
+
+test("inline-repo-identity-query exempts the factory module only", () => {
+  const { appliesTo } = CHECKS.find(
+    (c) => c.name === "inline-repo-identity-query",
+  );
+  assert.equal(appliesTo("src/lib/git/repo-identity-query.ts"), false);
+  assert.equal(appliesTo("src/lib/git/queries/core.ts"), true);
+  assert.equal(appliesTo("src/lib/settings/queries.ts"), true);
+  assert.equal(appliesTo("src/lib/scripts/queries.ts"), true);
+});
+
+test("queries-internal-import flags every spelling that reaches the private module", () => {
+  // The alias route, which is how a feature file would most likely reach it.
+  assert.deepEqual(
+    queriesInternalImport(
+      'import { useRepoMutation } from "@/lib/git/queries/internal";',
+    ),
+    [1],
+  );
+  // Relative routes of any depth, including a sibling inside src/lib/git/.
+  assert.deepEqual(
+    queriesInternalImport(
+      'import { workingTreeKeys } from "./queries/internal";',
+    ),
+    [1],
+  );
+  assert.deepEqual(
+    queriesInternalImport(
+      'import { useRepoMutation } from "../../lib/git/queries/internal";',
+    ),
+    [1],
+  );
+  // An explicit extension, and the dynamic-import spelling, reach the same module.
+  assert.deepEqual(
+    queriesInternalImport('export { x } from "@/lib/git/queries/internal.ts";'),
+    [1],
+  );
+  assert.deepEqual(
+    queriesInternalImport(
+      'const m = await import("@/lib/git/queries/internal");',
+    ),
+    [1],
+  );
+  // Non-normalized spellings that still RESOLVE to the private module. A pattern
+  // matched against the raw path misses both; segment normalization is why these
+  // are caught.
+  assert.deepEqual(
+    queriesInternalImport('import { x } from "@/lib/git/queries/./internal";'),
+    [1],
+  );
+  assert.deepEqual(
+    queriesInternalImport(
+      'import { x } from "@/lib/git/queries/core/../internal";',
+    ),
+    [1],
+  );
+  // A subpath: internal.ts splitting into an internal/ directory is exactly the
+  // move this package just made, so the boundary has to survive it.
+  assert.deepEqual(
+    queriesInternalImport(
+      'import { x } from "@/lib/git/queries/internal/keys";',
+    ),
+    [1],
+  );
+});
+
+test("queries-internal-import leaves the barrel and other packages' aliases alone", () => {
+  for (const source of [
+    // The supported route: the barrel, which never re-exports internal.ts.
+    'import { useStage, useRepoStatus } from "@/lib/git/queries";',
+    // A deeper public module of the same package is not the private one.
+    'import { repoKeys } from "@/lib/git/queries/core";',
+    // A longer name sharing the prefix — the segment boundary keeps it out.
+    'import { x } from "@/lib/git/queries/internal-helpers";',
+    // Some OTHER package's own internal module: the `git/queries/` anchor is what
+    // scopes this check, so an unrelated sibling import must not trip it.
+    'import { y } from "./internal";',
+    'import { z } from "@/lib/notifications/internal";',
+    // ANOTHER package's queries/internal, by alias. settings/ and scripts/ each own
+    // a queries.ts that could split into a directory the same way this one did, and
+    // an unanchored `queries/internal` tail would then flag their private module
+    // as if it were this package's.
+    'import { a } from "@/lib/settings/queries/internal";',
+    'import { b } from "@/lib/scripts/queries/internal";',
+    // A directory whose name merely ENDS in git is a different package.
+    'import { c } from "@/lib/local-git/queries/internal";',
+    'import { d } from "my-git/queries/internal";',
+    // Comment stripping keeps the doc mentions of the boundary clean.
+    '// never import from "@/lib/git/queries/internal" outside the package',
+  ])
+    assert.deepEqual(
+      queriesInternalImport(source),
+      [],
+      `should ignore ${source}`,
+    );
+});
+
+test("queries-internal-import over-reaches on a RELATIVE queries/internal", () => {
+  // Documented bound, pinned so it stays deliberate: a bare `queries/internal`
+  // tail has to flag, because that is how a file inside src/lib/git/ reaches this
+  // package. The scanner sees a specifier, never the file it sits in, so the same
+  // spelling from some other package's subdirectory flags too. The cost is a
+  // false positive that an allowlist entry documents; the alternative is missing
+  // the likeliest real violation.
+  assert.deepEqual(
+    queriesInternalImport('import { x } from "../queries/internal";'),
+    [1],
+  );
+  assert.deepEqual(
+    queriesInternalImport('import { x } from "./queries/internal";'),
+    [1],
+  );
+});
+
+test("queries-internal-import exempts the queries package itself", () => {
+  const { appliesTo } = CHECKS.find(
+    (c) => c.name === "queries-internal-import",
+  );
+  // The package's own modules are the sanctioned consumers.
+  assert.equal(appliesTo("src/lib/git/queries/internal.ts"), false);
+  assert.equal(appliesTo("src/lib/git/queries/workingtree.ts"), false);
+  assert.equal(appliesTo("src/lib/git/queries/index.ts"), false);
+  // Everything outside it is scanned, including its immediate neighbours.
+  assert.equal(appliesTo("src/lib/git/host.ts"), true);
+  assert.equal(appliesTo("src/features/repository/FileRow.tsx"), true);
+});
+
+test("queries-internal-reexport catches a DOMAIN module republishing internals", () => {
+  // `export *` chains republish, so one of these in any package module rides the
+  // barrel's own `export * from "./<module>";` onto the public surface.
+  for (const source of [
+    'export * from "./internal";',
+    'export { useRepoMutation } from "./internal";',
+    'export * as internals from "./internal";',
+    // The long ways round, and the subpath for when internal.ts becomes internal/.
+    'export * from "@/lib/git/queries/internal";',
+    'export * from "./core/../internal";',
+    'export * from "./internal/keys";',
+    // Vite suffixes address the same module.
+    'export * from "./internal?raw";',
+    'export * from "./internal.js?worker";',
+  ])
+    assert.deepEqual(
+      queriesInternalReexport(source),
+      [1],
+      `should flag ${source}`,
+    );
+});
+
+test("queries-internal-reexport catches a re-export SPLIT across two statements", () => {
+  // The evasion a specifier-matching pattern can never see: the export clause
+  // carries no module path at all, so the binding has to be tracked from its
+  // import. index.ts's `export *` republishes it exactly like a direct re-export.
+  // Line 2 every time: the report points at the offending EXPORT, not the
+  // import, which is legal on its own and is not what needs removing.
+  for (const source of [
+    'import { workingTreeKeys } from "./internal";\nexport { workingTreeKeys };',
+    // Aliased on the way in — the spelling that makes the export site look local.
+    'import { useRepoMutation as m } from "./internal";\nexport { m };',
+    'import { useRepoMutation as m } from "./internal";\nexport default m;',
+    // Renamed on the way out; the LOCAL name is what ties it to the import.
+    'import { a } from "./internal";\nexport { a as publicName };',
+    // The alias spelling of the import reaches the same module.
+    'import { x } from "@/lib/git/queries/internal";\nexport { x };',
+  ])
+    assert.deepEqual(
+      queriesInternalReexport(source),
+      [2],
+      `should flag ${source}`,
+    );
+});
+
+test("queries-internal-reexport catches TYPE-only re-exports of internal", () => {
+  // Erased at runtime, but a type-only re-export still publishes the NAME through
+  // the barrel's type space, so `export type { workingTreeKeys }` widens the
+  // public surface exactly like the value form.
+  for (const source of [
+    // Statement-level `export type { … }` — the form that carries no specifier.
+    'import { a } from "./internal";\nexport type { a };',
+    'import type { a } from "./internal";\nexport type { a };',
+    // The inline `type` modifier, on either side of the split.
+    'import { type a } from "./internal";\nexport { a };',
+    'import { a } from "./internal";\nexport { type a };',
+    'import type { a } from "./internal";\nexport { a };',
+  ])
+    assert.deepEqual(
+      queriesInternalReexport(source),
+      [2],
+      `should flag ${source}`,
+    );
+  // The specifier arm already owns the `from` spellings — it matches on `from`,
+  // which `export type *` and `export type { … } from` both carry.
+  assert.deepEqual(
+    queriesInternalReexport('export type * from "./internal";'),
+    [1],
+  );
+  assert.deepEqual(
+    queriesInternalReexport('export type { A } from "./internal";'),
+    [1],
+  );
+});
+
+test("queries-internal-reexport leaves unrelated type exports alone", () => {
+  for (const source of [
+    // A type-only export with no internal import in the file.
+    "export type { LocalType };",
+    // A type re-exported from a PUBLIC sibling.
+    'import { a } from "./core";\nexport type { a };',
+    // A type ALIAS declaration is not an export clause at all.
+    "export type Foo = { a: string };",
+  ])
+    assert.deepEqual(
+      queriesInternalReexport(source),
+      [],
+      `should ignore ${source}`,
+    );
+});
+
+test("queries-internal-reexport ignores exports unrelated to internal", () => {
+  for (const source of [
+    // A bare export clause with no internal import in the file at all.
+    "export { localThing };",
+    // Imports internal, but exports only its own symbols — the legal shape.
+    'import { workingTreeKeys } from "./internal";\nexport { myOwnHelper };',
+    'import { workingTreeKeys } from "./internal";\nexport const x = 1;',
+    // A split re-export of a PUBLIC sibling is ordinary package work.
+    'import { a } from "./core";\nexport { a };',
+  ])
+    assert.deepEqual(
+      queriesInternalReexport(source),
+      [],
+      `should ignore ${source}`,
+    );
+});
+
+test("queries-internal-reexport does not pair an export DECLARATION with a later import", () => {
+  // `export enum E { A }` ends without a semicolon, so a `;`-bounded gap alone
+  // would run past it and pair with the next plain import's specifier. The gap is
+  // bounded by the `import` keyword too, which is what keeps these clean.
+  for (const source of [
+    'export enum E { A }\nimport { workingTreeKeys } from "./internal";',
+    'export interface I { a: string }\nimport { x } from "./internal";',
+  ])
+    assert.deepEqual(
+      queriesInternalReexport(source),
+      [],
+      `should ignore ${source}`,
+    );
+  // And the bound costs no real detections: a re-exported name may CONTAIN
+  // "import" without the word boundary matching.
+  assert.deepEqual(
+    queriesInternalReexport(
+      'export { default as importedThing } from "./internal";',
+    ),
+    [1],
+  );
+});
+
+test("queries-internal-reexport leaves plain imports of internal alone", () => {
+  // Importing the shared helpers is the whole point of internal.ts; only
+  // RE-exporting them widens the barrel's surface.
+  for (const source of [
+    'import { useRepoMutation } from "./internal";',
+    'import { workingTreeKeys, repoSettingsKey } from "./internal";',
+    'import { useRepoMutation } from "@/lib/git/queries/internal";',
+    // A re-export of a PUBLIC sibling is ordinary barrel work.
+    'export * from "./core";',
+    // An export statement cannot pair with a later import's specifier: the gap
+    // between `export` and `from` may not cross a `;`.
+    'export const x = 1; import y from "./internal";',
+  ])
+    assert.deepEqual(
+      queriesInternalReexport(source),
+      [],
+      `should ignore ${source}`,
+    );
+});
+
+test("queries-internal-reexport covers the package but exempts internal.ts", () => {
+  const { appliesTo } = CHECKS.find(
+    (c) => c.name === "queries-internal-reexport",
+  );
+  // Every module in the package, the barrel included — export * chains from any
+  // of them reach the public surface.
+  assert.equal(appliesTo("src/lib/git/queries/core.ts"), true);
+  assert.equal(appliesTo("src/lib/git/queries/workingtree.ts"), true);
+  assert.equal(appliesTo("src/lib/git/queries/index.ts"), true);
+  // internal.ts is the module in question, so it cannot re-export itself.
+  assert.equal(appliesTo("src/lib/git/queries/internal.ts"), false);
+  // Outside the package, queries-internal-import owns the boundary instead.
+  assert.equal(appliesTo("src/lib/git/host.ts"), false);
+});
+
+test("a path-pinned check fails loudly instead of going inert", () => {
+  // The silent fail-open this file exists to prevent: a pinned check whose path
+  // moved scans nothing and prints OK. The pin turns that into a failure.
+  const barrel = CHECKS.find(
+    (c) => c.name === "queries-barrel-internal-reference",
+  );
+  assert.equal(scopePinFailure(barrel, 1), null);
+  const moved = scopePinFailure(barrel, 0);
+  assert.match(moved, /SCOPE PIN FAILED/);
+  // The message has to name the path to re-point, or it cannot be acted on.
+  assert.match(moved, /src\/lib\/git\/queries\/index\.ts/);
+
+  const pkg = CHECKS.find((c) => c.name === "queries-internal-reexport");
+  assert.equal(scopePinFailure(pkg, 29), null);
+  assert.match(scopePinFailure(pkg, 1), /SCOPE PIN FAILED/);
+  // The floor sits near the real module count: a QUERIES_DIR typo that left only a
+  // handful of files matching would otherwise pass while scanning almost nothing.
+  assert.equal(pkg.expectScanned.atLeast, 20);
+  assert.match(scopePinFailure(pkg, 5), /SCOPE PIN FAILED/);
+  // A check with no pin is unaffected.
+  assert.equal(scopePinFailure({ name: "unpinned" }, 0), null);
+});
+
+test("reachesGitQueriesInternal pins what counts as the package's internals", () => {
+  // Asserted directly, not just through a scanner: this predicate is the semantic
+  // core of the whole boundary family, and a scanner refactor must not be able to
+  // quietly change what "reaches internal" means.
+  for (const spec of [
+    "@/lib/git/queries/internal",
+    "@/lib/git/queries/internal.ts",
+    "@/lib/git/queries/internal/keys", // internal.ts may become internal/
+    "@/lib/git/queries/./internal", // non-normalized, still resolves there
+    "@/lib/git/queries/core/../internal",
+    "@/lib/git/queries/internal?raw", // vite suffixes address the same file
+    "../../lib/git/queries/internal",
+    "queries/internal", // the in-package relative spelling
+  ])
+    assert.equal(
+      reachesGitQueriesInternal(spec),
+      true,
+      `should reach: ${spec}`,
+    );
+
+  for (const spec of [
+    "@/lib/git/queries", // the barrel is the supported route
+    "@/lib/git/queries/core",
+    "@/lib/git/queries/internal-helpers", // segment boundary, not a prefix match
+    "@/lib/settings/queries/internal", // another package's internals
+    "@/lib/scripts/queries/internal",
+    "@/lib/local-git/queries/internal", // a dir merely ENDING in git
+    "my-git/queries/internal",
+    "./internal", // a bare sibling belongs to whoever imports it
+  ])
+    assert.equal(reachesGitQueriesInternal(spec), false, `should not: ${spec}`);
+});
+
+test("reachesQueriesInternalFromSibling adds the in-package sibling spelling", () => {
+  // Inside the package internal.ts is reached as `./internal`, a form carrying no
+  // `queries/` segment at all — so this predicate is strictly wider than the one
+  // above, and never narrower.
+  for (const spec of [
+    "./internal",
+    "./internal.ts",
+    "./././internal",
+    "./core/../internal",
+    "./internal/keys",
+  ])
+    assert.equal(
+      reachesQueriesInternalFromSibling(spec),
+      true,
+      `sibling should reach: ${spec}`,
+    );
+  for (const spec of ["./core", "./internal-ish", "./internals", "./worktrees"])
+    assert.equal(
+      reachesQueriesInternalFromSibling(spec),
+      false,
+      `sibling should not: ${spec}`,
+    );
+  // Strictly wider: everything the outside-facing predicate accepts, this does too.
+  for (const spec of ["@/lib/git/queries/internal", "queries/internal"])
+    assert.equal(reachesQueriesInternalFromSibling(spec), true, spec);
+});
+
+test("okReportLine suppresses the OK line for a check that went inert", () => {
+  const check = { name: "x" };
+  const clean = { scanned: [1, 2], violations: [], stale: [] };
+  assert.equal(okReportLine(check, clean, null), "x: OK (2 files scanned)\n");
+  // The whole point: a moved path must never read as a pass.
+  assert.equal(okReportLine(check, clean, "SCOPE PIN FAILED — …"), null);
+  assert.equal(
+    okReportLine(check, { scanned: [1], violations: ["a:1"], stale: [] }, null),
+    null,
+  );
+  assert.equal(
+    okReportLine(
+      check,
+      { scanned: [1], violations: [], stale: ["f.ts"] },
+      null,
+    ),
+    null,
+  );
+});
+
+test("queries-internal-present pins the module the whole family is named around", () => {
+  // Renaming internal.ts makes every other rule vacuously green: the re-export
+  // check simply starts treating the renamed module as an ordinary one, and its
+  // floor is still met. This pin is the only thing that notices.
+  const present = CHECKS.find((c) => c.name === "queries-internal-present");
+  const { appliesTo } = present;
+  assert.equal(appliesTo("src/lib/git/queries/internal.ts"), true);
+  assert.equal(appliesTo("src/lib/git/queries/core.ts"), false);
+  assert.equal(appliesTo("src/lib/settings/internal.ts"), false);
+  // It carries no pattern of its own — existence is the whole assertion.
+  assert.deepEqual(present.scan(view('export * from "./internal";')), []);
+  assert.equal(scopePinFailure(present, 1), null);
+  const renamed = scopePinFailure(present, 0);
+  assert.match(renamed, /SCOPE PIN FAILED/);
+  assert.match(renamed, /src\/lib\/git\/queries\/internal\.ts/);
+});
+
+test("queries-barrel-internal-reference catches the barrel naming its internals", () => {
+  // The one line that undoes the package boundary, and the spellings around it.
+  for (const source of [
+    'export * from "./internal";',
+    'export { useRepoMutation } from "./internal";',
+    'export * from "./internal.ts";',
+    // An import is no better: index.ts is a pure export list, so a reference to
+    // internal there is a re-export or one edit from becoming one.
+    'import { workingTreeKeys } from "./internal";',
+    // The barrel can also name its own private module the long way round. A raw
+    // `./internal` pattern misses every one of these.
+    'export * from "@/lib/git/queries/internal";',
+    'export * from "../queries/internal";',
+    'export * from "./././internal";',
+    'export * from "./core/../internal";',
+    // And the subpath, for when internal.ts becomes internal/.
+    'export * from "./internal/keys";',
+  ])
+    assert.deepEqual(
+      queriesBarrelInternal(source),
+      [1],
+      `should flag ${source}`,
+    );
+});
+
+test("queries-barrel-internal-reference leaves the real barrel lines alone", () => {
+  for (const source of [
+    'export * from "./core";',
+    'export * from "./workingtree";',
+    'export * from "./worktrees";',
+    // Domain modules whose names merely start the same way.
+    'export * from "./internal-ish";',
+    'export * from "./internals";',
+    // Comment stripping keeps the barrel's own explanatory header clean.
+    "// internal.ts is intentionally absent — see its header.",
+  ])
+    assert.deepEqual(
+      queriesBarrelInternal(source),
+      [],
+      `should ignore ${source}`,
+    );
+});
+
+test("queries-barrel-internal-reference is pinned to the barrel file only", () => {
+  const { appliesTo } = CHECKS.find(
+    (c) => c.name === "queries-barrel-internal-reference",
+  );
+  assert.equal(appliesTo("src/lib/git/queries/index.ts"), true);
+  // A domain module is out of THIS check's scope, because importing internal
+  // there is legal — but re-exporting it is not, and queries-internal-reexport
+  // covers that half. The two together are what make the boundary hold.
+  assert.equal(appliesTo("src/lib/git/queries/workingtree.ts"), false);
+  assert.deepEqual(
+    queriesInternalReexport('import { useRepoMutation } from "./internal";'),
+    [],
+    "a domain module may IMPORT internal",
+  );
+  assert.deepEqual(
+    queriesInternalReexport('export * from "./internal";'),
+    [1],
+    "a domain module may NOT re-export internal",
+  );
+  assert.equal(appliesTo("src/lib/git/queries/internal.ts"), false);
+  // And no other barrel in the repo is this one.
+  assert.equal(appliesTo("src/lib/settings/index.ts"), false);
+});
+
+test("mutation-identity-pinning flags an unpinned repo-scoped create", () => {
+  // The pre-fix shape every create-family hook had: the call and its invalidation
+  // both closing over the hook's `repo`, with nothing pinning the mutation key.
+  const plain = [
+    "export function useCreateRuleset(repo: string) {",
+    "  const queryClient = useQueryClient();",
+    "  return useMutation({",
+    "    mutationFn: (body: Record<string, unknown>) =>",
+    "      api.ghRulesetCreate(repo, body),",
+    "    onSettled: () =>",
+    "      queryClient.invalidateQueries({ queryKey: rulesetsKey(repo) }),",
+    "  });",
+    "}",
+  ].join("\n");
+  assert.deepEqual(unpinnedMutationIdentity(plain), [3]);
+  // The useRepoMutation form must fail the same way — six of the pinned sites are
+  // plain useMutation, so a useRepoMutation-only scan would miss half the class.
+  const viaHelper = [
+    "export function useCreateTag(repo: string) {",
+    "  return useRepoMutation(repo, (args: { name: string; hash: string }) =>",
+    "    api.gitTag(repo, args.name, args.hash),",
+    "  );",
+    "}",
+  ].join("\n");
+  assert.deepEqual(unpinnedMutationIdentity(viaHelper), [2]);
+  // The seed arm: not create-named, but a response written into a hook-scope key
+  // on success — the settings-seed defect, which a retarget cannot roll back.
+  const seed = [
+    "export function useUpdateGlRepoSettings(repo: string) {",
+    "  const queryClient = useQueryClient();",
+    "  return useMutation({",
+    "    mutationFn: (input: GitLabRepoSettingsInput) =>",
+    "      api.forgeGlRepoSettingsUpdate(repo, input),",
+    "    onSuccess: (data) =>",
+    "      queryClient.setQueryData(glRepoSettingsKey(repo), data),",
+    "  });",
+    "}",
+  ].join("\n");
+  assert.deepEqual(unpinnedMutationIdentity(seed), [3]);
+});
+
+test("mutation-identity-pinning accepts a key wrapped across lines", () => {
+  // THE formatting the guard has to survive: biome wraps a four-axis key onto its
+  // own lines, so the literal lands on the line AFTER `mutationKey: [`. A
+  // single-line anchor reads this exact (pinned) site as unpinned.
+  const wrapped = [
+    "export function useJiraCreateIssue(",
+    "  repo: string,",
+    "  link: JiraLink | null | undefined,",
+    ") {",
+    "  const queryClient = useQueryClient();",
+    "  return useMutation({",
+    "    mutationKey: [",
+    '      "jira-create-issue",',
+    "      repo,",
+    "      link?.siteHost ?? null,",
+    "      link?.projectKey ?? null,",
+    "    ],",
+    "    mutationFn: (args: { issueTypeId: string }) =>",
+    "      jiraIssueCreate((link as JiraLink).siteHost, args.issueTypeId),",
+    "    onSettled: () => invalidateJiraForRepo(queryClient, repo),",
+    "  });",
+    "}",
+  ].join("\n");
+  assert.deepEqual(unpinnedMutationIdentity(wrapped), []);
+  // Both spellings pin, on both call forms, wrapped or not.
+  for (const source of [
+    'export function useCreateDiscussion(repo: string) {\n  return useRepoMutation(repo, (a) => api.create(repo, a), {\n    identity: ["create-discussion", repo],\n  });\n}',
+    'export function useCreatePr(repo: string) {\n  return useRepoMutation(\n    repo,\n    (a) => api.prCreate(repo, a),\n    {\n      identity: [\n        "create-pr",\n        repo,\n      ],\n    },\n  );\n}',
+    'export function useCreateWebhook(repo: string) {\n  return useMutation({\n    mutationKey: ["webhook", "create", repo],\n    mutationFn: (i: WebhookInput) => api.ghHookCreate(repo, i),\n  });\n}',
+  ])
+    assert.deepEqual(
+      unpinnedMutationIdentity(source),
+      [],
+      `should accept ${source}`,
+    );
+});
+
+test("mutation-identity-pinning leaves mutations with no repo closure alone", () => {
+  for (const source of [
+    // The other valid remedy: the write target rides the VARIABLES, so the hook
+    // has no repo in scope for a switch to redirect (useMoveBoardCard's shape).
+    "export function useMoveBoardCard() {\n  return useMutation({\n    mutationFn: (args: { repo: string }) => api.move(args.repo),\n  });\n}",
+    // Account-scoped, and a non-create name with no cache seed.
+    "export function useGhPublishOwners(enabled: boolean) {\n  return useMutation({\n    mutationFn: () => api.publish(),\n  });\n}",
+    // Repo-scoped but neither create nor seed: the convention still governs it,
+    // this ratchet deliberately does not (see the check's appliesTo note).
+    "export function useCheckoutBranch(repo: string) {\n  return useRepoMutation(repo, (n: string) => api.checkout(repo, n));\n}",
+    // The export gate, pinned by a name CREATE_HOOK_RE does match: a private
+    // helper no exported hook delegates to is not a mutation the package ships.
+    "function useCreateThing(repo: string) {\n  return useMutation({ mutationFn: (a) => api.create(repo, a) });\n}",
+    // Comment stripping keeps the convention's own prose out of the scan.
+    '// useCreateThing(repo) must pass identity: ["create-thing", repo]',
+  ])
+    assert.deepEqual(
+      unpinnedMutationIdentity(source),
+      [],
+      `should ignore ${source}`,
+    );
+});
+
+test("mutation-identity-pinning follows a create hook into its private wrapper", () => {
+  // webhooks.ts's real shape: the exported create hook builds nothing itself, it
+  // delegates, so the key has to live on the WRAPPER. Scanning only the exported
+  // hook's own body reads this whole five-hook family as clean.
+  const wrapper = (key) =>
+    [
+      "function useWebhookMutation<TArgs, TData>(",
+      "  repo: string,",
+      "  op: string,",
+      "  mutationFn: (args: TArgs) => Promise<TData>,",
+      ") {",
+      "  const queryClient = useQueryClient();",
+      "  return useMutation({",
+      ...(key ? [`    mutationKey: ["webhook", op, repo],`] : []),
+      "    mutationFn,",
+      "    onSettled: () =>",
+      "      queryClient.invalidateQueries({ queryKey: webhooksKey(repo) }),",
+      "  });",
+      "}",
+      "",
+      "export function useCreateWebhook(repo: string) {",
+      '  return useWebhookMutation(repo, "create", (input: WebhookInput) =>',
+      "    api.ghHookCreate(repo, input),",
+      "  );",
+      "}",
+    ].join("\n");
+  // Unkeyed wrapper: reported at the wrapper's own useMutation, which is where the
+  // fix goes — not at the delegating hook.
+  assert.deepEqual(unpinnedMutationIdentity(wrapper(false)), [7]);
+  assert.deepEqual(unpinnedMutationIdentity(wrapper(true)), []);
+});
+
+test("mutation-identity-pinning stops at its documented boundary", () => {
+  // A seeding wrapper reached ONLY from non-create hooks — useTimeTrackingMutation's
+  // shape. Inside the check's stated class (a response seeded into a hook-scope key)
+  // but outside what it follows, since delegation is resolved from create hooks only.
+  // Pinned as a fixture so widening the rule fails HERE, loudly, instead of quietly
+  // turning every such wrapper into a new pin-or-allowlist decision.
+  const seedingWrapper = [
+    // Four parameters, matching the real useTimeTrackingMutation this pins, so the
+    // fixture stays greppable against its site.
+    "function useTimeTrackingMutation(",
+    "  repo: string,",
+    "  statsKey: (repo: string, number: number) => readonly unknown[],",
+    "  viewKey: (repo: string, number: number) => readonly unknown[],",
+    "  mutationFn: (args: { number: number }) => Promise<GitLabTimeStats>,",
+    ") {",
+    "  const queryClient = useQueryClient();",
+    "  return useMutation({",
+    "    mutationFn,",
+    "    onSuccess: (stats, args) => {",
+    "      queryClient.setQueryData(statsKey(repo, args.number), stats);",
+    "    },",
+    "  });",
+    "}",
+    "",
+    "export function useAddMrSpentTime(repo: string) {",
+    "  return useTimeTrackingMutation(repo, mrTimeStatsKey, mrViewKey, (args) =>",
+    "    api.forgeGlMrAddSpentTime(repo, args.number),",
+    "  );",
+    "}",
+  ].join("\n");
+  assert.deepEqual(unpinnedMutationIdentity(seedingWrapper), []);
+  // The same wrapper IS reached once a create-named hook delegates to it, which is
+  // the line the boundary actually draws.
+  assert.deepEqual(
+    unpinnedMutationIdentity(
+      `${seedingWrapper}\n\nexport function useCreateSpentTime(repo: string) {\n  return useTimeTrackingMutation(repo, k, v, (a) => api.x(repo, a));\n}`,
+    ),
+    [8],
+  );
+});
+
+test("mutation-identity-pinning requires the identity ARGUMENT at a conditionally-keyed delegation", () => {
+  // A conditionally-keyed delegation shape (no live instance in src today).
+  // `MUTATION_KEYED_RE` sees the spread and reads the wrapper as pinned however
+  // it is called, so the obligation is the delegating call's: without this the
+  // key can be dropped and checks stay green.
+  const mod = (identityArg) =>
+    [
+      "function useLocalPrMutation<TArgs, TData>(",
+      "  repo: string,",
+      "  fn: (args: TArgs) => Promise<TData>,",
+      "  identity?: readonly unknown[],",
+      ") {",
+      "  const queryClient = useQueryClient();",
+      "  return useMutation({",
+      "    ...(identity ? { mutationKey: identity } : {}),",
+      "    mutationFn: fn,",
+      "    onSettled: () =>",
+      "      queryClient.invalidateQueries({ queryKey: localPrKey(repo) }),",
+      "  });",
+      "}",
+      "",
+      "export function useCreateLocalPr(repo: string) {",
+      "  return useLocalPrMutation(",
+      "    repo,",
+      "    (input: { title: string }) => createLocalPr(repo, input),",
+      ...(identityArg ? ['    ["local-pr", "create", repo],'] : []),
+      "  );",
+      "}",
+    ].join("\n");
+  // Passing it: clean. Omitting it: the delegating call is the violation, reported
+  // at its own line (16) — the wrapper body is not where the fix goes.
+  assert.deepEqual(unpinnedMutationIdentity(mod(true)), []);
+  assert.deepEqual(unpinnedMutationIdentity(mod(false)), [16]);
+  // The `&&` spelling of the same spread has to behave identically — recognizing
+  // only the ternary was its own fail-open: MUTATION_KEYED_RE reads the wrapper as
+  // pinned, and a delegator dropping the key would have gone unreported.
+  const andForm = (identityArg) =>
+    [
+      "function useLocalPrMutation<TArgs, TData>(",
+      "  repo: string,",
+      "  fn: (args: TArgs) => Promise<TData>,",
+      "  identity?: readonly unknown[],",
+      ") {",
+      "  return useMutation({",
+      "    ...(identity && { mutationKey: identity }),",
+      "    mutationFn: fn,",
+      "  });",
+      "}",
+      "",
+      "export function useCreateLocalPr(repo: string) {",
+      "  return useLocalPrMutation(",
+      "    repo,",
+      "    (input: { title: string }) => createLocalPr(repo, input),",
+      ...(identityArg ? ['    ["local-pr", "create", repo],'] : []),
+      "  );",
+      "}",
+    ].join("\n");
+  assert.deepEqual(unpinnedMutationIdentity(andForm(true)), []);
+  assert.deepEqual(unpinnedMutationIdentity(andForm(false)), [13]);
+  // The two sides of the spread must name the SAME binding, or an unrelated pair
+  // would read as a conditional key and move the obligation to the call.
+  assert.deepEqual(
+    unpinnedMutationIdentity(
+      andForm(false).replace(
+        "{ mutationKey: identity })",
+        "{ mutationKey: other })",
+      ),
+    ),
+    [],
+  );
+  // An unconditional key (useWebhookMutation's shape) is unaffected: there is no
+  // optional parameter for the call to have to supply.
+  const unconditional = [
+    "function useWebhookMutation<TArgs, TData>(",
+    "  repo: string,",
+    "  op: string,",
+    "  mutationFn: (args: TArgs) => Promise<TData>,",
+    ") {",
+    "  return useMutation({",
+    '    mutationKey: ["webhook", op, repo],',
+    "    mutationFn,",
+    "  });",
+    "}",
+    "",
+    "export function useCreateWebhook(repo: string) {",
+    '  return useWebhookMutation(repo, "create", (i) => api.create(repo, i));',
+    "}",
+  ].join("\n");
+  assert.deepEqual(unpinnedMutationIdentity(unconditional), []);
+});
+
+test("mutation-identity-pinning sees through a generic parameter list", () => {
+  // `function useX<T>(` puts a `<` where the anchor wants a `(`; an anchor that
+  // demands the paren swallows every generic declaration without a sound.
+  const generic = [
+    "export function useCreateThing<TArgs, TData>(repo: string) {",
+    "  return useMutation({",
+    "    mutationFn: (a: TArgs) => api.create(repo, a),",
+    "  });",
+    "}",
+  ].join("\n");
+  assert.deepEqual(unpinnedMutationIdentity(generic), [2]);
+  // A constraint carrying an arrow type must not end the generic list early.
+  const constrained =
+    "export function useCreateThing<T extends (a: string) => void>(repo: string) {\n  return useMutation({ mutationFn: (a: T) => api.create(repo, a) });\n}";
+  assert.deepEqual(unpinnedMutationIdentity(constrained), [2]);
+});
+
+test("mutation-identity-pinning is scoped to the query modules, with one allowlisted file", () => {
+  const check = CHECKS.find((c) => c.name === "mutation-identity-pinning");
+  assert.equal(check.appliesTo("src/lib/git/queries/branches.ts"), true);
+  assert.equal(check.appliesTo("src/lib/jira/queries.ts"), true);
+  // The local-entity modules: same repo-scoped create shape, own directories.
+  assert.equal(check.appliesTo("src/lib/pulls/queries.ts"), true);
+  assert.equal(check.appliesTo("src/lib/issues/queries.ts"), true);
+  // Their neighbours are not swept in with them.
+  assert.equal(check.appliesTo("src/lib/pulls/local.ts"), false);
+  assert.equal(check.appliesTo("src/lib/issues/local.ts"), false);
+  // Feature files declare no query hooks; .tsx never enters the scope.
+  assert.equal(check.appliesTo("src/features/pulls/CreatePrDialog.tsx"), false);
+  assert.equal(check.appliesTo("src/lib/settings/queries.ts"), false);
+  // The single exception, and the reason it is a whole file rather than a line.
+  assert.deepEqual(check.allowlist, ["src/lib/git/queries/pr-write.ts"]);
+  // An allowlisted file is SCANNED, so the entry only stays legitimate while its
+  // site is still unpinned — pin useStackCreate and the entry reports stale.
+  const flagged =
+    "export function useStackCreate(repo: string, lens: RemoteLens) {\n  return useRepoMutation(repo, (prs: number[]) =>\n    api.forgeStackCreate(repo, prs, lens),\n  );\n}";
+  assert.deepEqual(unpinnedMutationIdentity(flagged), [2]);
+  // End to end: the allowlisted file's hit is suppressed and its entry stays live,
+  // while the same shape in a sibling module is a violation.
+  const files = [
+    "src/lib/git/queries/pr-write.ts",
+    "src/lib/git/queries/branches.ts",
+  ];
+  const views = new Map([
+    ["src/lib/git/queries/pr-write.ts", view(flagged)],
+    [
+      "src/lib/git/queries/branches.ts",
+      view(
+        "export function useCreateBranch(repo: string) {\n  return useRepoMutation(repo, (n: string) => api.gitCreateBranch(repo, n));\n}",
+      ),
+    ],
+  ]);
+  const { violations, stale } = runCheck(check, files, views);
+  assert.deepEqual(violations, ["src/lib/git/queries/branches.ts:2"]);
+  assert.deepEqual(stale, []);
+});
+
+test("an allowlist entry whose file no longer has the pattern is stale", () => {
+  // Allowlisted files are scanned, not skipped: a live entry suppresses its hit
+  // and stays; an entry with nothing left to suppress is reported so the ratchet
+  // can only tighten.
+  const check = {
+    name: "fixture",
+    appliesTo: () => true,
+    scan: CHECKS.find((c) => c.name === "hover-reveal").scan,
+    allowlist: ["still-reveals.tsx", "now-clean.tsx", "since-deleted.tsx"],
+    message: "fixture message",
+  };
+  const files = ["still-reveals.tsx", "now-clean.tsx", "fresh.tsx"];
+  const views = new Map([
+    [
+      "still-reveals.tsx",
+      view('const c = "opacity-0 group-hover:opacity-100";'),
+    ],
+    ["now-clean.tsx", view('const c = "flex items-center gap-2";')],
+    ["fresh.tsx", view('const c = "invisible group-hover:visible";')],
+  ]);
+
+  const { violations, stale } = runCheck(check, files, views);
+  // The allowlisted hit is suppressed; the unlisted one is not.
+  assert.deepEqual(violations, ["fresh.tsx:1"]);
+  // Clean-now and no-longer-present entries both surface; the live one does not.
+  assert.deepEqual(stale, ["now-clean.tsx", "since-deleted.tsx"]);
+});
+
+test("a rust allowlist record no hit maps to is stale, matched as (file, fn)", () => {
+  const list = [
+    { file: "git/ops.rs", fn: "live_one", rationale: "x" },
+    { file: "git/ops.rs", fn: "site_removed", rationale: "x" },
+    // Same fn name, different file: the pair must match, not either half.
+    { file: "git/remote.rs", fn: "live_one", rationale: "x" },
+  ];
+  const hits = [
+    { file: "git/ops.rs", fn: "live_one", allowlisted: true },
+    { file: "git/ops.rs", fn: "unlisted", allowlisted: false },
+  ];
+  assert.deepEqual(
+    staleAllowlistEntries(list, hits).map((e) => `${e.file}::${e.fn}`),
+    ["git/ops.rs::site_removed", "git/remote.rs::live_one"],
+  );
+  // An empty allowlist (SECRET_ARGV_ALLOWLIST today) is a no-op, not a failure.
+  assert.deepEqual(staleAllowlistEntries([], hits), []);
+});
+
+test("stripComments blanks comments but not comment-shaped strings", () => {
+  assert.deepEqual(stripComments(["const a = 1; // e.metaKey"]), [
+    "const a = 1; ",
+  ]);
+  assert.deepEqual(
+    stripComments([
+      "/* opacity-0",
+      "   group-hover:opacity-100 */ const a = 1;",
+    ]),
+    ["", " const a = 1;"],
+  );
+  assert.deepEqual(stripComments(['const url = "https://x.dev/a";']), [
+    'const url = "https://x.dev/a";',
+  ]);
+});
+
+// -------------------------------------------------------- check-rust-invariants
+
+test("enclosingFn attributes const, unsafe and extern signatures", () => {
+  const cases = [
+    ["pub const fn for_provider(p: Provider) -> Self {", "for_provider"],
+    ["    const fn all() -> Self {", "all"],
+    ["unsafe fn from_raw(p: *const u8) {", "from_raw"],
+    ['pub unsafe extern "C" fn callback(v: i32) {', "callback"],
+    // A bare `extern fn` is legal and defaults to the "C" ABI.
+    ["extern fn bare_abi() {", "bare_abi"],
+    ["pub(crate) const unsafe fn peek() -> u8 {", "peek"],
+    ["pub async fn ordinary(x: u8) {", "ordinary"],
+  ];
+  for (const [signature, name] of cases) {
+    // The preceding fn is the wrong answer a too-narrow pattern falls back to.
+    const lines = ["fn preceding() {}", "}", signature, "    let x = 1;"];
+    assert.equal(enclosingFn(lines, 3), name, `for ${signature}`);
+  }
+});
+
+test("refspec-template hits are attributed to the enclosing fn", () => {
+  const src = [
+    "fn preceding() {}",
+    "",
+    "pub const fn build_ref(name: &str) -> String {",
+    '    format!("refs/heads/{name}")',
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkRefspecTemplates("fixture.rs", src, src.split("\n"), hits);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].fn, "build_ref");
+  assert.equal(hits[0].line, 4);
+  assert.equal(hits[0].allowlisted, false);
+});
+
+test("refspec-template check ignores format! templates with no ref marker", () => {
+  const src = ["fn f() {", '    format!("hello {name}")', "}"].join("\n");
+  const hits = [];
+  checkRefspecTemplates("fixture.rs", src, src.split("\n"), hits);
+  assert.deepEqual(hits, []);
+});
+
+test("compare-endpoint check flags an interpolated basehead, either side", () => {
+  for (const template of [
+    "repos/{slug}/compare/{base}...{head}",
+    // Only the head interpolates — still the injectable half.
+    "repos/{slug}/compare/main...{head}",
+    "repos/{slug}/compare/{base}...{owner}:{branch}?per_page=1",
+  ]) {
+    const src = [
+      "fn build() -> String {",
+      `    format!("${template}")`,
+      "}",
+    ].join("\n");
+    const hits = [];
+    checkCompareEndpoints("fixture.rs", src, src.split("\n"), hits);
+    assert.equal(hits.length, 1, `should flag ${template}`);
+    assert.equal(hits[0].fn, "build");
+    assert.equal(hits[0].allowlisted, false);
+  }
+});
+
+test("compare-endpoint check ignores a fully literal path and the slug alone", () => {
+  for (const template of [
+    // Nothing after the marker interpolates — no segment an attacker reaches.
+    "repos/{slug}/compare/main...dev",
+    "repos/{slug}/pulls/{number}",
+  ]) {
+    const src = [
+      "fn build() -> String {",
+      `    format!("${template}")`,
+      "}",
+    ].join("\n");
+    const hits = [];
+    checkCompareEndpoints("fixture.rs", src, src.split("\n"), hits);
+    assert.deepEqual(hits, [], `should ignore ${template}`);
+  }
+});
+
+test("secret-shaped argv is caught next to a -f-family flag", () => {
+  const lines = [
+    "fn send(token: &str) {",
+    '    cmd.arg("-f")',
+    '        .arg(format!("token={token}"));',
+    "}",
+  ];
+  const hits = [];
+  checkSecretArgv("fixture.rs", lines.join("\n"), lines, hits);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].fn, "send");
+  assert.equal(hits[0].allowlisted, false);
+
+  const benign = ["fn send() {", '    cmd.arg("-f").arg("title=hello");', "}"];
+  const none = [];
+  checkSecretArgv("fixture.rs", benign.join("\n"), benign, none);
+  assert.deepEqual(none, []);
+});
+
+test("sync #[tauri::command] is caught, async is not, unreadable fails closed", () => {
+  const sync = ["#[tauri::command]", "pub fn do_thing() -> u8 { 1 }"];
+  const hits = [];
+  checkSyncCommands("fixture.rs", sync.join("\n"), sync, hits);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].fn, "do_thing");
+  assert.equal(hits[0].allowlisted, false);
+
+  const asyncCmd = [
+    "#[tauri::command]",
+    '#[cfg(target_os = "macos")]',
+    "pub async fn do_thing() -> u8 { 1 }",
+  ];
+  const none = [];
+  checkSyncCommands("fixture.rs", asyncCmd.join("\n"), asyncCmd, none);
+  assert.deepEqual(none, []);
+
+  const unreadable = ["#[tauri::command]", "pub struct NotAFn;"];
+  const failClosed = [];
+  checkSyncCommands(
+    "fixture.rs",
+    unreadable.join("\n"),
+    unreadable,
+    failClosed,
+  );
+  assert.equal(failClosed.length, 1);
+  assert.equal(failClosed[0].fn, "<unresolved>");
+  assert.equal(failClosed[0].allowlisted, false);
+});
+
+test("stderr-only AppError::Git is caught, bare and format!-wrapped", () => {
+  const src = [
+    "async fn plain(out: GitOutput) -> AppError {",
+    "    AppError::Git {",
+    "        code: out.code,",
+    "        stderr: out.stderr,",
+    "    }",
+    "}",
+    "async fn wrapped(out: GitOutput) -> AppError {",
+    "    AppError::Git {",
+    "        code: out.code,",
+    '        stderr: format!("prefix\\n{}", out.stderr),',
+    "    }",
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkStderrOnlyGitError("fixture.rs", src, src.split("\n"), hits);
+  assert.deepEqual(
+    hits.map((h) => h.fn),
+    ["plain", "wrapped"],
+  );
+  assert.equal(hits[0].allowlisted, false);
+});
+
+test("stderr-only check ignores correct shaping and bare binding patterns", () => {
+  const src = [
+    "async fn shaped(out: GitOutput) -> AppError {",
+    "    AppError::Git {",
+    "        code: out.code,",
+    "        stderr: out.full_failure_text(),",
+    "    }",
+    "}",
+    "fn matched(e: AppError) -> bool {",
+    '    matches!(e, AppError::Git { stderr, .. } if stderr.contains("x"))',
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkStderrOnlyGitError("fixture.rs", src, src.split("\n"), hits);
+  assert.deepEqual(hits, []);
+});
+
+test("a stderr value naming a binding is judged by that binding's initializer", () => {
+  // The shape the conflict batch itself uses (`let report = …; stderr: report`):
+  // the field alone says nothing, so substituting `.stderr` into the binding
+  // later has to stay visible.
+  const src = [
+    "async fn good(commit: GitOutput) -> AppError {",
+    "    let report = commit.full_failure_text();",
+    "    let _lower = report.to_lowercase();",
+    "    AppError::Git {",
+    "        code: commit.code,",
+    "        stderr: report,",
+    "    }",
+    "}",
+    "async fn bad(commit: GitOutput) -> AppError {",
+    "    let report = commit.stderr;",
+    "    AppError::Git {",
+    "        code: commit.code,",
+    "        stderr: report,",
+    "    }",
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkStderrOnlyGitError("fixture.rs", src, src.split("\n"), hits);
+  assert.deepEqual(
+    hits.map((h) => h.fn),
+    ["bad"],
+  );
+});
+
+test("an unresolvable stderr binding fails closed", () => {
+  // A parameter has no initializer in range, so the checker cannot know which
+  // shaping built it — that is a finding, not a pass.
+  const src = [
+    "async fn passthrough(code: i32, report: String) -> AppError {",
+    "    AppError::Git {",
+    "        code,",
+    "        stderr: report,",
+    "    }",
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkStderrOnlyGitError("fixture.rs", src, src.split("\n"), hits);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].fn, "passthrough");
+  assert.match(hits[0].fix, /cannot resolve/);
+});
+
+test("failure_text() substitution is caught apart from the combining helper", () => {
+  const src = [
+    "async fn substituting(out: GitOutput) -> AppError {",
+    "    AppError::Git {",
+    "        code: out.code,",
+    "        stderr: out.failure_text(),",
+    "    }",
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkStderrOnlyGitError("fixture.rs", src, src.split("\n"), hits);
+  assert.equal(hits.length, 1);
+  assert.match(hits[0].fix, /SUBSTITUTES/);
+});
+
+test("a comment naming full_failure_text does not disarm the check", () => {
+  // The verdict is read from the field VALUE as an expression; a window-wide
+  // substring test would have accepted this site on the strength of its prose.
+  const src = [
+    "async fn commented(out: GitOutput) -> AppError {",
+    "    // full_failure_text() is what this should use.",
+    "    AppError::Git {",
+    "        code: out.code,",
+    "        stderr: out.stderr,",
+    "    }",
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkStderrOnlyGitError("fixture.rs", src, src.split("\n"), hits);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].fn, "commented");
+});
+
+test("a chain of stderr aliases is followed to its shaping", () => {
+  // One hop lands on a bare ident that matches none of the shaping tests, which
+  // reads as correctly shaped — so the walk has to continue.
+  const src = [
+    "async fn chained_bad(out: GitOutput) -> AppError {",
+    "    let raw = out.stderr;",
+    "    let report = raw;",
+    "    AppError::Git {",
+    "        code: out.code,",
+    "        stderr: report,",
+    "    }",
+    "}",
+    "async fn chained_ok(out: GitOutput) -> AppError {",
+    "    let raw = out.full_failure_text();",
+    "    let report = raw;",
+    "    AppError::Git {",
+    "        code: out.code,",
+    "        stderr: report,",
+    "    }",
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkStderrOnlyGitError("fixture.rs", src, src.split("\n"), hits);
+  assert.deepEqual(
+    hits.map((h) => h.fn),
+    ["chained_bad"],
+  );
+  assert.match(hits[0].fix, /full_failure_text/);
+});
+
+test("a cycle of stderr aliases fails closed", () => {
+  const src = [
+    "async fn looped(out: GitOutput) -> AppError {",
+    "    let first = second;",
+    "    let second = first;",
+    "    AppError::Git {",
+    "        code: out.code,",
+    "        stderr: first,",
+    "    }",
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkStderrOnlyGitError("fixture.rs", src, src.split("\n"), hits);
+  assert.equal(hits.length, 1);
+  assert.match(hits[0].fix, /cannot resolve/);
+});
+
+test("a stderr field beyond a six-line constructor is still read", () => {
+  // Brace balance, not a line count: rustfmt and a long field list push the
+  // field down, and a window that ends first reads as "no stderr field".
+  const src = [
+    "async fn padded(out: GitOutput) -> AppError {",
+    "    AppError::Git {",
+    "        // one",
+    "        // two",
+    "        // three",
+    "        // four",
+    "        // five",
+    "        // six",
+    "        // seven",
+    "        code: out.code,",
+    "        stderr: out.stderr,",
+    "    }",
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkStderrOnlyGitError("fixture.rs", src, src.split("\n"), hits);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].fn, "padded");
+});
+
+test("an alias initializer is judged whole, not truncated at a `;`", () => {
+  // The `;` that ends the statement can also sit inside a string literal, and
+  // the truncated head matches no shaping test and is not an ident — a pass.
+  const src = [
+    "async fn semicolon_in_literal(out: GitOutput) -> AppError {",
+    '    let report = format!("a; {}", out.stderr);',
+    "    AppError::Git {",
+    "        code: out.code,",
+    "        stderr: report,",
+    "    }",
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkStderrOnlyGitError("fixture.rs", src, src.split("\n"), hits);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].fn, "semicolon_in_literal");
+  assert.match(hits[0].fix, /full_failure_text/);
+});
+
+test("a `stderr:` inside a string literal does not answer for the real field", () => {
+  // Matching the first `stderr:` in the text lets an earlier field's STRING
+  // stand in for the field — and a string naming the correct helper passes.
+  const src = [
+    "async fn masked(out: GitOutput) -> AppError {",
+    "    AppError::Git {",
+    '        code: fallback("shape it as stderr: out.full_failure_text()"),',
+    "        stderr: out.stderr,",
+    "    }",
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkStderrOnlyGitError("fixture.rs", src, src.split("\n"), hits);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].fn, "masked");
+  assert.match(hits[0].fix, /full_failure_text/);
+});
+
+test("a raw string literal does not swallow the rest of a constructor", () => {
+  // `r"\\?\"` ends at its own quote — raw literals honor no escapes — but an
+  // escape-aware scan reads the trailing backslash as escaping that quote and
+  // consumes everything after it, so the real field is never reached.
+  const src = [
+    "async fn raw_in_ctor(out: GitOutput) -> AppError {",
+    "    AppError::Git {",
+    String.raw`        code: parse(r"\\?\"),`,
+    "        stderr: out.stderr,",
+    "    }",
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkStderrOnlyGitError("fixture.rs", src, src.split("\n"), hits);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].fn, "raw_in_ctor");
+});
+
+test("an attribute-decorated test module is still recognized as a span", () => {
+  // The gate and the `mod` can be separated by outer attributes; missing the
+  // span reads every renaming pattern inside it as an unresolvable field.
+  const src = [
+    "#[cfg(test)]",
+    "#[allow(clippy::too_many_lines)]",
+    "mod tests {",
+    "    fn renamed(e: &AppError) {",
+    "        if let AppError::Git { code: c, stderr: text } = e {",
+    "            drop((c, text));",
+    "        }",
+    "    }",
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkStderrOnlyGitError("fixture.rs", src, src.split("\n"), hits);
+  assert.deepEqual(hits, []);
+});
+
+test("test modules are skipped by SPAN, so production code after one is scanned", () => {
+  // A renaming pattern (`stderr: text`) is indistinguishable from an
+  // unresolvable field, and only tests carry them. Cutting the scan at the
+  // module instead of bounding it would leave everything below unchecked.
+  const src = [
+    "#[cfg(test)]",
+    "mod tests {",
+    "    fn renamed(e: &AppError) {",
+    "        if let AppError::Git { code: c, stderr: text } = e {",
+    "            drop((c, text));",
+    "        }",
+    "    }",
+    "}",
+    "async fn after_tests(out: GitOutput) -> AppError {",
+    "    AppError::Git {",
+    "        code: out.code,",
+    "        stderr: out.stderr,",
+    "    }",
+    "}",
+  ].join("\n");
+  const hits = [];
+  checkStderrOnlyGitError("fixture.rs", src, src.split("\n"), hits);
+  assert.deepEqual(
+    hits.map((h) => h.fn),
+    ["after_tests"],
+  );
+});
+
+// ----------------------------------------------------------- check-dead-surface
+
+test("a commented-out handler entry does not read as registered", () => {
+  // The dangerous direction: `foo` survives `split("::").pop()` from a
+  // commented-out line, so a disabled-but-invoked command would read as clean.
+  const source = [
+    ".invoke_handler(tauri::generate_handler![",
+    "    git::status,",
+    "    // git::disabled_line,",
+    "    /* git::disabled_block, */",
+    "    git::commit,",
+    "])",
+  ].join("\n");
+  assert.deepEqual([...parseRegistered(source, "fixture")].sort(), [
+    "commit",
+    "status",
+  ]);
+});
+
+test("the registered parser survives nested brackets and a missing marker", () => {
+  const nested = [
+    "tauri::generate_handler![",
+    "    git::status,",
+    "    with_array::[a],",
+    "    git::commit",
+    "]",
+  ].join("\n");
+  const names = parseRegistered(nested, "fixture");
+  assert.ok(names.has("status") && names.has("commit"));
+  assert.throws(
+    () => parseRegistered("no handler here", "fixture"),
+    /Could not find/,
+  );
+});
+
+test("a commented-out invoke does not read as a live call", () => {
+  // The mirror of the handler-list bug: a retired command whose only call site
+  // is commented out would otherwise stay "invoked" and never surface as dead.
+  const source = [
+    'const a = invoke("git_status");',
+    '// const b = invoke("git_retired_command");',
+    "/*",
+    'const c = invoke("git_retired_block");',
+    "*/",
+    // A comment-shaped string is not a comment: this call still counts.
+    'const d = invoke("git_open_url"); // see https://example.dev/docs',
+  ].join("\n");
+  assert.deepEqual([...parseInvoked(source)].sort(), [
+    "git_open_url",
+    "git_status",
+  ]);
+});
+
+test("an allowlist entry that suppresses nothing is stale, in both shapes", () => {
+  const registered = new Set(["git_status", "git_commit", "git_menu_only"]);
+  const invoked = new Set(["git_status"]);
+  // Only registered-but-uninvoked (`git_menu_only`) is what an entry is FOR, so
+  // it stays. The other two shapes both suppress nothing: a command the handler
+  // list no longer registers, and one with a live caller — which never reaches
+  // the `dead` filter, so its entry quiets a hit that cannot happen.
+  assert.deepEqual(
+    staleCommandEntries(
+      ["git_menu_only", "git_status", "git_retired_command"],
+      registered,
+      invoked,
+    ),
+    ["git_retired_command", "git_status"],
+  );
+  // The empty allowlist (today's tree) is a no-op, not a failure.
+  assert.deepEqual(staleCommandEntries([], registered, invoked), []);
+});
+
+test("invoke matching survives nested generics and wrapped calls", () => {
+  const source = [
+    'const a = invoke<Record<string, string>>("git_branch_tips");',
+    "const b = await invoke<PublishTarget[]>(",
+    '  "forge_publish_targets",',
+    ");",
+    'const c = invoke("git_status");',
+  ].join("\n");
+  assert.deepEqual([...parseInvoked(source)].sort(), [
+    "forge_publish_targets",
+    "git_branch_tips",
+    "git_status",
+  ]);
+});
+
+// ----------------------------------------------------------- check-rule-mirrors
+
+// Both fixtures wrap their sentences the way the real carriers do — the `-C`
+// clause and the `is / forbidden` catchall each straddle a line break. That is
+// deliberate: if the whitespace normalization ever came out, the passing
+// fixture would read as a carrier missing two sentinels, so these cases pin the
+// normalization as much as the patterns.
+const carrierStatingTheRule = [
+  "1. **Git is a whitelist.** Permitted: `git --no-pager diff / status / log /",
+  "   show` and `git branch --list`, each optionally prefixed with `-C <path>`",
+  "   to address a task worktree. Everything else — commit, add/stage, stash,",
+  "   push, worktree, config — is",
+  '   forbidden, even "just to test". The user commits their own work.',
+].join("\n");
+
+test("a carrier that still states the whole rule satisfies every sentinel", () => {
+  assert.deepEqual(missingSentinels(carrierStatingTheRule), []);
+});
+
+test("a carrier that drops the line-wrapped catchall is caught", () => {
+  // The dangerous direction: the whitelist forms are still listed, so the file
+  // LOOKS like it carries the rule — only the sentence forbidding everything
+  // else is gone, which is exactly the drift a reader would not notice.
+  const softened = carrierStatingTheRule.replace(
+    ["   push, worktree, config — is", "   forbidden, even"].join("\n"),
+    "   push, worktree, config — are discouraged, except",
+  );
+  assert.notEqual(softened, carrierStatingTheRule);
+  assert.deepEqual(
+    missingSentinels(softened).map((s) => s.name),
+    ["forbidden catchall"],
+  );
+});
+
+test("a carrier that carves an exception into the catchall is caught", () => {
+  // Worse than deleting the sentence, because the sentence is still there to
+  // read: the rule is stated and then unstated in the same breath.
+  const excepted = carrierStatingTheRule.replace(
+    [
+      "   push, worktree, config — is",
+      '   forbidden, even "just to test".',
+    ].join("\n"),
+    "   push, worktree, config — is forbidden, except git commit.",
+  );
+  assert.notEqual(excepted, carrierStatingTheRule);
+  assert.deepEqual(
+    missingSentinels(excepted).map((s) => s.name),
+    ["forbidden catchall"],
+  );
+});
+
+test("a carrier that drops the -C sanction is caught", () => {
+  // Losing this clause is what makes a worktree-scoped command read as
+  // forbidden to an agent honoring its own charter.
+  const unscoped = carrierStatingTheRule.replace(
+    [
+      "   show` and `git branch --list`, each optionally prefixed with `-C <path>`",
+      "   to address a task worktree. Everything else",
+    ].join("\n"),
+    "   show` and `git branch --list`. Everything else",
+  );
+  assert.notEqual(unscoped, carrierStatingTheRule);
+  assert.deepEqual(
+    missingSentinels(unscoped).map((s) => s.name),
+    ["-C worktree sanction"],
+  );
+});
+
+test("a carrier that drops the branch --list allowance is caught", () => {
+  const withoutBranch = carrierStatingTheRule.replace(
+    "` and `git branch --list`,",
+    "`,",
+  );
+  assert.notEqual(withoutBranch, carrierStatingTheRule);
+  assert.deepEqual(
+    missingSentinels(withoutBranch).map((s) => s.name),
+    ["branch --list allowance"],
+  );
+});
+
+test("a carrier that drops the read-only forms list is caught", () => {
+  const withoutForms = carrierStatingTheRule.replace(
+    [
+      "1. **Git is a whitelist.** Permitted: `git --no-pager diff / status / log /",
+      "   show`",
+    ].join("\n"),
+    "1. **Git is a whitelist.** Permitted: the read-only inspection forms",
+  );
+  assert.notEqual(withoutForms, carrierStatingTheRule);
+  assert.deepEqual(
+    missingSentinels(withoutForms).map((s) => s.name),
+    ["read-only git forms"],
+  );
+});
+
+test("every carrier path the gate checks exists on disk", () => {
+  // The sentinels only fire on a file the gate can read: a carrier renamed or
+  // moved without updating CARRIERS would otherwise fail as "cannot read" in
+  // CI long after the rename landed.
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  for (const carrier of CARRIERS) {
+    assert.ok(existsSync(join(root, carrier)), `missing carrier: ${carrier}`);
+  }
+});
+
+test("a mounted carrier, when present, still states the whole rule", () => {
+  // Mounted carriers exist only behind the owner's junction — also the only
+  // place their drift can be authored — so the suite gates them exactly where
+  // it can and skips them in clones, the same split the gate itself makes.
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  for (const carrier of MOUNTED_CARRIERS) {
+    const path = join(root, carrier);
+    if (!existsSync(path)) continue;
+    assert.deepEqual(
+      missingSentinels(readFileSync(path, "utf8")).map((s) => s.name),
+      [],
+      `mounted carrier lost the rule: ${carrier}`,
+    );
+  }
+});
+
+// ------------------------------------------------ check-built-whitespace
+
+// The fixtures mirror what Astro actually emits: a newline between the anchors
+// under `compressHTML: true`, and none under "jsx". Both sit inside a <footer>
+// because that scoping IS the predicate — a gap anywhere else on the page must
+// not satisfy it.
+const footerWithGap = `<footer><div><a href="/a/">A</a>\n<a href="/b/">B</a></div></footer>`;
+const footerCompressed = `<footer><div><a href="/a/">A</a><a href="/b/">B</a></div></footer>`;
+
+test("the whitespace predicate fires on a compressed footer", () => {
+  assert.equal(hasInlineGap(footerWithGap), true);
+  assert.equal(hasInlineGap(footerCompressed), false);
+});
+
+test("an anchor gap outside the footer does not satisfy the gate", () => {
+  // The page-wide form passed on CTA pairs while the footer row was compressed,
+  // which is the fail-open this scoping closes.
+  const ctaGapOnly = `<main><a href="/x/">X</a> <a href="/y/">Y</a></main>${footerCompressed}`;
+  assert.equal(hasInlineGap(ctaGapOnly), false);
+});
+
+test("a block-level tag starting with 'a' does not satisfy the gate", () => {
+  // `<a` unbounded also matches <aside>/<article>/<abbr>, so the gate could go
+  // green on a block boundary with every real anchor pair compressed.
+  for (const tag of ["aside", "article", "abbr"]) {
+    assert.equal(INLINE_GAP.test(`</a>\n<${tag}>`), false, tag);
+  }
+  assert.equal(INLINE_GAP.test(`</a>\n<a href="/b/">`), true);
+});
+
+test("a page with no footer is not treated as passing", () => {
+  assert.equal(footerOf("<main><p>no footer here</p></main>"), null);
+  assert.equal(hasInlineGap("<main><p>no footer here</p></main>"), false);
+});
+
+test("a custom element whose name starts with 'footer' is not the footer", () => {
+  // `<footer` unbounded also starts inside <footer-links>, so a gapped pair
+  // there could carry the gate while the real footer stayed compressed.
+  const page = `<footer-links><a href="/a/">A</a> <a href="/b/">B</a></footer-links>${footerCompressed}`;
+  assert.equal(hasInlineGap(page), false);
+  assert.ok(footerOf(page).startsWith("<footer>"));
+});
+
+test("a footer close tag with trailing space still delimits the element", () => {
+  assert.equal(
+    hasInlineGap(footerWithGap.replace("</footer>", "</footer >")),
+    true,
+  );
+});
+
+// --------------------------------------------------- check-tauri-plugin-parity
+
+/** Cargo.lock text in the block shape the gate reads, LF or CRLF on demand. */
+function cargoLock(entries, eol = "\n") {
+  return entries
+    .map(([name, version]) =>
+      ["[[package]]", `name = "${name}"`, `version = "${version}"`].join(eol),
+    )
+    .join(eol + eol);
+}
+
+/** Crate names the check reports, driven from two in-memory maps. */
+const splitCrates = (crates, npm) =>
+  mismatchedPairs(new Map(crates), new Map(npm)).map((p) => p.crate);
+
+test("parseCrateVersions reads the block shape under both line endings", () => {
+  // CRLF is not hypothetical: a Windows checkout materializes Cargo.lock that
+  // way under core.autocrlf, and an LF-only pattern would parse zero packages —
+  // the gate then passes having compared nothing.
+  const entries = [
+    ["tauri", "2.11.5"],
+    ["tauri-plugin-http", "2.6.0"],
+  ];
+  for (const eol of ["\n", "\r\n"]) {
+    assert.deepEqual(
+      [...parseCrateVersions(cargoLock(entries, eol))],
+      entries,
+      `should parse ${JSON.stringify(eol)} blocks`,
+    );
+  }
+});
+
+test("parseNpmVersions reads the root importer's resolved versions only", () => {
+  const lock = [
+    "lockfileVersion: '9.0'",
+    "",
+    "importers:",
+    "",
+    "  .:",
+    "    dependencies:",
+    "      '@tauri-apps/api':",
+    "        specifier: ^2.11.1",
+    "        version: 2.11.1",
+    "      zustand:",
+    "        specifier: ^5.0.15",
+    "        version: 5.0.15(react@19.2.8)",
+    "    devDependencies:",
+    "      '@tauri-apps/cli':",
+    "        specifier: ^2.11.4",
+    "        version: 2.11.4",
+    "",
+    "  site:",
+    "    dependencies:",
+    "      '@tauri-apps/api':",
+    "        specifier: ^1.0.0",
+    "        version: 1.0.0",
+    "",
+    "packages:",
+    "",
+    "  '@tauri-apps/api@9.9.9':",
+    "    resolution: {integrity: sha512-fixture}",
+  ].join("\n");
+  const npm = parseNpmVersions(lock);
+  // devDependencies count (that is where @tauri-apps/cli lives), the resolved
+  // version wins over the specifier, and a peer-resolution suffix is not part
+  // of the version.
+  assert.equal(npm.get("@tauri-apps/api"), "2.11.1");
+  assert.equal(npm.get("@tauri-apps/cli"), "2.11.4");
+  assert.equal(npm.get("zustand"), "5.0.15");
+  // The sibling importer and the transitive `packages:` section both carry the
+  // same name at a different version; either winning would compare a version
+  // the app never installs.
+  assert.equal(npm.size, 3);
+});
+
+test("parseNpmVersions yields nothing when there is no root importer", () => {
+  // The degradation that feeds the `empty` fail-closed arm from the parser
+  // side: no `  .:` importer block means no versions, and the transitive
+  // `packages:` copies are out of scope whatever they resolve to.
+  const noImporter = [
+    "lockfileVersion: '9.0'",
+    "",
+    "packages:",
+    "",
+    "  '@tauri-apps/api@9.9.9':",
+    "    resolution: {integrity: sha512-fixture}",
+    "    version: 9.9.9",
+  ].join("\n");
+  assert.equal(parseNpmVersions(noImporter).size, 0);
+});
+
+test("npmNameFor pairs the two forms and nothing else", () => {
+  assert.equal(npmNameFor("tauri"), "@tauri-apps/api");
+  assert.equal(
+    npmNameFor("tauri-plugin-notification"),
+    "@tauri-apps/plugin-notification",
+  );
+  // The tauri-* build and runtime crates ship no npm half, and `tauri-plugin`
+  // itself is the plugin SDK, not a plugin.
+  for (const crate of [
+    "tauri-build",
+    "tauri-codegen",
+    "tauri-runtime-wry",
+    "tauri-utils",
+    "tauri-plugin",
+    "serde",
+  ]) {
+    assert.equal(npmNameFor(crate), null, `should not pair ${crate}`);
+  }
+});
+
+test("mismatchedPairs passes halves aligned on major.minor", () => {
+  assert.deepEqual(
+    splitCrates(
+      [["tauri-plugin-http", "2.6.0"]],
+      [["@tauri-apps/plugin-http", "2.6.0"]],
+    ),
+    [],
+  );
+  // Patch drift is legal — tauri-cli compares major and minor only, so flagging
+  // it would redden PRs whose bundle builds fine.
+  assert.deepEqual(
+    splitCrates(
+      [["tauri-plugin-http", "2.6.0"]],
+      [["@tauri-apps/plugin-http", "2.6.1"]],
+    ),
+    [],
+  );
+});
+
+test("mismatchedPairs flags a split in either direction", () => {
+  // Crate ahead: the Cargo.lock-only bump that ships a broken `tauri build`.
+  assert.deepEqual(
+    splitCrates(
+      [["tauri-plugin-http", "2.6.0"]],
+      [["@tauri-apps/plugin-http", "2.5.9"]],
+    ),
+    ["tauri-plugin-http"],
+  );
+  // npm ahead: the same break, reached from the other lockfile — a check that
+  // only looked one way would call this clean.
+  assert.deepEqual(
+    splitCrates(
+      [["tauri-plugin-http", "2.5.9"]],
+      [["@tauri-apps/plugin-http", "2.6.0"]],
+    ),
+    ["tauri-plugin-http"],
+  );
+  assert.deepEqual(
+    splitCrates([["tauri", "3.0.0"]], [["@tauri-apps/api", "2.6.0"]]),
+    ["tauri"],
+  );
+});
+
+test("mismatchedPairs carries both halves of the split it reports", () => {
+  assert.deepEqual(
+    mismatchedPairs(
+      new Map([["tauri", "2.11.5"]]),
+      new Map([["@tauri-apps/api", "2.10.1"]]),
+    ),
+    [
+      {
+        crate: "tauri",
+        npm: "@tauri-apps/api",
+        crateVersion: "2.11.5",
+        npmVersion: "2.10.1",
+      },
+    ],
+  );
+});
+
+test("verdict fails closed when the lockfiles yield no pairs at all", () => {
+  // The branch a broken parser lands in: nothing to compare is not a clean
+  // tree, because this repo always ships tauri on both sides.
+  const none = verdict(new Map(), new Map());
+  assert.equal(none.empty, true);
+  assert.deepEqual(none.pairs, []);
+  assert.deepEqual(none.mismatched, []);
+});
+
+test("verdict fails closed when the core pair is missing from a partial parse", () => {
+  // Partial degradation is the residual fail-open: plugins still pair, so the
+  // count looks healthy while the comparisons the gate exists for went missing.
+  const partial = verdict(
+    new Map([["tauri-plugin-http", "2.6.0"]]),
+    new Map([["@tauri-apps/plugin-http", "2.6.0"]]),
+  );
+  assert.equal(partial.empty, false);
+  assert.equal(partial.missingCore, true);
+  assert.deepEqual(partial.mismatched, []);
+});
+
+test("verdict clears only when the core pair is present and aligned", () => {
+  const clean = verdict(
+    new Map([
+      ["tauri", "2.11.5"],
+      ["tauri-plugin-http", "2.6.0"],
+    ]),
+    new Map([
+      ["@tauri-apps/api", "2.11.1"],
+      ["@tauri-apps/plugin-http", "2.6.0"],
+    ]),
+    { declared: ["@tauri-apps/api", "@tauri-apps/plugin-http"] },
+  );
+  assert.equal(clean.empty, false);
+  assert.equal(clean.missingCore, false);
+  assert.deepEqual(clean.mismatched, []);
+  assert.deepEqual(clean.duplicated, []);
+  assert.deepEqual(clean.unpaired, []);
+  assert.equal(clean.pairs.length, 2);
+});
+
+test("duplicateCrateNames names only the crates carrying two blocks", () => {
+  const lock = cargoLock([
+    ["tauri", "2.11.5"],
+    ["windows-sys", "0.59.0"],
+    ["windows-sys", "0.60.2"],
+    ["tauri-plugin-http", "2.6.0"],
+  ]);
+  assert.deepEqual([...duplicateCrateNames(lock)], ["windows-sys"]);
+});
+
+test("verdict fails closed on a duplicated PAIRED crate only", () => {
+  const crates = new Map([
+    ["tauri", "2.11.5"],
+    ["tauri-plugin-http", "2.6.0"],
+  ]);
+  const npm = new Map([
+    ["@tauri-apps/api", "2.11.1"],
+    ["@tauri-apps/plugin-http", "2.6.0"],
+  ]);
+  // Two blocks for a compared crate: the parse kept one version arbitrarily, so
+  // the pair it reports may not be the one the app links.
+  assert.deepEqual(
+    verdict(crates, npm, { duplicates: new Set(["tauri-plugin-http"]) })
+      .duplicated,
+    ["tauri-plugin-http"],
+  );
+  // Duplication is ordinary for the crates this gate never compares.
+  assert.deepEqual(
+    verdict(crates, npm, {
+      duplicates: new Set(["windows-sys", "tauri-plugin-fs"]),
+    }).duplicated,
+    [],
+  );
+});
+
+test("declaredNpmPackages reads both dependency blocks, scoped to @tauri-apps", () => {
+  const pkg = JSON.stringify({
+    dependencies: { "@tauri-apps/api": "^2.11.1", zustand: "^5.0.15" },
+    devDependencies: { "@tauri-apps/cli": "^2.11.4", vite: "^8.2.1" },
+  });
+  assert.deepEqual(declaredNpmPackages(pkg), [
+    "@tauri-apps/api",
+    "@tauri-apps/cli",
+  ]);
+  // A manifest with neither block is not a crash — the arm simply expects
+  // nothing.
+  assert.deepEqual(declaredNpmPackages("{}"), []);
+});
+
+// One class, two cells: a declared Tauri package that never reaches `declared`
+// is a comparison the gate silently skips, and it can be lost either by the
+// BLOCK it sits in or by the KEY it is declared under. A new input path added
+// to the manifest scan belongs here.
+
+test("declaredNpmPackages counts optional deps and exempts peers", () => {
+  const pkg = JSON.stringify({
+    dependencies: { "@tauri-apps/api": "^2.11.1" },
+    optionalDependencies: { "@tauri-apps/plugin-shell": "^2.4.0" },
+    // pnpm does not install an app's peers, so flagging one would redden a
+    // required check over a package that was never meant to be there.
+    peerDependencies: { "@tauri-apps/plugin-fs": "^2.5.0" },
+  });
+  assert.deepEqual(declaredNpmPackages(pkg), [
+    "@tauri-apps/api",
+    "@tauri-apps/plugin-shell",
+  ]);
+});
+
+test("declaredNpmPackages resolves an npm: alias to the real package name", () => {
+  // The alias hides the package on BOTH sides at once: the key carries no
+  // `@tauri-apps/` prefix, and the lockfile's root importer keys the entry by
+  // the alias — so without reading the value, nothing is ever compared.
+  const pkg = JSON.stringify({
+    dependencies: {
+      "@tauri-apps/api": "^2.11.1",
+      "tauri-store-alias": "npm:@tauri-apps/plugin-store@^2.4.4",
+      "other-alias": "npm:left-pad@1.3.0",
+    },
+  });
+  assert.deepEqual(declaredNpmPackages(pkg), [
+    "@tauri-apps/api",
+    "@tauri-apps/plugin-store",
+  ]);
+  assert.deepEqual(
+    [...declaredNpmAliases(pkg)],
+    [["@tauri-apps/plugin-store", "tauri-store-alias"]],
+  );
+  // The mirror case keeps its scoped KEY, so the importer entry still matches
+  // and the garbage version lands in `mismatched` rather than here: it is a
+  // declaration under its own name, not an alias.
+  const forked = JSON.stringify({
+    dependencies: { "@tauri-apps/plugin-store": "npm:fork@1.0.0" },
+  });
+  assert.deepEqual(declaredNpmPackages(forked), ["@tauri-apps/plugin-store"]);
+  assert.deepEqual([...declaredNpmAliases(forked)], []);
+});
+
+test("a direct declaration cannot mask an alias of the same package", () => {
+  // Both forms resolve, and pnpm keys the importer by each — the direct name
+  // and the alias. The pair the direct declaration forms is exactly what would
+  // swallow the alias if the two lists were one map.
+  const pkg = JSON.stringify({
+    dependencies: {
+      "@tauri-apps/api": "^2.11.1",
+      "@tauri-apps/plugin-store": "^2.4.4",
+      "store-alias": "npm:@tauri-apps/plugin-store@2.4.4",
+    },
+  });
+  assert.deepEqual(declaredNpmPackages(pkg), [
+    "@tauri-apps/api",
+    "@tauri-apps/plugin-store",
+  ]);
+  assert.deepEqual(declaredNpmAliases(pkg), [
+    ["@tauri-apps/plugin-store", "store-alias"],
+  ]);
+  const decided = verdict(
+    new Map([
+      ["tauri", "2.11.5"],
+      ["tauri-plugin-store", "2.4.4"],
+    ]),
+    new Map([
+      ["@tauri-apps/api", "2.11.1"],
+      ["@tauri-apps/plugin-store", "2.4.4"],
+      ["store-alias", "2.4.4"],
+    ]),
+    { declared: declaredNpmPackages(pkg), aliases: declaredNpmAliases(pkg) },
+  );
+  // Every other arm is clean — the direct half pairs and matches — so `aliased`
+  // is the only thing standing between this tree and a green gate.
+  assert.deepEqual(decided.mismatched, []);
+  assert.deepEqual(decided.unpaired, []);
+  assert.equal(decided.empty, false);
+  assert.equal(decided.missingCore, false);
+  assert.deepEqual(decided.aliased, [
+    ["@tauri-apps/plugin-store", "store-alias"],
+  ]);
+});
+
+test("an aliased declaration reaches the unpaired arm", () => {
+  // The end of the chain both cells feed: the name is declared, the crate is
+  // there, no pair can form under the alias — so the gate reports rather than
+  // passing over it.
+  const pkg = JSON.stringify({
+    dependencies: {
+      "@tauri-apps/api": "^2.11.1",
+      "tauri-store-alias": "npm:@tauri-apps/plugin-store@^2.4.4",
+    },
+  });
+  const decided = verdict(
+    new Map([
+      ["tauri", "2.11.5"],
+      ["tauri-plugin-store", "2.4.4"],
+    ]),
+    // What pnpm writes for an aliased install: the alias is the importer key.
+    new Map([
+      ["@tauri-apps/api", "2.11.1"],
+      ["tauri-store-alias", "2.4.4"],
+    ]),
+    { declared: declaredNpmPackages(pkg), aliases: declaredNpmAliases(pkg) },
+  );
+  assert.deepEqual(decided.unpaired, ["@tauri-apps/plugin-store"]);
+  // Both arms see an alias-only declaration; the CLI renders `aliased` first
+  // because it names the cause rather than the symptom.
+  assert.deepEqual(decided.aliased, [
+    ["@tauri-apps/plugin-store", "tauri-store-alias"],
+  ]);
+});
+
+test("crateNameFor inverts the pairing and stops at the npm-only package", () => {
+  assert.equal(crateNameFor("@tauri-apps/api"), "tauri");
+  assert.equal(crateNameFor("@tauri-apps/plugin-store"), "tauri-plugin-store");
+  assert.equal(crateNameFor("@tauri-apps/cli"), null);
+  assert.equal(crateNameFor("zustand"), null);
+});
+
+test("verdict fails closed on a declared package that produced no comparison", () => {
+  const crates = new Map([
+    ["tauri", "2.11.5"],
+    ["tauri-plugin-http", "2.6.0"],
+  ]);
+  // The lockfile half lost one entry — a shape a format change makes, and one
+  // the pair COUNT cannot see: the remaining pairs still look healthy.
+  const degraded = verdict(crates, new Map([["@tauri-apps/api", "2.11.1"]]), {
+    declared: ["@tauri-apps/api", "@tauri-apps/plugin-http", "@tauri-apps/cli"],
+  });
+  assert.equal(degraded.empty, false);
+  assert.equal(degraded.missingCore, false);
+  // @tauri-apps/cli maps to no crate name, so it owes nothing and stays out.
+  assert.deepEqual(degraded.unpaired, ["@tauri-apps/plugin-http"]);
+  // A declared package whose crate is absent from Cargo.lock ENTIRELY is the
+  // same finding, not an exemption: a JS half calling a plugin the Rust side
+  // never registers is exactly what this arm is for.
+  assert.deepEqual(
+    verdict(crates, new Map([["@tauri-apps/api", "2.11.1"]]), {
+      declared: ["@tauri-apps/api", "@tauri-apps/plugin-dialog"],
+    }).unpaired,
+    ["@tauri-apps/plugin-dialog"],
+  );
+  // The must-NOT-hit twin: the npm-only package stays out even when it is the
+  // only thing left to flag.
+  assert.deepEqual(
+    verdict(crates, new Map([["@tauri-apps/api", "2.11.1"]]), {
+      declared: ["@tauri-apps/api", "@tauri-apps/cli"],
+    }).unpaired,
+    [],
+  );
+});
+
+test("mismatchedPairs skips a half with no counterpart", () => {
+  // Crate-only plugins and the npm-only CLI have nothing to disagree with, so
+  // neither is a finding however far the versions sit apart.
+  assert.deepEqual(
+    splitCrates(
+      [
+        ["tauri-plugin-fs", "2.5.2"],
+        ["tauri-plugin-single-instance", "2.4.4"],
+      ],
+      [["@tauri-apps/cli", "2.11.4"]],
+    ),
+    [],
+  );
+  assert.deepEqual(
+    splitCrates([["tauri", "2.11.5"]], [["@tauri-apps/cli", "1.0.0"]]),
+    [],
+  );
+});
+
+// og-card gate: the reference check is only as good as its frontmatter parse,
+// and its historical failure mode is fail-open (a quoting form the regex
+// missed skipped the check entirely and the run stayed green).
+
+test("cardRefOf reads every YAML quoting form", () => {
+  // Every key/value quoting form must reach the check — a form the regex
+  // misses is skipped silently, not rejected.
+  assert.equal(cardRefOf('ogImage: "/og/a.png"'), "/og/a.png");
+  assert.equal(cardRefOf("ogImage: '/og/b.png'"), "/og/b.png");
+  assert.equal(cardRefOf("ogImage: /og/c.png"), "/og/c.png");
+  assert.equal(
+    cardRefOf("ogImage: https://cdn.example/d.png"),
+    "https://cdn.example/d.png",
+  );
+  assert.equal(cardRefOf('"ogImage": "/og/f.png"'), "/og/f.png");
+  assert.equal(cardRefOf("'ogImage': '/og/g.png'"), "/og/g.png");
+  assert.equal(cardRefOf('ogImage : "/og/h.png"'), "/og/h.png");
+});
+
+test("cardRefOf does not fire on other keys or mid-line mentions", () => {
+  assert.equal(cardRefOf('heroImage: "/og/e.png"'), undefined);
+  assert.equal(cardRefOf("description: set ogImage: later"), undefined);
+  assert.equal(cardRefOf(""), undefined);
+});
+
+test("frontmatterOf is total and CRLF-safe", () => {
+  assert.equal(frontmatterOf("# heading only, no frontmatter\n"), "");
+  assert.equal(
+    cardRefOf(frontmatterOf('---\r\nogImage: "/og/x.png"\r\n---\r\nbody')),
+    "/og/x.png",
+  );
+});
+
+test("servedRelPathsFor obligates the webp sibling for png cards only", () => {
+  assert.deepEqual(servedRelPathsFor("/og/a.png"), ["og/a.png", "og/a.webp"]);
+  assert.deepEqual(servedRelPathsFor("/og/a.jpg"), ["og/a.jpg"]);
+  assert.deepEqual(servedRelPathsFor("https://cdn.example/a.png"), []);
+});
+
+test("isAbsoluteRef exempts http(s) in any case, nothing else", () => {
+  assert.equal(isAbsoluteRef("HTTPS://cdn.example/a.png"), true);
+  assert.equal(isAbsoluteRef("http://cdn.example/a.png"), true);
+  assert.equal(isAbsoluteRef("/og/a.png"), false);
+});
+
+test("og-blog.mjs's shared-predicate import resolves on disk", () => {
+  // The derive tool has no CI execution of its own, so a renamed guard would
+  // otherwise surface only on the author's next local run.
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const ogBlog = join(root, "site/scripts/og-blog.mjs");
+  const spec = readFileSync(ogBlog, "utf8").match(
+    /from "(\.\.[^"]*check-og-cards\.mjs)"/,
+  )?.[1];
+  assert.ok(spec, "og-blog.mjs imports the shared og-card predicates");
+  assert.ok(
+    existsSync(resolve(dirname(ogBlog), spec)),
+    `og-blog.mjs's import "${spec}" resolves to a real file`,
+  );
+});
+
+test("servedRelPathsFor rejects refs that escape public/", () => {
+  // The backslash arm is built char-by-char: an inline "\\" here has been
+  // collapsed by tooling escape layers into a broken \x escape before.
+  const bs = String.fromCharCode(92);
+  assert.throws(() => servedRelPathsFor("/og/../package.json"));
+  assert.throws(() => servedRelPathsFor("../secrets.txt"));
+  assert.throws(() => servedRelPathsFor(`/og/..${bs}..${bs}x.png`));
+  assert.throws(() => servedRelPathsFor("/./og/a.png"));
+  // The legal shapes still pass untouched.
+  assert.deepEqual(servedRelPathsFor("/og/a.png"), ["og/a.png", "og/a.webp"]);
+});
+
+// ---------------------------------------------------------- check-skill-mirrors
+
+/** Two one-file skill copies, as the gate reads them off disk. */
+const copies = (claudeBody, agentsBody) => [
+  new Map([["SKILL.md", claudeBody]]),
+  new Map([["SKILL.md", agentsBody]]),
+];
+
+test("skill-mirrors passes identical copies", () => {
+  const { onlyClaude, onlyAgents, differ } = diffTrees(
+    ...copies("# A\n\nSame.\n", "# A\n\nSame.\n"),
+  );
+  assert.deepEqual(
+    { onlyClaude, onlyAgents, differ },
+    { onlyClaude: [], onlyAgents: [], differ: [] },
+  );
+});
+
+test("skill-mirrors tolerates the three mechanical differences", () => {
+  // Line endings: the trees are installed at different times.
+  assert.deepEqual(
+    diffTrees(...copies("# A\n\nSame.\n", "# A\r\n\r\nSame.\r\n")).differ,
+    [],
+  );
+  // Each tree self-references its own path.
+  assert.deepEqual(
+    diffTrees(
+      ...copies(
+        "Run `node .claude/skills/d/x.mjs`.\n",
+        "Run `node .agents/skills/d/x.mjs`.\n",
+      ),
+    ).differ,
+    [],
+  );
+  // The command sigil differs per harness — scoped to the skill's own name.
+  assert.deepEqual(
+    diffTrees(...copies("Use `/d polish`.\n", "Use `$d polish`.\n"), "d")
+      .differ,
+    [],
+  );
+});
+
+test("skill-mirrors scopes the sigil rule to the skill's own command", () => {
+  // Stripping every backticked `/token` would equate unrelated prose: the gated
+  // trees contain `/products`, `/collection` and the regex flag `/g`.
+  assert.notEqual(
+    normalizeSkill("fetch `/products`", "d"),
+    normalizeSkill("fetch `$products`", "d"),
+  );
+  assert.notEqual(
+    normalizeSkill("split on `/g`", "d"),
+    normalizeSkill("split on `$g`", "d"),
+  );
+  assert.equal(
+    normalizeSkill("run `/d polish`", "d"),
+    normalizeSkill("run `$d polish`", "d"),
+  );
+});
+
+test("skill-mirrors ignores every harness-only frontmatter key", () => {
+  // The whole HARNESS_ONLY_KEYS set is Claude-only config, not content: without
+  // the deletion these three would report as drift.
+  const { differ, frontmatter } = diffTrees(
+    ...copies(
+      '---\nname: d\nallowed-tools:\n  - Bash\nuser-invocable: true\nargument-hint: "[x]"\n---\n\nBody.\n',
+      "---\nname: d\n---\n\nBody.\n",
+    ),
+  );
+  assert.deepEqual(differ, []);
+  assert.deepEqual(frontmatter, []);
+});
+
+test("skill-mirrors normalization is reflexive over tree paths", () => {
+  // Byte-identical copies must ALWAYS compare equal, including when they name a
+  // tree. impeccable's scripts/hook-admin.mjs is exactly this: one identical
+  // table listing the .claude, .agents, .cursor and .github stores. Neutralizing
+  // only each copy's own prefix breaks this and reds the gate on identical files,
+  // where the printed "copy one over the other" remedy is a no-op.
+  for (const body of [
+    'table: [".claude/skills/d", ".agents/skills/d"]\n',
+    'run ".agents/skills/d/hook.mjs"\n',
+    'run ".claude/skills/d/hook.mjs"\n',
+  ]) {
+    assert.deepEqual(
+      diffTrees(
+        new Map([["hook.mjs", body]]),
+        new Map([["hook.mjs", body]]),
+        "d",
+      ).differ,
+      [],
+      `identical bodies must compare equal: ${body.trim()}`,
+    );
+  }
+  // The rewrite still absorbs each copy's own self-reference.
+  assert.deepEqual(
+    diffTrees(
+      new Map([["hook.mjs", 'run ".claude/skills/d/hook.mjs"\n']]),
+      new Map([["hook.mjs", 'run ".agents/skills/d/hook.mjs"\n']]),
+      "d",
+    ).differ,
+    [],
+  );
+});
+
+test("skill-mirrors catches a description rewritten in one tree", () => {
+  // description decides when the skill loads, so a one-tree rewrite silently
+  // changes which harness picks it up — the body can be byte-identical.
+  const { frontmatter } = diffTrees(
+    ...copies(
+      "---\nname: d\ndescription: triggers on React work\n---\n\nBody.\n",
+      "---\nname: d\ndescription: NEVER load this skill\n---\n\nBody.\n",
+    ),
+  );
+  assert.deepEqual(
+    frontmatter.map((f) => f.field),
+    ["description"],
+  );
+});
+
+test("skill-mirrors catches a frontmatter block lost from one copy", () => {
+  const { frontmatter } = diffTrees(
+    ...copies("---\nname: d\n---\n\nBody.\n", "Body.\n"),
+  );
+  assert.deepEqual(
+    frontmatter.map((f) => f.field),
+    ["frontmatter block"],
+  );
+});
+
+test("skill-mirrors catches real prose drift", () => {
+  // The exact class this gate exists for: one copy edited, the other left behind.
+  assert.deepEqual(
+    diffTrees(...copies("It is stable.\n", "It is not stable.\n")).differ,
+    ["SKILL.md"],
+  );
+});
+
+test("skill-mirrors catches a file present in only one tree", () => {
+  const claude = new Map([["SKILL.md", "x\n"]]);
+  const agents = new Map([
+    ["SKILL.md", "x\n"],
+    ["EXTRA.md", "orphan\n"],
+  ]);
+  assert.deepEqual(diffTrees(claude, agents).onlyAgents, ["EXTRA.md"]);
+  assert.deepEqual(diffTrees(agents, claude).onlyClaude, ["EXTRA.md"]);
+});
+
+test("skill-mirrors normalization does not collapse the sigil's name", () => {
+  // Normalizing the sigil must not also eat the command name, or two different
+  // commands would compare equal and the gate would fail open. The skill name
+  // must be PASSED — without it the sigil branch never runs and the assertion
+  // holds no matter what the regex does.
+  assert.notEqual(
+    normalizeSkill("Use `/polish`.\n", "polish"),
+    normalizeSkill("Use `/distill`.\n", "polish"),
+  );
+});
+
+test("skill-mirrors gates frontmatter keys beyond name/description", () => {
+  // The vercel rule files rank themselves with impact/tags; gating only
+  // name+description would let those drift silently.
+  const { frontmatter } = diffTrees(
+    ...copies(
+      "---\nname: d\nimpact: HIGH\ntags: a, b\n---\n\nBody.\n",
+      "---\nname: d\nimpact: LOW\ntags:\n---\n\nBody.\n",
+    ),
+  );
+  assert.deepEqual(
+    frontmatter.map((f) => f.field),
+    ["impact", "tags"],
+  );
+});
+
+test("skill-mirrors compares a folded description whole, not its indicator", () => {
+  // `description: >` + indented lines truncated to ">" under a lazy field regex,
+  // so two opposite descriptions compared equal.
+  const { frontmatter } = diffTrees(
+    ...copies(
+      "---\nname: d\ndescription: >\n  Loads on React work.\n---\n\nBody.\n",
+      "---\nname: d\ndescription: >\n  NEVER load this.\n---\n\nBody.\n",
+    ),
+  );
+  assert.deepEqual(
+    frontmatter.map((f) => f.field),
+    ["description"],
+  );
+});
+
+test("skill-mirrors accepts frontmatter that opens with a blank line", () => {
+  // Real, and in the gated set: rules/rerender-memo-with-default-value.md opens
+  // `---`, blank line, then `title:`. An opener that demanded a key line on the
+  // first row rejected it, dropping its frontmatter into the body comparison
+  // where the harness-only-key exemption no longer applies.
+  const { frontmatter, differ } = diffTrees(
+    ...copies(
+      "---\n\ntitle: T\nallowed-tools:\n  - Bash\n---\n\nBody.\n",
+      "---\n\ntitle: T\n---\n\nBody.\n",
+    ),
+  );
+  assert.deepEqual(frontmatter, [], "harness-only key is still exempt here");
+  assert.deepEqual(differ, [], "the block parsed as frontmatter, not body");
+});
+
+test("skill-mirrors does not treat an hr-opened prose block as frontmatter", () => {
+  // Prose after a `---` horizontal rule must not be swallowed up to the next
+  // `---`. A `Word: prose` line is genuinely ambiguous YAML and is a documented
+  // limit; a colon-free line is not, and is the shape this catches.
+  const { differ } = diffTrees(
+    ...copies(
+      "---\n\nAlpha text here.\n\n---\n\nTail.\n",
+      "---\n\nBeta text here.\n\n---\n\nTail.\n",
+    ),
+  );
+  assert.deepEqual(differ, ["SKILL.md"]);
+});
+
+test("skill-mirrors exemptions each carry a reason", () => {
+  // An exemption emptied of its reason is an undocumented hole in the gate.
+  assert.ok(EXEMPT.size > 0, "at least one exemption is recorded");
+  for (const [name, reason] of EXEMPT) {
+    assert.equal(typeof reason, "string");
+    assert.ok(reason.trim().length > 10, `${name}'s exemption states why`);
+  }
+});
+
+test("skill-mirrors single-tree declarations each carry a reason", () => {
+  assert.ok(
+    SINGLE_TREE.size > 0,
+    "the single-tree skills are declared, not inferred",
+  );
+  for (const name of EXPECTED_ABSENT)
+    assert.ok(
+      SINGLE_TREE.has(name),
+      // A typo here silently suppresses a real stale-skip NOTE, which is the
+      // only signal that a declaration has stopped describing anything.
+      `${name} is expected-absent but not declared in SINGLE_TREE`,
+    );
+  for (const [name, reason] of SINGLE_TREE) {
+    assert.equal(typeof reason, "string");
+    assert.ok(
+      reason.trim().length > 10,
+      `${name}'s single-tree entry states why`,
+    );
+  }
+});
+
+test("skill-mirrors classifies binary assets for hash comparison", () => {
+  // A utf8 decode collapses invalid bytes to U+FFFD, so two different PNGs can
+  // decode to the same string; shadcn ships PNGs in a gated skill.
+  assert.equal(isTextFile("assets/shadcn.png"), false);
+  assert.equal(isTextFile("SKILL.md"), true);
+  assert.equal(isTextFile("agents/openai.yml"), true);
+});
+
+test("skill-mirrors exits non-zero on drift, zero when clean", () => {
+  // The pure-function tests above never reach main()'s exit code: dropping its
+  // `failed = true` left every one of them green while the gate exited 0.
+  const root = mkdtempSync(join(tmpdir(), "gd-skill-mirror-"));
+  const gate = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "check-skill-mirrors.mjs",
+  );
+  const write = (tree, skill, file, body) => {
+    mkdirSync(join(root, tree, skill), { recursive: true });
+    writeFileSync(join(root, tree, skill, file), body);
+  };
+  // Return the output too: an exit code alone cannot tell the branch that fired
+  // from an unrelated crash, and cannot pin a SKIP-vs-NOTE decision at all.
+  let lastOut = "";
+  const run = () => {
+    try {
+      lastOut = String(
+        execFileSync(process.execPath, [gate], {
+          env: { ...process.env, GD_SKILL_MIRROR_ROOT: root },
+          stdio: "pipe",
+        }),
+      );
+      return 0;
+    } catch (err) {
+      lastOut = String(err.stdout || "") + String(err.stderr || "");
+      return err.status;
+    }
+  };
+  try {
+    // TWO mirrored skills, so removing one leaves the intersection non-empty:
+    // with only `demo`, deleting its twin empties the intersection and the run
+    // exits 1 at the VACUITY guard instead of the single-tree branch under test —
+    // the whole SINGLE_TREE mechanism could be deleted and this still passed.
+    for (const tree of [".claude/skills", ".agents/skills"]) {
+      write(tree, "demo", "SKILL.md", "Same.\n");
+      write(tree, "keeper", "SKILL.md", "Kept.\n");
+    }
+    assert.equal(run(), 0, "identical copies exit 0");
+
+    writeFileSync(join(root, ".agents/skills/demo/SKILL.md"), "Different.\n");
+    assert.equal(run(), 1, "drifted copies exit 1");
+
+    writeFileSync(join(root, ".agents/skills/demo/SKILL.md"), "Same.\n");
+    rmSync(join(root, ".agents/skills/demo"), { recursive: true });
+    assert.equal(run(), 1, "a deleted mirror copy exits 1, not a SKIP");
+
+    // …and prove the previous assertion came from the single-tree branch, not
+    // the vacuity guard: restoring the twin must go green again.
+    write(".agents/skills", "demo", "SKILL.md", "Same.\n");
+    assert.equal(run(), 0, "restoring the deleted mirror copy exits 0");
+
+    // EXEMPT is the gate's largest fail-open lever: without the `if (reason)`
+    // block this drift would fail the run, so the assertion discriminates it.
+    write(".claude/skills", "impeccable", "SKILL.md", "A\n");
+    write(".agents/skills", "impeccable", "SKILL.md", "B\n");
+    assert.equal(
+      run(),
+      0,
+      "drift inside an EXEMPT skill is suppressed by name",
+    );
+    // …and pin the SKIP-vs-NOTE decision, not just the exit code: a still-diverging
+    // exemption must report SKIP. Otherwise the stale-exemption NOTE — the only
+    // signal that an exemption has stopped suppressing anything — is unpinned.
+    assert.match(lastOut, /SKIP impeccable \(exempt:/);
+
+    // The same exemption with copies that now MATCH must flip to that NOTE.
+    writeFileSync(join(root, ".agents/skills/impeccable/SKILL.md"), "A\n");
+    assert.equal(run(), 0, "a reconciled exemption still exits 0");
+    assert.match(lastOut, /NOTE impeccable is exempt but its copies now match/);
+
+    // The stale-skip NOTE needs BOTH directions or it is unpinned: the negative
+    // alone stays green if the whole loop is deleted. `gd-conventions` is the
+    // committed single-tree entry and is not in this root yet, so its NOTE must
+    // fire; the two gitignored mounts must stay quiet, which is what made the
+    // line useless as a signal when it fired on every CI run.
+    assert.match(
+      lastOut,
+      /NOTE gd-conventions is declared in SINGLE_TREE but absent/,
+    );
+    assert.doesNotMatch(lastOut, /NOTE (delegate|logo-creator)/);
+
+    writeFileSync(join(root, ".agents/skills/impeccable/SKILL.md"), "B\n");
+
+    // The SINGLE_TREE *skip* branch: a declared name present in one tree only.
+    // Without the declaration this is the failing single-tree path above.
+    write(".claude/skills", "gd-conventions", "SKILL.md", "Claude-only.\n");
+    assert.equal(
+      run(),
+      0,
+      "a declared single-tree skill skips, it does not fail",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("skill-mirrors fails rather than passing vacuously", () => {
+  // Its own root: with no skill in BOTH trees the gate must not report success.
+  // Without the vacuity guard the declared single-tree name below reaches the
+  // single-tree loop, matches SINGLE_TREE, and the run exits 0 having compared
+  // nothing at all.
+  const root = mkdtempSync(join(tmpdir(), "gd-skill-mirror-vacuous-"));
+  const gate = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "check-skill-mirrors.mjs",
+  );
+  try {
+    mkdirSync(join(root, ".claude/skills/gd-conventions"), { recursive: true });
+    writeFileSync(join(root, ".claude/skills/gd-conventions/SKILL.md"), "x\n");
+    mkdirSync(join(root, ".agents/skills"), { recursive: true });
+    let code = 0;
+    let out = "";
+    try {
+      execFileSync(process.execPath, [gate], {
+        env: { ...process.env, GD_SKILL_MIRROR_ROOT: root },
+        stdio: "pipe",
+      });
+    } catch (err) {
+      code = err.status;
+      out = String(err.stdout || "") + String(err.stderr || "");
+    }
+    assert.equal(code, 1, "an empty intersection exits 1");
+    // Any uncaught throw also exits 1, so pin the REASON — otherwise this control
+    // cannot tell the vacuity guard firing from the gate crashing before it.
+    assert.match(out, /no skill exists in both trees/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+const rawCopyIconButton = scanner("raw-copy-icon-button");
+
+test("raw-copy-icon-button flags an icon-only copy button in every spelling", () => {
+  // One line, raw element.
+  assert.deepEqual(
+    rawCopyIconButton(
+      '<button type="button" title="Copy command" onClick={() => copyText(cmd, "Command copied")}><CopyIcon className="size-3.5" /></button>',
+    ),
+    [1],
+  );
+  // The formatter-wrapped raw element, reported on its opening line.
+  const wrapped = [
+    "<code>{cmd}</code>",
+    "<button",
+    '  type="button"',
+    '  className="shrink-0 cursor-pointer text-muted-foreground"',
+    '  title="Copy command"',
+    '  onClick={() => copyText(cmd, "Command copied")}',
+    ">",
+    '  <CopyIcon className="size-3.5" />',
+    "</button>",
+  ].join("\n");
+  assert.deepEqual(rawCopyIconButton(wrapped), [2]);
+  // The vendored Button, labelled, with a block-bodied arrow in its props: the
+  // `=>` must not end the opening tag.
+  const vendored = [
+    "<Button",
+    '  variant="ghost"',
+    '  size="icon-xs"',
+    '  aria-label="Copy thread as Markdown"',
+    "  onClick={(e) => {",
+    "    e.stopPropagation();",
+    '    copyText(threadToMarkdown(thread), "Markdown copied");',
+    "  }}",
+    ">",
+    "  <CopyIcon />",
+    "</Button>",
+  ].join("\n");
+  assert.deepEqual(rawCopyIconButton(vendored), [1]);
+  // A JSX comment beside the icon: stripComments leaves an empty `{}` pair,
+  // which must not hide the button from the scan.
+  const commented = [
+    '<Button variant="ghost" size="icon-xs" aria-label="Copy link" onClick={onCopy}>',
+    "  {/* the label names the control; the SVG is decoration */}",
+    '  <CopyIcon className="size-3.5" aria-hidden="true" />',
+    "</Button>",
+  ].join("\n");
+  assert.deepEqual(rawCopyIconButton(commented), [1]);
+  // The after-icon side of the same skip: without it this spelling hides.
+  assert.deepEqual(
+    rawCopyIconButton(
+      '<button type="button" title="Copy" onClick={onCopy}><CopyIcon />{/* trailing */}</button>',
+    ),
+    [1],
+  );
+});
+
+test("raw-copy-icon-button leaves icon+text controls and the component alone", () => {
+  for (const source of [
+    // Icon then visible text (LogBlock's header button).
+    [
+      '<button type="button" onClick={() => copyText(trimmed, "Logs copied")}>',
+      '  <CopyIcon className="size-3" />',
+      "  Copy",
+      "</button>",
+    ].join("\n"),
+    // Text then icon (the short-SHA copy in the commit headers).
+    [
+      '<button type="button" onClick={() => copyText(commit.oid, "SHA copied")}>',
+      "  {commit.oid.slice(0, 7)}",
+      '  <CopyIcon className="size-3" />',
+      "</button>",
+    ].join("\n"),
+    // An inline-start icon on a labelled Button.
+    [
+      '<Button variant="ghost" size="sm" onClick={() => copyText(text, "Copied")}>',
+      '  <CopyIcon data-icon="inline-start" />',
+      "  Copy all",
+      "</Button>",
+    ].join("\n"),
+    '<Button size="xs"><CopyIcon data-icon="inline-start" /> Copy</Button>',
+    // A menu item is not a button, and carries its own text anyway.
+    [
+      '<DropdownMenuItem onClick={() => copyText(path, "Path copied")}>',
+      "  <CopyIcon />",
+      "  Copy path",
+      "</DropdownMenuItem>",
+    ].join("\n"),
+    // The component route, and a different icon alone in a button.
+    '<CopyIconButton text={cmd} label="Copy command" toast="Command copied" />',
+    '<Button size="icon-xs" aria-label="Done"><CheckIcon /></Button>',
+    // The idiom named in a comment is not a use of it.
+    "// <button><CopyIcon /></button>",
+  ]) {
+    assert.deepEqual(rawCopyIconButton(source), [], source);
+  }
+});
+
+test("raw-copy-icon-button exempts the component file and vendored ui only", () => {
+  const check = CHECKS.find((c) => c.name === "raw-copy-icon-button");
+  assert.equal(check.appliesTo("src/components/CopyIconButton.tsx"), false);
+  assert.equal(check.appliesTo("src/components/ui/button.tsx"), false);
+  assert.equal(
+    check.appliesTo("src/features/repo-settings/ScopeRefreshHint.tsx"),
+    true,
+  );
+  // The component's own body IS the idiom, so appliesTo is what keeps it clean —
+  // pinned against the real file so a rename can't turn the exemption stale.
+  const file = "src/components/CopyIconButton.tsx";
+  const source = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), "..", file),
+    "utf8",
+  );
+  assert.notDeepEqual(rawCopyIconButton(source), []);
+  const views = new Map([[file, view(source)]]);
+  assert.deepEqual(runCheck(check, [file], views).violations, []);
+});

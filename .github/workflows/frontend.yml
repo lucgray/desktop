@@ -1,0 +1,77 @@
+name: frontend
+
+# Builds + typechecks the root frontend on EVERY PR — no paths filter, because
+# `build` is a required status check on master's ruleset and a paths-skipped
+# workflow leaves it stuck "Expected" forever (GitHub required-checks docs).
+# The path-filtered push:master run is the backstop re-validating the true
+# merged tree, since a PR green against a stale base merges stale-green (the
+# push run only detects; the PR run gates). No other PR workflow builds the
+# root toolchain — the rest cover src-tauri/**, site/, and changelog fragments.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+    paths:
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "patches/**"
+      - "src/**"
+      - "scripts/**" # the Node-suites step reads these
+      - "index.html"
+      - "vite.config.ts"
+      - "tsconfig*.json"
+      - "biome.json"
+      - ".gitignore" # live biome input (vcs.useIgnoreFile)
+      - ".github/workflows/frontend.yml"
+
+# One in-flight run per ref; a superseded push cancels the stale run instead of
+# stacking a second one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6.1.0
+
+      - name: Install Node
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck and bundle
+        run: pnpm build
+
+      # Check-only (biome ci never writes); `pnpm lint` locally is --write.
+      - name: Lint and format check
+        run: pnpm exec biome ci ./src/
+
+      # Suites whose dependencies live in node_modules and therefore SKIP in the
+      # no-install guards job: the reference detector's render oracle needs
+      # `marked`, the PR-create lane needs zustand plus @tanstack/react-query,
+      # the keyboard-nav suite reaches react through the module under test, and
+      # the notification-settings suite loads the settings graph, which pulls
+      # react plus @tauri-apps/plugin-store.
+      # This installed job is their one enforced run, and GD_EXPECT_DEPS turns an
+      # unresolvable import there into a failure rather than a silent skip.
+      - name: Node suites needing node_modules (enforced)
+        env:
+          GD_EXPECT_DEPS: "1"
+        run: node --test "scripts/comment-refs.test.mjs" "scripts/pr-create-lane.test.mjs" "scripts/list-keyboard-nav.test.mjs" "scripts/notification-settings.test.mjs"

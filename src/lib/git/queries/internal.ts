@@ -1,0 +1,412 @@
+// Helpers shared by more than one query module. Deliberately NOT re-exported from
+// the barrel: they are implementation details of this package, and exporting them
+// would widen its public surface.
+
+import {
+  type QueryClient,
+  type QueryKey,
+  useMutation,
+  useQueryClient,
+} from "@tanstack/react-query";
+import {
+  BOARD_WRITES_KEY,
+  pausedBoardWriteOn,
+  projectItemsRepoKey,
+} from "./board-writes";
+import { repoKeys } from "./core";
+
+/**
+ * The keys a working-tree write invalidates: repo status, every working-tree file diff,
+ * and only the MUTABLE file-at-rev slices — `"worktree"` and the index `":0"`, which
+ * staging rewrites — all prefix-matched. Staging-class mutations (stage/unstage/discard/
+ * apply) pass this ALONE so they don't mark the heavy history/branches/Insights/SBOM
+ * queries stale; `useCommit` in workingtree.ts passes it as its AWAITED set and defers
+ * what HEAD moves to `commitAftermathKeys` (same file). Committed-rev reads are
+ * immutable under staging.
+ */
+export const workingTreeKeys = (repo: string) =>
+  [
+    repoKeys.status(repo),
+    ["repo", repo, "diff"],
+    ["repo", repo, "file-b64", "worktree"],
+    ["repo", repo, "file-b64", ":0"],
+  ] as const;
+
+/**
+ * The shared skeleton behind the optimistic-cache mutations in prs.ts and pr-actions.ts:
+ * cancel in-flight fetches on the target key, snapshot it, apply an optimistic
+ * `setQueryData` patch, roll the snapshot back on error, reconcile on settle. Wrappers
+ * differ only in `keyFor(args)` (the key is derived from the args AT MUTATE TIME, so a
+ * mid-flight repo/number/sha switch can never corrupt another key's cache), `patch`, and
+ * `reconcile`. `TCache` is the shape stored at the key; the rollback context carries the
+ * exact key + prior value.
+ */
+export function useOptimisticCacheMutation<TArgs, TData, TCache>(
+  mutationFn: (args: TArgs) => Promise<TData>,
+  keyFor: (args: TArgs) => QueryKey,
+  patch: (prev: TCache | undefined, args: TArgs) => TCache | undefined,
+  reconcile: (
+    queryClient: ReturnType<typeof useQueryClient>,
+    args: TArgs,
+  ) => void,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn,
+    onMutate: async (args: TArgs) => {
+      const key = keyFor(args);
+      await queryClient.cancelQueries({ queryKey: key });
+      const prev = queryClient.getQueryData<TCache>(key);
+      queryClient.setQueryData<TCache>(key, (data) => patch(data, args));
+      return { prev, key };
+    },
+    onError: (
+      _e: unknown,
+      _args: TArgs,
+      ctx: { prev: TCache | undefined; key: QueryKey } | undefined,
+    ) => {
+      // Explicit guard: in TanStack Query v5 `setQueryData(key, undefined)` BAILS
+      // without updating (it does not remove the entry), so an unguarded call would be
+      // a silent no-op, not a rollback. A create-from-nothing patch would need
+      // removeQueries here instead.
+      if (ctx?.prev !== undefined) queryClient.setQueryData(ctx.key, ctx.prev);
+    },
+    onSettled: (_d: TData | undefined, _e: unknown, args: TArgs) =>
+      reconcile(queryClient, args),
+  });
+}
+
+/** How many of a repo's own board writes are between their request and their
+ *  answer, PER REPO — keyed by the same `repo` string the invalidation targets,
+ *  because that is the scope the deferral decides. One shared number would let a
+ *  write in one repository defer another's settle-refetch, and since each settle
+ *  invalidates only its own repo, the deferred one's stale mark would never be
+ *  flushed: a board left stale after its own successful write.
+ *
+ *  Module-scoped rather than a `mutationKey` + `isMutating` count because a
+ *  mutation is still `pending` while its own `onSettled` runs (query-core 5.102.8
+ *  dispatches `success` AFTER the callbacks), so an `isMutating` reading would
+ *  have to subtract a self that only SOME callers of
+ *  {@link invalidateProjectBoards} contribute — the issue-side callers are not in
+ *  the family. A count the writes hold across their own request has one meaning
+ *  for every caller: "someone else is mid-write on THIS repo". */
+export const pendingBoardWrites = new Map<string, number>();
+
+/** Whether a board write on `repo` is outstanding for a settle to wait on: inside
+ *  its request ({@link pendingBoardWrites}), or PAUSED offline after its
+ *  optimistic patch, before the request the count wraps ever started. A settling
+ *  write is excluded from its own reading provided every board-write `onMutate`
+ *  awaits only microtask-scope work — the precondition `pausedBoardWriteOn`
+ *  states. */
+export function boardWritesOutstanding(
+  queryClient: QueryClient,
+  repo: string,
+): boolean {
+  if ((pendingBoardWrites.get(repo) ?? 0) > 0) return true;
+  // `findAll`, never `find`: the mutation cache's `find` defaults to an EXACT key
+  // match (query-core 5.102.8), which the `["board-write"]` prefix never is.
+  return (
+    queryClient.getMutationCache().findAll({
+      mutationKey: BOARD_WRITES_KEY,
+      predicate: (mutation) => pausedBoardWriteOn(mutation, repo),
+    }).length > 0
+  );
+}
+
+/**
+ * Board RE-READS a write asked for and that are still running, per repo — the
+ * refetching branch of {@link invalidateProjectBoards}, counted from the call until
+ * its refetch settles. The honest "a write's result is still on its way to the
+ * screen" signal: the app's window-focus invalidation, a background refetch, a
+ * stale mark and a page fetch all bypass this function, so none of them counts.
+ * (The focus one holds off only a lens a date-shift chase is reading —
+ * `invalidateRepoOnFocus` in projects.ts.)
+ * Module-scoped with its own listeners for the reason {@link pendingBoardWrites} is:
+ * no query or mutation state carries WHY a fetch started.
+ */
+const boardRereads = new Map<string, number>();
+const boardRereadListeners = new Set<() => void>();
+
+function bumpBoardRereads(repo: string, delta: number): void {
+  const next = (boardRereads.get(repo) ?? 0) + delta;
+  if (next > 0) boardRereads.set(repo, next);
+  else boardRereads.delete(repo);
+  for (const listener of boardRereadListeners) listener();
+}
+
+export function subscribeBoardRereads(listener: () => void): () => void {
+  boardRereadListeners.add(listener);
+  return () => boardRereadListeners.delete(listener);
+}
+
+export function boardRereadsRunning(repo: string): boolean {
+  return (boardRereads.get(repo) ?? 0) > 0;
+}
+
+/**
+ * Board LENSES (by query hash) that have not reconciled since the last write on
+ * their repo, so they may still show what they showed before it:
+ *
+ * - OWED: every cached lens of the repo's boards, recorded when a write asks for
+ *   its re-read. A lens stays owed while that read is running, PAUSED offline
+ *   (board reads use the default `networkMode: "online"`, and query-core's
+ *   `refetchQueries` answers a paused fetch with `Promise.resolve()`, 5.102.8
+ *   queryClient.js, so the re-read count above cannot carry it), cancelled before
+ *   it landed, or not refetched at all because the lens was inactive.
+ * - FAILED: an owed lens whose read settled in error.
+ *
+ * Each clears on its OWN next network read that succeeds — the re-read itself, a
+ * resumed fetch, the strip's Retry, a remount, focus or staleTime refetch — never
+ * on another lens's. An owed lens that then fails becomes failed. An optimistic
+ * `setQueryData` is a success too, but a `manual` one that proves nothing about
+ * the server, so it doesn't count. A lens REMOVED from the cache drops its entry.
+ * One cache subscription, held only while something is recorded.
+ */
+const owedBoardReads = new Set<string>();
+const failedBoardReads = new Set<string>();
+let boardReadsWatch: (() => void) | null = null;
+
+function watchBoardReads(
+  queryClient: QueryClient,
+  owed: string[],
+  failed: string[],
+): void {
+  for (const hash of owed) owedBoardReads.add(hash);
+  for (const hash of failed) failedBoardReads.add(hash);
+  if (boardReadsWatch !== null) return;
+  boardReadsWatch = queryClient.getQueryCache().subscribe((event) => {
+    const hash = event.query.queryHash;
+    if (event.type === "removed") {
+      // A removed lens (garbage-collected, or cleared) has no read left to settle
+      // its entry, which would otherwise outlive it and keep this subscription held.
+      const had = owedBoardReads.delete(hash);
+      if (!failedBoardReads.delete(hash) && !had) return;
+    } else if (event.type === "updated" && event.action.type === "success") {
+      if (event.action.manual === true) return;
+      // A Load more append succeeds too, but only ADDS a page: the pages before it
+      // still hold what they held. query-core keeps the fetch's own meta on the
+      // state through its success, and a page fetch carries `fetchMore` there
+      // (5.102.8 infiniteQueryObserver.js); a refresh of the pages carries none.
+      if (event.query.state.fetchMeta?.fetchMore !== undefined) return;
+      const had = owedBoardReads.delete(hash);
+      if (!failedBoardReads.delete(hash) && !had) return;
+    } else if (event.type === "updated" && event.action.type === "error") {
+      if (!owedBoardReads.delete(hash)) return;
+      failedBoardReads.add(hash);
+    } else return;
+    if (owedBoardReads.size === 0 && failedBoardReads.size === 0) {
+      boardReadsWatch?.();
+      boardReadsWatch = null;
+    }
+    for (const listener of boardRereadListeners) listener();
+  });
+}
+
+/** Record every cached board lens under `queryKey` (a board's family, or a repo's
+ *  boards) as OWED a re-read, without starting one — for a settle that holds those
+ *  boards as they are until a later read. Notifies directly, since no re-read count
+ *  moves to do it. */
+export function oweBoardReads(
+  queryClient: QueryClient,
+  queryKey: QueryKey,
+): void {
+  watchBoardReads(
+    queryClient,
+    queryClient
+      .getQueryCache()
+      .findAll({ queryKey })
+      .map((query) => query.queryHash),
+    [],
+  );
+  for (const listener of boardRereadListeners) listener();
+}
+
+export function boardReadOwed(queryHash: string): boolean {
+  return owedBoardReads.has(queryHash);
+}
+
+export function boardReadFailed(queryHash: string): boolean {
+  return failedBoardReads.has(queryHash);
+}
+
+/**
+ * Mark every board this repo has opened stale, for any write that changes what a
+ * board card SHOWS — its title, state glyph, assignees, membership, or the field
+ * value that decides its column. Partial key on purpose: the caller is editing an
+ * issue/PR and has no board id in scope, and the family is one entry per board
+ * actually visited.
+ *
+ * CANCEL before invalidate. A board read already in flight when the mutation
+ * settles would otherwise resolve afterwards and stamp itself fresh —
+ * `successState` clears `isInvalidated` — erasing the invalidation and serving
+ * pre-mutation cards for the rest of the staleTime window. There is no second
+ * chance: `invalidateQueries` refetches ACTIVE queries only, and a board behind
+ * the Projects tab's Activity gate is not active. (The repo's cancel-then-
+ * invalidate class, same as the item-field-values chains in projects.ts.)
+ *
+ * Invalidate-only past that: no forced refetch, so the Activity gate still owns
+ * WHEN a hidden board re-reads.
+ *
+ * The key stops SHORT of the board id and its lens, so every saved view's cache
+ * of every board goes stale together — a write changes what the item is, which no
+ * filter makes untrue.
+ *
+ * LAST WRITE REFETCHES, with one named gap. While another board write on THIS repo
+ * is still in flight, or paused offline ({@link boardWritesOutstanding}), this marks
+ * stale WITHOUT fetching (`refetchType: "none"`), because the answer a refetch
+ * would bring back has not seen that sibling yet: server truth fetched mid-flight
+ * puts an archived card back on the board, or a moved one in its old column, until
+ * the sibling's own settle re-reads. Deferring costs nothing while the last write
+ * out is one of THESE — projects.ts's `trackBoardWrite` decrements before any
+ * `onSettled` runs, so it sees a clear count and performs the one real refetch.
+ * The gap: when the last one out settles through `markProjectBoardsStale` or
+ * `holdBoardsForVerdict` (both projects.ts) instead, nothing refetches at once.
+ * That is the point of those modes — the first's own patch is already on screen,
+ * and the boards stay marked stale for the next natural read; the second records
+ * its board's lenses owed, and its caller arms the full re-read that judges the
+ * failed reposition. A write under the shield (writeThroughBoards'
+ * `markStale: false`) marks only the FILTERED lenses it patches, whose membership
+ * no payload can settle, and preserves every mark it found — so a mark laid here
+ * still reaches its refetch. A lone write here sees zero and refetches
+ * immediately, exactly as before.
+ *
+ * Read PER REPO, matching the key this invalidates: a write pending in another
+ * repository must not defer this one, whose stale mark that write's own settle
+ * would never come back to flush.
+ *
+ * The cancel above stays unconditional either way: a read already in flight holds
+ * pre-write values whether or not this call is the one that re-reads.
+ *
+ * The refetching branch RESTARTS what it cancelled — `refetchQueries` under the
+ * default active type re-runs every cancelled read that still has an enabled
+ * observer, dataless ones included. The deferred branch does not, and relies on the
+ * last write out to do it; when that last write settles through one of the two
+ * modes above instead, its own repo-wide rescue is what covers the reads this
+ * branch left with nothing.
+ */
+export function invalidateProjectBoards(
+  queryClient: QueryClient,
+  repo: string,
+): void {
+  const queryKey = projectItemsRepoKey(repo);
+  const deferred = boardWritesOutstanding(queryClient, repo);
+  // Only the refetching branch is a re-read in flight; the deferred one marks and
+  // leaves the read to the last write out, which counts it there.
+  if (!deferred) bumpBoardRereads(repo, 1);
+  void queryClient
+    .cancelQueries({ queryKey })
+    .then(() => {
+      // EVERY cached lens of the repo's boards is owed from here, active or not:
+      // a lens that hasn't reconciled since this write still shows what it showed
+      // before it. Registered before the refetch starts, so the ledger's own
+      // transitions settle each one — its next non-manual success clears it, an
+      // error moves it to failed, and a pause, a cancel or an inactive lens that
+      // isn't refetched now simply stays owed until its own next read lands. The
+      // deferred branch records nothing: it refetches nothing, and the last write
+      // out records for both.
+      if (!deferred)
+        watchBoardReads(
+          queryClient,
+          queryClient
+            .getQueryCache()
+            .findAll({ queryKey })
+            .map((query) => query.queryHash),
+          [],
+        );
+      return queryClient.invalidateQueries(
+        deferred ? { queryKey, refetchType: "none" } : { queryKey },
+      );
+    })
+    .finally(() => {
+      if (!deferred) bumpBoardRereads(repo, -1);
+    });
+}
+
+/**
+ * A mutation that invalidates repo queries on completion. Defaults to the whole repo
+ * subtree (correct but broad); pass `opts.invalidate` to narrow it for hot mutations
+ * (each key is prefix-matched). Reserve the whole-subtree default for ops that touch
+ * history or branch topology (checkout/pull/reset/merge); a hot history op (commit)
+ * splits instead — narrow awaited `invalidate` plus deferred `opts.invalidateAfter`.
+ */
+export function useRepoMutation<TArgs, TData>(
+  repo: string,
+  mutationFn: (args: TArgs) => Promise<TData>,
+  opts: {
+    /** Query keys to invalidate on completion (prefix-matched). Defaults to the
+     *  whole repo subtree. */
+    invalidate?: readonly (readonly unknown[])[];
+    /** Keys invalidated fire-and-forget on top of `invalidate` — NEVER awaited, so
+     *  callers can refresh heavy/slow families without holding the mutation's
+     *  isPending. Sequenced after the awaited set only under `refetchBeforeSuccess`;
+     *  otherwise both fire together in `onSettled`. */
+    invalidateAfter?: readonly (readonly unknown[])[];
+    /** Invalidate (and AWAIT) in onSuccess instead of fire-and-forget in
+     *  onSettled, so the refetch lands BEFORE the caller's own onSuccess —
+     *  commit uses this so the emptied list, cleared draft, and toast appear
+     *  together. (As a result it does NOT invalidate on error.) */
+    refetchBeforeSuccess?: boolean;
+    /** Runs on success before any invalidation fires (react-query awaits
+     *  `onSuccess` ahead of `onSettled`), so store state can be fixed up while the
+     *  cache still describes the pre-mutation world. Must be synchronous — an
+     *  async callback's rejection escapes the containment; a synchronous throw
+     *  is contained and logged, and the invalidation still runs. */
+    onSuccess?: (data: TData, variables: TArgs) => void;
+    /**
+     * Identity axes this mutation's `mutationFn` and callbacks close over (repo,
+     * lens, …). Opt in wherever a mid-flight change of those would misdirect the
+     * work: a MOUNTED observer re-rendered with new props retargets its PENDING
+     * mutation's whole options object, so the call lands — and any cache patch
+     * writes — under the new identity. A changed mutation-key hash detaches the
+     * pending mutation instead, freezing its options; `mutateAsync` still settles,
+     * but the observer's own `isPending`/`data` go idle at the switch, so only
+     * award this to sites whose callers await the promise.
+     */
+    identity?: readonly unknown[];
+  } = {},
+) {
+  const queryClient = useQueryClient();
+  const invalidate = () =>
+    Promise.all(
+      (opts.invalidate ?? [repoKeys.all(repo)]).map((queryKey) =>
+        queryClient.invalidateQueries({ queryKey }),
+      ),
+    );
+  const invalidateAfter = () =>
+    Promise.all(
+      (opts.invalidateAfter ?? []).map((queryKey) =>
+        queryClient.invalidateQueries({ queryKey }),
+      ),
+    );
+  // A caller's hook must not take the mutation down with it: a throw here would
+  // otherwise skip the invalidation, or report a succeeded mutation as failed.
+  const notifySuccess = (data: TData, variables: TArgs) => {
+    try {
+      opts.onSuccess?.(data, variables);
+    } catch (e) {
+      console.error("[queries] mutation onSuccess failed", e);
+    }
+  };
+  return useMutation({
+    mutationFn,
+    ...(opts.identity ? { mutationKey: opts.identity } : {}),
+    ...(opts.refetchBeforeSuccess
+      ? {
+          onSuccess: async (data: TData, variables: TArgs) => {
+            notifySuccess(data, variables);
+            await invalidate();
+            void invalidateAfter();
+          },
+        }
+      : {
+          onSuccess: notifySuccess,
+          onSettled: () => {
+            void invalidate();
+            void invalidateAfter();
+          },
+        }),
+  });
+}
+
+export const repoSettingsKey = (repo: string) =>
+  ["repo", repo, "repo-settings"] as const;

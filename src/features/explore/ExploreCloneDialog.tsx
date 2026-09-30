@@ -1,0 +1,218 @@
+import { useSelector } from "@tanstack/react-store";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { useEffectEvent, useState } from "react";
+import { PathText } from "@/components/path-text";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { parentDir } from "@/features/welcome/clone-utils";
+import { CloneAccountPicker, resolveCloneAccount } from "@/features/repository/CloneAccountPicker";
+import { useAppForm } from "@/lib/form";
+import { forgeClone, validateRepo } from "@/lib/git/api";
+import type { ForgeProvider } from "@/lib/git/types";
+import { useAddRecentRepo, useSettings } from "@/lib/settings/queries";
+import { useUiStore } from "@/lib/stores/ui";
+import { toastError } from "@/lib/toast";
+import {
+  ARIA_DISABLED_CLASS,
+  useDisabledReason,
+} from "@/lib/use-disabled-reason";
+import { useSeedOnOpen } from "@/lib/use-seed-on-open";
+import { cn } from "@/lib/utils";
+import { useTranslation } from "@/lib/i18n";
+
+/** The repo an Explore clone is pinned to. */
+export interface ExploreCloneTarget {
+  provider: ForgeProvider;
+  cloneUrl: string;
+  name: string;
+}
+
+const DEFAULTS = { destination: "", recurseSubmodules: false };
+
+/**
+ * A clone dialog pinned to a repo chosen in Explore — same submit path as the
+ * Welcome CloneRepoDialog (forgeClone → validateRepo → record recent → openRepo)
+ * but with the URL fixed to the selected repo, so it only asks for the local path.
+ */
+export function ExploreCloneDialog({
+  target,
+  onOpenChange,
+}: {
+  target: ExploreCloneTarget | null;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  const openRepo = useUiStore((s) => s.openRepo);
+  const addRecent = useAddRecentRepo();
+  const settings = useSettings();
+  const [cloneAccount, setCloneAccount] = useState<string | null>(null);
+
+  const form = useAppForm({
+    defaultValues: DEFAULTS,
+    onSubmit: async ({ value }) => {
+      const dest = value.destination.trim();
+      if (!target || !dest) return;
+      try {
+        const clonedPath = await forgeClone(
+          target.provider,
+          target.cloneUrl,
+          dest,
+          target.name,
+          value.recurseSubmodules,
+          await resolveCloneAccount(cloneAccount),
+        );
+        const info = await validateRepo(clonedPath);
+        // Await the recents write so the row exists before RepositoryView mounts
+        // (best-effort — a settings-write failure must never block opening).
+        await addRecent
+          .mutateAsync({ path: info.root, name: info.name })
+          .catch(() => undefined);
+        onOpenChange(false);
+        openRepo(info);
+      } catch (e) {
+        toastError(e);
+      }
+    },
+  });
+
+  // Default the destination near the user's other repos each time it opens.
+  const defaultPath = useEffectEvent(() => {
+    const recent = settings.data?.recentRepos?.[0]?.path;
+    return recent ? parentDir(recent) : "";
+  });
+  const seedOnOpen = useEffectEvent(() => {
+    setCloneAccount(null);
+    form.reset(
+      { destination: defaultPath(), recurseSubmodules: false },
+      { keepDefaultValues: true },
+    );
+  });
+  const open = target !== null;
+  useSeedOnOpen(open, seedOnOpen);
+
+  const values = useSelector(form.store, (s) => s.values);
+  const isSubmitting = useSelector(form.store, (s) => s.isSubmitting);
+
+  async function pickDestination() {
+    const path = await openDialog({ directory: true, title: t("exploreUi.localPath") });
+    if (path) form.setFieldValue("destination", path);
+  }
+
+  const canClone = values.destination.trim().length > 0;
+  const { blockedReason, reasonId, wrapperTitle, describedBy } =
+    useDisabledReason({
+      disabled: !canClone,
+      reason: t("exploreUi.chooseLocalPath"),
+    });
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <form
+          className="space-y-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            form.handleSubmit();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>{t("exploreUi.cloneTitle", { name: target?.name ?? "" })}</DialogTitle>
+            <DialogDescription>
+              {t("exploreUi.cloneDescription")}
+            </DialogDescription>
+          </DialogHeader>
+
+          {target && (
+            <CloneAccountPicker provider={target.provider} url={target.cloneUrl}
+              value={cloneAccount} onChange={setCloneAccount} />
+          )}
+
+          <div className="space-y-1.5">
+            <div className="flex items-end gap-2">
+              <div className="flex-1">
+                <form.AppField name="destination">
+                  {(field) => (
+                    <field.TextField
+                      label={t("exploreUi.localPath")}
+                      placeholder={t("exploreUi.chooseCloneFolder")}
+                    />
+                  )}
+                </form.AppField>
+              </div>
+              <Button type="button" variant="outline" onClick={pickDestination}>
+                {t("exploreUi.choose")}
+              </Button>
+            </div>
+            {values.destination.trim() && target && (
+              // gap-1, not a trailing label space — flex line boxes trim those.
+              <p className="flex min-w-0 gap-1 text-[11px] text-muted-foreground">
+                <span className="shrink-0">{t("exploreUi.clonesInto")}</span>
+                <PathText
+                  path={`${values.destination.trim().replace(/[\\/]$/, "")}${
+                    values.destination.includes("/") ? "/" : "\\"
+                  }${target.name}`}
+                  className="font-mono"
+                />
+              </p>
+            )}
+          </div>
+
+          <div className="space-y-1">
+            <form.AppField name="recurseSubmodules">
+              {(field) => (
+                <field.CheckboxField
+                  label={t("exploreUi.cloneSubmodules")}
+                  className="flex cursor-pointer items-center gap-2 text-xs"
+                />
+              )}
+            </form.AppField>
+            <p className="text-[11px] text-muted-foreground">
+              {t("exploreUi.initializeSubmodules")}
+            </p>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+              disabled={isSubmitting}
+            >
+              {t("exploreUi.cancel")}
+            </Button>
+            <form.AppForm>
+              <span
+                className={cn(
+                  "inline-flex",
+                  blockedReason && "cursor-not-allowed",
+                )}
+                title={wrapperTitle}
+              >
+                <form.SubmitButton
+                  focusableWhenDisabled={!!blockedReason}
+                  disabled={!canClone}
+                  aria-describedby={describedBy}
+                  className={ARIA_DISABLED_CLASS}
+                >
+                  {t("exploreUi.clone")}
+                </form.SubmitButton>
+                {blockedReason ? (
+                  <span id={reasonId} className="sr-only">
+                    {blockedReason}
+                  </span>
+                ) : null}
+              </span>
+            </form.AppForm>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}

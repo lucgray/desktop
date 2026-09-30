@@ -1,0 +1,1 @@
+- **Interface language.** Choose English or Simplified Chinese in Settings → General; the selection applies immediately and is remembered when you reopen the app.

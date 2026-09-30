@@ -1,0 +1,268 @@
+import { SparkleIcon, XIcon } from "@phosphor-icons/react";
+import { useSelector } from "@tanstack/react-store";
+import { useEffectEvent, useRef } from "react";
+import { toast } from "sonner";
+import { DIALOG_SCROLL } from "@/components/dialog-scroll";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { useFinishAndSurface } from "@/features/conversations/useAiStream";
+import { required, useAppForm } from "@/lib/form";
+import { useGenerateChord } from "@/lib/hotkeys/useGenerateChord";
+import { useCreateLocalIssue } from "@/lib/issues/queries";
+import { useAiEnabled } from "@/lib/settings/queries";
+import { originNoteFor } from "@/lib/stores/notifications";
+import { useUiStore } from "@/lib/stores/ui";
+import { toastError, toastErrorWithNote } from "@/lib/toast";
+import { useSeedOnOpen } from "@/lib/use-seed-on-open";
+import { cn } from "@/lib/utils";
+import { useGenerateIssueDraft } from "./useGenerateIssueDraft";
+import { useTranslation } from "@/lib/i18n";
+
+export function CreateLocalIssueDialog({
+  repoPath,
+  open,
+  onOpenChange,
+  initialDraft,
+}: {
+  repoPath: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /** Seed the form when opened (e.g. from a generated plan). */
+  initialDraft?: { title: string; body: string };
+}) {
+  const { t } = useTranslation();
+  const createIssue = useCreateLocalIssue(repoPath);
+  const selectIssue = useUiStore((s) => s.selectIssue);
+  const repoName = useUiStore((s) => s.repoName) ?? "";
+  const aiEnabled = useAiEnabled();
+  const { generate, cancel, generating } = useGenerateIssueDraft(repoPath);
+  // Closing mid-generation never cancels the run: it finishes into the retained
+  // form state, and this surfaces the result while the dialog is away.
+  const surface = useFinishAndSurface(repoPath, open, {
+    cancel,
+    generating,
+    close: () => onOpenChange(false),
+    readyTitle: t("remainingUi.issueDraftReady"),
+    readyDescription: t("remainingUi.issueDraftWaiting"),
+    reopen: () => onOpenChange(true),
+  });
+  /** The serialized explicit draft the current form state was seeded from. */
+  const seededDraftRef = useRef<string | null>(null);
+  /** The repo whose draft the form holds. A dialog left open across a repo switch
+   *  never re-seeds, so this still reads the submit's repo and the settle's close
+   *  is the right one. */
+  const draftRepoRef = useRef(repoPath);
+  /** Which draft the form holds, bumped only where the seed actually reseeds. A
+   *  repo check can't tell drafts apart within one repo: closing and reopening
+   *  mid-create puts a fresh draft behind the same path. */
+  const seedGenRef = useRef(0);
+
+  const form = useAppForm({
+    defaultValues: { title: "", body: "" },
+    onSubmit: async ({ value }) => {
+      const submitGen = seedGenRef.current;
+      try {
+        const issue = await createIssue.mutateAsync({
+          title: value.title.trim(),
+          body: value.body,
+        });
+        // The create can settle after a repo switch, and this dialog is retained
+        // across one: the selection answers to the live repo, the close to the
+        // draft's. The toast fires either way, naming where it came from.
+        const originNote = originNoteFor(repoPath);
+        const stillHere = originNote === undefined;
+        toast.success(`Created local issue: ${issue.title}`, {
+          description: originNote,
+        });
+        // Both axes of "still THIS submit's draft": the repo, since a seed under
+        // another one already replaced it, and the generation, since a close and
+        // reopen in this same repo reseeds a fresh draft behind the same path.
+        if (
+          draftRepoRef.current === repoPath &&
+          seedGenRef.current === submitGen
+        )
+          onOpenChange(false);
+        if (stillHere) selectIssue({ kind: "local", id: issue.id });
+      } catch (e) {
+        // The failure names its repo too, so one that landed away from the live
+        // one isn't read as belonging to whatever is on screen.
+        const originNote = originNoteFor(repoPath);
+        if (originNote) toastErrorWithNote(e, originNote);
+        else toastError(e);
+      }
+    },
+  });
+
+  // Live title/body drive the AI drafter's input and its enabled state.
+  const titleVal = useSelector(form.store, (s) => s.values.title);
+  const bodyVal = useSelector(form.store, (s) => s.values.body);
+  const notes = [titleVal, bodyVal].filter(Boolean).join("\n\n");
+
+  // keepDefaultValues: otherwise the per-render options sync clobbers the
+  // reset values back to empty on an untouched form.
+  const seedOnOpen = useEffectEvent(() => {
+    draftRepoRef.current = repoPath;
+    const key = initialDraft
+      ? JSON.stringify([initialDraft.title, initialDraft.body])
+      : null;
+    // A plan or to-do handing over new content retargets the one shared form, so
+    // a waiting or streaming run's result must not survive into it; a reopen
+    // carrying the same content is the ordinary hold path below.
+    const isNewRequest = key !== null && key !== seededDraftRef.current;
+    if (isNewRequest) {
+      if (generating) cancel();
+      void surface.consumeSkipSeed();
+    } else if (surface.shouldSkipSeed(generating)) {
+      // A generation still streaming — or one that settled while the dialog was
+      // closed — leaves the whole draft in form state, which this reset would
+      // blank on reopen.
+      return;
+    }
+    seedGenRef.current += 1;
+    form.reset(
+      { title: initialDraft?.title ?? "", body: initialDraft?.body ?? "" },
+      { keepDefaultValues: true },
+    );
+    seededDraftRef.current = key;
+  });
+  useSeedOnOpen(open, seedOnOpen);
+
+  // Shared by the Draft-with-AI button and the generate chord below.
+  async function runGenerate() {
+    // `generate` resolves void and fires onResult only on a usable draft, so the
+    // flag is how the settle learns whether a result actually landed.
+    let ok = false;
+    // finally: a throw past the stream (draft extraction, these field writes)
+    // must still settle, or the switch-abort latch stays armed for the next run.
+    try {
+      await generate({
+        notes,
+        repoName,
+        onResult: (d) => {
+          ok = true;
+          if (d.title) form.setFieldValue("title", d.title);
+          form.setFieldValue("body", d.body);
+        },
+      });
+    } finally {
+      surface.noteRunSettled(ok);
+    }
+  }
+  // The generate chord drafts this issue while the dialog is open. It's mounted
+  // on DialogContent, not the <form>: the X close button is a form SIBLING
+  // inside the Popup, so a form-level handler would miss a chord pressed with
+  // focus on X. It is swallowed here whenever it may fire (the hook mirrors the
+  // global listener's own guards), so the global generate-commit-message action
+  // can't run behind the dialog; while generating it swallows but DOESN'T
+  // cancel.
+  const generateChord = useGenerateChord({
+    enabled: aiEnabled && !generating && notes.trim() !== "",
+    run: runGenerate,
+  });
+  // The one submit gate, shared by the button and the form's native submit:
+  // Enter must submit exactly when the button would.
+  const submitBlocked = generating;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        className="flex max-h-[85vh] flex-col sm:max-w-2xl"
+        onKeyDown={generateChord.onKeyDown}
+      >
+        <form
+          className="flex min-h-0 min-w-0 flex-col gap-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (submitBlocked) return;
+            form.handleSubmit();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>{t("issues.newLocal")}</DialogTitle>
+            <DialogDescription>
+              {t("remainingUi.localIssueDescription")}
+            </DialogDescription>
+          </DialogHeader>
+
+          {/* Fields scroll; header and submit footer stay pinned. */}
+          <div className={cn(DIALOG_SCROLL, "min-h-0 flex-1 space-y-4")}>
+            <form.AppField
+              name="title"
+              validators={{ onChange: ({ value }) => required(value) }}
+            >
+              {(field) => (
+                <field.TextField
+                  label={t("issues.title")}
+                  placeholder={t("issues.summaryPlaceholder")}
+                />
+              )}
+            </form.AppField>
+            <form.AppField name="body">
+              {(field) => (
+                <field.MarkdownField
+                  label={t("issues.description")}
+                  placeholder={t("issues.notesPlaceholder")}
+                  rows={8}
+                  textareaClassName="max-h-72 min-h-24 resize-y font-mono"
+                  actions={
+                    !aiEnabled ? undefined : generating ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        onClick={cancel}
+                      >
+                        <XIcon data-icon="inline-start" />
+                        {t("common.cancel")}
+                      </Button>
+                    ) : (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        disabled={!notes.trim()}
+                        onClick={runGenerate}
+                        // The chord is only offered while it would do something —
+                        // a disabled Generate's shortcut is dead too.
+                        title={
+                          notes.trim()
+                            ? `${t("remainingUi.issueExpandWithAi")}${generateChord.hint}`
+                            : t("remainingUi.issueExpandWithAi")
+                        }
+                      >
+                        <SparkleIcon data-icon="inline-start" />
+                        {t("remainingUi.issueDraftWithAi")}
+                      </Button>
+                    )
+                  }
+                />
+              )}
+            </form.AppField>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+            >
+              {t("common.cancel")}
+            </Button>
+            <form.AppForm>
+              <form.SubmitButton disabled={submitBlocked}>
+                {t("remainingUi.createLocalIssue")}
+              </form.SubmitButton>
+            </form.AppForm>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}

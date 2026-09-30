@@ -1,0 +1,223 @@
+import { useQueryClient } from "@tanstack/react-query";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { useCallback } from "react";
+import { toast } from "sonner";
+import { usePlanStore } from "@/features/plan/store";
+import { useResearchStore } from "@/features/research/store";
+import { track } from "@/lib/analytics";
+import { validateRepo } from "@/lib/git/api";
+import type { RepoInfo } from "@/lib/git/types";
+import { migrateRepoData } from "@/lib/repo-data-migration";
+import { scriptsKeys } from "@/lib/scripts/queries";
+import {
+  useAddRecentRepo,
+  useRelocateRecentRepo,
+  useRemoveRecentRepo,
+  useSettings,
+} from "@/lib/settings/queries";
+import { useConfirm } from "@/lib/stores/confirm";
+import { useUiStore } from "@/lib/stores/ui";
+import { isAppError } from "@/lib/tauri/invoke";
+import { toastError } from "@/lib/toast";
+import { translateCurrent } from "@/lib/i18n";
+
+/**
+ * Opens a repository by path: validates it, records it in recents, and switches
+ * the app to it. A `source: "recent"` path that's no longer a git repo offers a
+ * toast to **Locate…** the folder's new home (moved on disk) or **Remove** the
+ * stale row; a `source: "picker"` one is a folder the user just chose rather
+ * than a recents row to repair, so it only reports that it isn't a repository.
+ * Callers: the shared recents list, macOS File → Open Recent, the folder
+ * picker in {@link usePickAndOpenRepo}, and a submodule opened as its own
+ * repository from the Submodules dialog.
+ */
+export function useOpenRepoByPath() {
+  const openRepo = useUiStore((s) => s.openRepo);
+  const addRecent = useAddRecentRepo();
+  const removeRecent = useRemoveRecentRepo();
+  const relocate = useRelocateRecentRepo();
+  const settings = useSettings();
+  const recentRepos = settings.data?.recentRepos;
+  const queryClient = useQueryClient();
+
+  // Shared tail for every successful open: record in recents (best-effort — a
+  // settings-write failure must never block opening), switch to the repo, track.
+  // Awaiting the recents write means the row exists before RepositoryView mounts
+  // and its open-time visibility probe persists onto it.
+  const recordOpenAndTrack = useCallback(
+    async (info: RepoInfo, source: "recent" | "picker" | "relocate") => {
+      await addRecent
+        .mutateAsync({ path: info.root, name: info.name })
+        .catch(() => undefined);
+      openRepo(info);
+      track({ name: "repo_opened", properties: { source } });
+    },
+    [addRecent, openRepo],
+  );
+
+  // A recents row whose folder moved: pick the new folder, validate it, repoint
+  // the existing row in place (preserving alias + probed metadata), then open.
+  const locateAndReopen = useCallback(
+    async (oldPath: string) => {
+      const picked = await openDialog({
+        directory: true,
+        title: translateCurrent("dataUi.repoOpening.locateTitle"),
+      });
+      if (typeof picked !== "string") return;
+      try {
+        const info = await validateRepo(picked);
+        // Any git repo validates, but the OLD folder is gone so we can't verify
+        // it's the SAME repo — picking a different one would irreversibly fold
+        // this repo's app data into another's identity keys. Confirm first (the
+        // house rule for destructive paths). The name comes from the recents row
+        // (alias or name), else the moved folder's basename.
+        const oldRow = recentRepos?.find((r) => r.path === oldPath);
+        const oldName =
+          oldRow?.alias?.trim() ||
+          oldRow?.name ||
+          oldPath.split(/[/\\]/).pop() ||
+          oldPath;
+        const confirmed = await useConfirm.getState().ask({
+          title: translateCurrent("dataUi.repoOpening.relocateTitle", { name: oldName }),
+          body: translateCurrent("dataUi.repoOpening.relocateBody", { path: info.root }),
+          confirmLabel: translateCurrent("dataUi.repoOpening.relocate"),
+        });
+        if (!confirmed) return;
+        // Best-effort, like the addRecent write below — a settings failure must
+        // never block opening. Repoint before addRecent so the follow-up write
+        // finds the row at its new path and just refreshes name/order.
+        await relocate
+          .mutateAsync({ oldPath, newPath: info.root })
+          .catch(() => undefined);
+        // Re-home every per-repo app-data store (local PRs/issues, review history,
+        // automations, Jira link, …) onto the new location's identity key. Purely
+        // best-effort — a migration failure must never block opening the repo.
+        await migrateRepoData(oldPath, info.root).catch(() => undefined);
+        // The task config is cached under one global key, and a save made from a
+        // pre-migration snapshot would persist the old scope keys back over the
+        // re-home — in their identity form, which folding won't repair. Reset
+        // rather than invalidate: observers drop to pending (a brief skeleton)
+        // instead of serving stale tasks through the refetch. Not awaited, so it
+        // can never hold up the open.
+        void queryClient
+          .resetQueries({ queryKey: scriptsKeys.config })
+          .catch(() => undefined);
+        // The plan/research stores hydrate once at startup, so their live runs
+        // still carry the old path — repoint them, or the sidebar loses them and
+        // their debounced autosave writes the pre-migration paths back to disk.
+        usePlanStore.getState().relocateRepoPath(oldPath, info.root);
+        useResearchStore.getState().relocateRepoPath(oldPath, info.root);
+        await recordOpenAndTrack(info, "relocate");
+      } catch (e) {
+        if (isAppError(e) && e.kind === "notARepo") {
+          // The picked folder isn't a repo — no Locate/Remove actions here (no
+          // recursion; the original row is still in the list to re-offer).
+          toast.error(translateCurrent("dataUi.repoOpening.notRepository", { path: picked }));
+        } else {
+          toastError(e);
+        }
+      }
+    },
+    [relocate, recordOpenAndTrack, recentRepos, queryClient],
+  );
+
+  return useCallback(
+    async (path: string, source: "recent" | "picker" = "recent") => {
+      try {
+        const info = await validateRepo(path);
+        await recordOpenAndTrack(info, source);
+      } catch (e) {
+        if (isAppError(e) && e.kind === "notARepo") {
+          if (source === "picker") {
+            // The user is acting on a folder they just picked, not on a recents
+            // row, so the row-repair actions (Locate/Remove) don't apply here.
+            toast.error(translateCurrent("dataUi.repoOpening.notRepository", { path }));
+          } else {
+            toast.error(translateCurrent("dataUi.repoOpening.noLongerRepository", { path }), {
+              duration: 10_000,
+              action: {
+                label: translateCurrent("dataUi.repoOpening.locate"),
+                onClick: () => void locateAndReopen(path),
+              },
+              cancel: {
+                label: translateCurrent("dataUi.repoOpening.remove"),
+                onClick: () =>
+                  void removeRecent.mutateAsync(path).catch(() => undefined),
+              },
+            });
+          }
+        } else {
+          toastError(e);
+        }
+      }
+    },
+    [recordOpenAndTrack, locateAndReopen, removeRecent],
+  );
+}
+
+/**
+ * Switches the active repo to a linked worktree directory. A worktree's `.git`
+ * is a pointer file, but `validateRepo` runs `rev-parse --show-toplevel`, which
+ * resolves it to the worktree root — so opening it Just Works. Unlike
+ * {@link useOpenRepoByPath} this does NOT record the path in recents: worktrees
+ * are child checkouts of a repo already in the switcher, not first-class repos.
+ *
+ * Resolves TRUE only once the app is actually in the worktree — false when the
+ * open failed (which toasts), when the user switched repos meanwhile, or when
+ * `stillWanted` retired it; the latter two are silent. A caller that reports the
+ * navigation to the user must await this and gate on it; callers that only
+ * navigate ignore the value, awaited or not. The guard reads the live repo when
+ * this is CALLED, so a caller that awaits something else FIRST needs its own
+ * check before calling.
+ *
+ * @param stillWanted Re-checked after `validateRepo`, for a caller that
+ * sequences several opens: a newer one can start while this validate runs, and
+ * the repo is unchanged in that case, so only the caller knows it is stale. A
+ * standalone open passes nothing.
+ */
+export function useOpenWorktree() {
+  const openRepo = useUiStore((s) => s.openRepo);
+  return useCallback(
+    async (path: string, stillWanted?: () => boolean) => {
+      // `openRepo` writes GLOBAL navigation state, so it may only fire while the
+      // app is still on the repo this call started from — the user can switch
+      // repositories while `validateRepo` runs, and an unguarded write would yank
+      // them back into the previous repo's worktree. The toast stays
+      // unconditional: the validation failed wherever they are now.
+      //
+      // `stillWanted` covers what the repo check can't: a caller sequencing
+      // several opens (the branch switcher) can have the user pick again while
+      // THIS validate runs, and the repo is unchanged in that case. A caller
+      // whose open stands alone passes nothing.
+      const firedOn = useUiStore.getState().repoPath;
+      try {
+        const info = await validateRepo(path);
+        if (useUiStore.getState().repoPath !== firedOn) return false;
+        if (stillWanted && !stillWanted()) return false;
+        openRepo(info);
+        return true;
+      } catch (e) {
+        toastError(e);
+        return false;
+      }
+    },
+    [openRepo],
+  );
+}
+
+/**
+ * Prompts for a local folder, then opens it as a repository (validate, record
+ * in recents, switch to it). App is the sole caller — it registers this as the
+ * `add-local-repository` action, and every surface offering "Open repository…"
+ * dispatches that action rather than calling here.
+ */
+export function usePickAndOpenRepo() {
+  const openByPath = useOpenRepoByPath();
+  return useCallback(async () => {
+    const path = await openDialog({
+      directory: true,
+      title: translateCurrent("dataUi.repoOpening.openTitle"),
+    });
+    if (typeof path === "string") await openByPath(path, "picker");
+  }, [openByPath]);
+}

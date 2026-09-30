@@ -1,0 +1,490 @@
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { repoKeys } from "@/lib/git/queries";
+import type { RemoteLens } from "@/lib/git/types";
+import { invoke } from "@/lib/tauri/invoke";
+
+// ── Types (mirror the Rust structs in github/actions.rs) ─────────────────────
+
+export interface WorkflowRun {
+  id: number;
+  number: number;
+  displayTitle: string;
+  /** queued | in_progress | completed | waiting | requested | pending */
+  status: string;
+  /** success | failure | cancelled | skipped | … ; "" while still running */
+  conclusion: string;
+  workflowName: string;
+  headBranch: string;
+  event: string;
+  createdAt: string;
+  /** When the run started executing (after queue); "" if never started. */
+  startedAt: string;
+  updatedAt: string;
+  url: string;
+  headSha: string;
+  /** The workflow this run belongs to, as its own database id — the handle a
+   *  re-dispatch needs. 0 on GitLab/Bitbucket rows: neither forge has a
+   *  per-workflow concept (one pipeline config per project). */
+  workflowDatabaseId: number;
+}
+
+export interface RunStep {
+  name: string;
+  status: string;
+  conclusion: string;
+  number: number;
+  startedAt: string;
+  completedAt: string;
+}
+
+export interface RunJob {
+  /** Forge job id, serialized from u64 as a string to preserve precision
+   *  beyond JavaScript's 2^53 safe-integer boundary. */
+  id: string;
+  name: string;
+  status: string;
+  conclusion: string;
+  startedAt: string;
+  completedAt: string;
+  url: string;
+  steps: RunStep[];
+  /** Present on Bitbucket jobs (a pipeline step) — the log reference its logs are
+   *  fetched by (`forge_bb_step_logs`). Absent for GitHub/GitLab, whose job logs
+   *  come from `forge_ci_job_logs`. */
+  logRef?: string;
+}
+
+export interface RunDetail {
+  id: number;
+  number: number;
+  displayTitle: string;
+  status: string;
+  conclusion: string;
+  workflowName: string;
+  headBranch: string;
+  event: string;
+  createdAt: string;
+  url: string;
+  headSha: string;
+  jobs: RunJob[];
+}
+
+export interface Workflow {
+  id: number;
+  name: string;
+  path: string;
+  /** active | disabled_manually | disabled_inactivity */
+  state: string;
+}
+
+export interface CiRunPage {
+  runs: WorkflowRun[];
+  /** Total matching runs when the provider reports one (GitHub; sometimes Bitbucket); null otherwise. */
+  totalCount: number | null;
+  hasMore: boolean;
+}
+
+// ── Status helpers ───────────────────────────────────────────────────────────
+
+const ACTIVE_STATUSES = new Set([
+  "queued",
+  "in_progress",
+  "waiting",
+  "requested",
+  "pending",
+]);
+
+/** A run/job still executing (so the UI keeps polling and offers Cancel). */
+export const isRunActive = (status: string) => ACTIVE_STATUSES.has(status);
+
+// ── API wrappers ─────────────────────────────────────────────────────────────
+//
+// Reads AND writes go through the provider-neutral `forge_ci_*` commands (GitHub
+// via `gh run …`, GitLab via `glab` pipelines → the same `WorkflowRun`/`RunDetail`
+// shapes; re-run / cancel / dispatch dispatch per provider too). Only the
+// workflow list stays `gh_*` — GitLab has no workflow analogue (one `.gitlab-ci.yml`
+// per project), so its dispatch is ref+variables with no workflow picker.
+
+export const forgeCiRunList = (
+  repoPath: string,
+  limit: number,
+  branch?: string,
+) =>
+  invoke<WorkflowRun[]>("forge_ci_run_list", {
+    repoPath,
+    limit,
+    branch: branch?.trim() || null,
+  });
+
+/** One page of runs (`page` is 1-based), plus the provider's total and whether more
+ *  remain — the paged read behind the Actions panel's Load more. */
+export const forgeCiRunPage = (
+  repoPath: string,
+  limit: number,
+  page: number,
+  branch?: string,
+) =>
+  invoke<CiRunPage>("forge_ci_run_page", {
+    repoPath,
+    limit,
+    page,
+    branch: branch?.trim() || null,
+  });
+
+export const forgeCiRunView = (repoPath: string, runId: number | string) =>
+  invoke<RunDetail>("forge_ci_run_view", { repoPath, runId: String(runId) });
+
+/** Re-run a finished run (`failed` = its failed jobs only). Ids stay strings over
+ *  IPC — they can exceed JS's safe-integer range. `lens` is GitHub-only (fork
+ *  identity) and picks which repository the re-run targets; callers on a
+ *  repo-wide CI surface omit it. */
+export const forgeCiRunRerun = (
+  repoPath: string,
+  runId: number | string,
+  failed: boolean,
+  lens?: RemoteLens,
+) =>
+  invoke<void>("forge_ci_run_rerun", {
+    repoPath,
+    runId: String(runId),
+    failed,
+    lens,
+  });
+
+export const forgeCiRunCancel = (repoPath: string, runId: number) =>
+  invoke<void>("forge_ci_run_cancel", { repoPath, runId: String(runId) });
+
+export const forgeCiRunFailedLogs = (
+  repoPath: string,
+  runId: number | string,
+) =>
+  invoke<string>("forge_ci_run_failed_logs", {
+    repoPath,
+    runId: String(runId),
+  });
+
+/** One job's failed-step logs (fallback: full job log), for AI debugging. */
+export const forgeCiJobLogs = (repoPath: string, jobId: string) =>
+  invoke<string>("forge_ci_job_logs", { repoPath, jobId });
+
+/** A Bitbucket pipeline step's logs (cleaned/capped). Bitbucket jobs carry a
+ *  `logRef` instead of a numeric job id, and `forge_ci_job_logs` errors for
+ *  them — so a job with a `logRef` fetches here instead. */
+export const forgeBbStepLogs = (repoPath: string, logRef: string) =>
+  invoke<string>("forge_bb_step_logs", { repoPath, logRef });
+
+/** A job's logs, dispatched by provider: Bitbucket steps (carrying a `logRef`)
+ *  go through `forge_bb_step_logs`; GitHub/GitLab jobs through the id-keyed
+ *  `forge_ci_job_logs`. */
+export const forgeJobLogs = (
+  repoPath: string,
+  job: { id: string; logRef?: string },
+) =>
+  job.logRef
+    ? forgeBbStepLogs(repoPath, job.logRef)
+    : forgeCiJobLogs(repoPath, job.id);
+
+/** Re-run ONE finished job: GitHub restarts it plus every job that depends on
+ *  it, GitLab retries it alone. Ids stay strings over IPC — they can exceed JS's
+ *  safe-integer range. `lens` is GitHub-only (fork identity) and picks which
+ *  repository the re-run targets; callers on a repo-wide CI surface omit it. */
+export const forgeCiJobRerun = (
+  repoPath: string,
+  jobId: string,
+  lens?: RemoteLens,
+) => invoke<void>("forge_ci_job_rerun", { repoPath, jobId, lens });
+
+/** Play (start) a manual GitLab CI job awaiting a manual trigger — GitLab-only,
+ *  gated on `implemented.ciJobPlay`; errors on other providers. */
+export const forgeGlCiPlayJob = (repoPath: string, jobId: string) =>
+  invoke<void>("forge_gl_ci_play_job", { repoPath, jobId });
+
+export const ghWorkflowList = (repoPath: string) =>
+  invoke<Workflow[]>("gh_workflow_list", { repoPath });
+
+/** Per-workflow workflow_dispatch presence at a ref, keyed by String(workflow.id).
+ *  A MISSING key means the probe couldn't tell — callers fail open (keep offering). */
+export const ghWorkflowDispatchable = (repoPath: string, gitRef: string) =>
+  invoke<Record<string, boolean>>("gh_workflow_dispatchable", {
+    repoPath,
+    gitRef,
+  });
+
+/** Start a run: GitHub dispatches `workflow` on the ref with `inputs`; GitLab runs
+ *  a new pipeline on the ref with `inputs` as variables (send `workflow` empty);
+ *  Bitbucket triggers the branch pipeline, or a named CUSTOM pipeline when `workflow`
+ *  is a custom-pipeline name. */
+export const forgeCiDispatch = (
+  repoPath: string,
+  workflow: string,
+  gitRef: string,
+  inputs: Record<string, string>,
+) => invoke<void>("forge_ci_dispatch", { repoPath, workflow, gitRef, inputs });
+
+/** The CUSTOM pipeline names declared in the working-tree `bitbucket-pipelines.yml`
+ *  (Bitbucket-only — the custom-dispatch picker's options). */
+export const forgeBbCustomPipelines = (repoPath: string) =>
+  invoke<string[]>("forge_bb_custom_pipelines", { repoPath });
+
+// ── Queries ──────────────────────────────────────────────────────────────────
+
+/** Polls every 5s while any listed run is active, otherwise stays idle. `active`
+ *  (the Actions tab being visible) gates the fetch so a hidden tab stops polling;
+ *  cached runs render instantly on return since React Query keeps the cache. */
+export function useWorkflowRuns(
+  repo: string,
+  enabled: boolean,
+  active: boolean,
+  branch?: string,
+) {
+  return useQuery({
+    queryKey: ["repo", repo, "actions", "runs", branch ?? ""] as const,
+    queryFn: () => forgeCiRunList(repo, 40, branch),
+    enabled: enabled && active,
+    staleTime: 10_000,
+    refetchInterval: (query) =>
+      (query.state.data ?? []).some((r) => isRunActive(r.status))
+        ? 5000
+        : false,
+  });
+}
+
+/** The Actions panel's run list, paged so the repo's whole history is reachable.
+ *  `active` (the Actions tab being visible) gates the fetch so a hidden tab stops
+ *  fetching; the key stays inside the `["repo", repo, "actions"]` subtree the panel's
+ *  mutations invalidate. */
+export function useWorkflowRunPages(
+  repo: string,
+  enabled: boolean,
+  active: boolean,
+  branch?: string,
+) {
+  // Normalize once: the key and the wire value must be the same string, or two
+  // spellings of one branch would each get their own cache entry.
+  const b = branch?.trim() || "";
+  return useInfiniteQuery({
+    queryKey: ["repo", repo, "actions", "runs-paged", b] as const,
+    queryFn: ({ pageParam }) => forgeCiRunPage(repo, 40, pageParam, b),
+    initialPageParam: 1,
+    getNextPageParam: (last, pages) =>
+      last.hasMore ? pages.length + 1 : undefined,
+    enabled: enabled && active,
+    // Three paths replay EVERY loaded page serially — the 5s poll, a window-focus
+    // refetch, and a remount past staleTime (leaving and re-entering the Actions tab
+    // flips `enabled`) — so their cost scales with how deep the user has paged, and the
+    // budget they spend is GitHub's shared 5,000 requests/hour that every other gh
+    // surface in the app draws on too. Twenty loaded pages on a 5s tick would be
+    // thousands of requests an hour on its own, so all three gate on at most one
+    // loaded page: past page 1 the data never goes stale on its own and neither
+    // automatic refetch arms, while a panel with NO page yet (failed first fetch)
+    // keeps the focus-refetch recovery it always had. Refresh still updates everything loaded, and the Actions mutations'
+    // `invalidateQueries` still refetches — an invalidated query is stale whatever the
+    // staleTime says, and `refetch()` never consults it.
+    staleTime: (query) =>
+      (query.state.data?.pages.length ?? 0) > 1
+        ? Number.POSITIVE_INFINITY
+        : 10_000,
+    refetchInterval: (query) => {
+      const pages = query.state.data?.pages ?? [];
+      return pages.length === 1 &&
+        pages[0].runs.some((r) => isRunActive(r.status))
+        ? 5000
+        : false;
+    },
+    refetchOnWindowFocus: (query) => (query.state.data?.pages.length ?? 0) <= 1,
+  });
+}
+
+export function useRunDetail(
+  repo: string,
+  runId: number | string | null,
+  active: boolean,
+) {
+  return useQuery({
+    // Normalize the id to a string in the key so number- and string-callers for
+    // the same run share one cache entry.
+    queryKey: ["repo", repo, "actions", "run", String(runId ?? 0)] as const,
+    queryFn: () => forgeCiRunView(repo, runId ?? 0),
+    enabled: runId !== null && active,
+    refetchInterval: (query) =>
+      query.state.data && isRunActive(query.state.data.status) ? 5000 : false,
+  });
+}
+
+/**
+ * The single most recent run on a branch, for the header CI badge. Polls fast
+ * while it's active, slowly otherwise so a freshly-pushed run still shows up.
+ */
+export function useLatestRun(
+  repo: string,
+  enabled: boolean,
+  branch: string | null,
+) {
+  return useQuery({
+    queryKey: ["repo", repo, "actions", "latest", branch ?? ""] as const,
+    queryFn: async () =>
+      (await forgeCiRunList(repo, 1, branch ?? undefined))[0] ?? null,
+    enabled: enabled && Boolean(branch),
+    staleTime: 15_000,
+    refetchInterval: (query) =>
+      query.state.data && isRunActive(query.state.data.status) ? 8000 : 30_000,
+  });
+}
+
+export function useWorkflows(repo: string, enabled: boolean) {
+  return useQuery({
+    queryKey: ["repo", repo, "actions", "workflows"] as const,
+    queryFn: () => ghWorkflowList(repo),
+    enabled,
+    staleTime: 5 * 60_000,
+  });
+}
+
+/** Which workflows accept a manual dispatch at `gitRef` (GitHub-only). The probe
+ *  fans out one `gh` process per workflow, so it never retries — a storm on every
+ *  keystroke of a bad ref would cost more than the affordance is worth — and an
+ *  empty ref isn't probed at all. */
+export function useWorkflowDispatchable(
+  repo: string,
+  gitRef: string,
+  enabled: boolean,
+) {
+  return useQuery({
+    // Deliberately OUTSIDE the `["repo", repo, "actions"]` subtree the Actions
+    // mutations invalidate: dispatch/re-run/cancel can't change a workflow's trigger
+    // declarations, and a refetch here re-runs the whole per-workflow fan-out.
+    queryKey: ["repo", repo, "actions-dispatchable", gitRef] as const,
+    queryFn: () => ghWorkflowDispatchable(repo, gitRef),
+    enabled: enabled && gitRef !== "",
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+}
+
+/** The Bitbucket custom-pipeline names (from `bitbucket-pipelines.yml`) — the
+ *  custom-dispatch picker's options. Reads the local working-tree file (no network);
+ *  fetched only while the dispatch surface is enabled. */
+export function useBbCustomPipelines(repo: string, enabled: boolean) {
+  return useQuery({
+    queryKey: ["repo", repo, "actions", "bb-custom-pipelines"] as const,
+    queryFn: () => forgeBbCustomPipelines(repo),
+    enabled,
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+}
+
+/** Failed-step logs, fetched only when the user expands them. */
+export function useRunFailedLogs(
+  repo: string,
+  runId: number | string | null,
+  enabled: boolean,
+) {
+  return useQuery({
+    // Normalize the id to a string in the key (see useRunDetail).
+    queryKey: [
+      "repo",
+      repo,
+      "actions",
+      "run",
+      String(runId ?? 0),
+      "logs",
+    ] as const,
+    queryFn: () => forgeCiRunFailedLogs(repo, runId ?? 0),
+    enabled: enabled && runId !== null,
+    staleTime: 30_000,
+  });
+}
+
+/** One job's logs (failed steps, or the full log), fetched only when expanded.
+ *  The job's `logRef` (Bitbucket steps) routes the fetch to `forge_bb_step_logs`;
+ *  GitHub/GitLab jobs (no `logRef`) go through the id-keyed `forge_ci_job_logs`.
+ *  The query key stays distinct per job either way. */
+export function useJobLogs(
+  repo: string,
+  job: { id: string; logRef?: string } | null,
+  enabled: boolean,
+) {
+  // Bitbucket steps are keyed by logRef (their numeric id can collide across a
+  // run's jobs); GitHub/GitLab jobs by their unique id.
+  const jobKey = job?.logRef ?? job?.id ?? "0";
+  return useQuery({
+    queryKey: ["repo", repo, "actions", "job", jobKey, "logs"] as const,
+    queryFn: () => forgeJobLogs(repo, job ?? { id: "0" }),
+    enabled: enabled && job !== null,
+    staleTime: 30_000,
+  });
+}
+
+// ── Mutations ────────────────────────────────────────────────────────────────
+
+function useActionsMutation<TArgs>(
+  repo: string,
+  mutationFn: (args: TArgs) => Promise<void>,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn,
+    // The awaited refresh is Actions' own; re-run/cancel/dispatch don't touch git
+    // state. The two CI surfaces the `actions` prefix can't reach (a PR's own
+    // checks, the list's `pr-ci` badges) ride along UNAWAITED — neither should
+    // hold this button pending.
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["repo", repo, "pr"] });
+      void queryClient.invalidateQueries({ queryKey: repoKeys.prCi(repo) });
+      return queryClient.invalidateQueries({
+        queryKey: ["repo", repo, "actions"],
+      });
+    },
+  });
+}
+
+export function useRerunRun(repo: string) {
+  return useActionsMutation(
+    repo,
+    (args: { runId: number | string; failed: boolean; lens?: RemoteLens }) =>
+      forgeCiRunRerun(repo, args.runId, args.failed, args.lens),
+  );
+}
+
+export function useCancelRun(repo: string) {
+  return useActionsMutation(repo, (runId: number) =>
+    forgeCiRunCancel(repo, runId),
+  );
+}
+
+/** Re-run one finished job (GitHub + GitLab). Invalidating the Actions subtree
+ *  refreshes the run detail + list; the run goes active and the existing 5s poll
+ *  takes over. */
+export function useRerunJob(repo: string) {
+  return useActionsMutation(
+    repo,
+    (args: { jobId: string; lens?: RemoteLens }) =>
+      forgeCiJobRerun(repo, args.jobId, args.lens),
+  );
+}
+
+/** Play a manual GitLab CI job (GitLab-only). Invalidating the Actions subtree
+ *  refreshes the run detail + list; the job goes active and the existing 5s
+ *  poll takes over. */
+export function usePlayCiJob(repo: string) {
+  return useActionsMutation(repo, (jobId: string) =>
+    forgeGlCiPlayJob(repo, jobId),
+  );
+}
+
+export function useRunWorkflow(repo: string) {
+  return useActionsMutation(
+    repo,
+    (args: {
+      workflow: string;
+      gitRef: string;
+      inputs: Record<string, string>;
+    }) => forgeCiDispatch(repo, args.workflow, args.gitRef, args.inputs),
+  );
+}

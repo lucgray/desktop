@@ -1,0 +1,242 @@
+# Contributing to GitDesktop
+
+Thanks for your interest in improving GitDesktop — an AI-native, keyboard-first
+Git desktop client built with Tauri 2 + React 19.
+
+This guide covers how to set up the project, the conventions we follow, and what
+makes a change easy to review and merge. By participating you agree to abide by
+our [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Before you start
+
+- For **bugs** and **feature ideas**, please open an issue first using the
+  [issue templates](.github/ISSUE_TEMPLATE) so we can agree on the approach before
+  you write code. Small, obvious fixes can skip straight to a PR.
+- For **security vulnerabilities**, do **not** open a public issue — follow
+  [SECURITY.md](SECURITY.md).
+- For **usage questions**, see [SUPPORT.md](.github/SUPPORT.md).
+
+GitDesktop has a clear product intent — calm, precise, dependable, with the repo
+(not the chrome) as the focus. Skimming [PRODUCT.md](PRODUCT.md) before proposing
+larger UI changes will save a round-trip; in particular, contributions are
+expected to respect its Design Principles.
+
+## Prerequisites
+
+- **Rust** toolchain (stable) — <https://rustup.rs>
+- **Node 24+**
+- **pnpm** (`corepack enable` will use the version pinned in `package.json`)
+- Tauri's platform build dependencies — see the
+  [Tauri prerequisites guide](https://v2.tauri.app/start/prerequisites/).
+  On Linux the same packages the release workflow installs are required
+  (`libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`,
+  `patchelf`, `build-essential`, `libssl-dev`).
+
+For running the app's GitHub and Actions features you'll also want **`git`** on
+`PATH` and the **GitHub CLI (`gh`)** authenticated (`gh auth login`). GitDesktop
+talks to GitHub exclusively through `gh` — there is no OAuth app and the app never
+stores your tokens.
+
+## Getting set up
+
+```sh
+pnpm install
+pnpm tauri dev    # run the app with hot reload
+```
+
+Other useful commands:
+
+```sh
+pnpm build                                        # typecheck (tsc) + bundle the frontend
+pnpm lint                                         # Biome — formats and lints ./src and ./site (a --write rewrite)
+cargo test --manifest-path src-tauri/Cargo.toml   # Rust unit tests
+```
+
+We use **Biome** for both formatting and linting the frontend — there is no
+separate Prettier/ESLint step. Run `pnpm lint` before committing.
+
+## Project layout
+
+A quick map of where things live (see the README's *Architecture* section for
+more):
+
+- `src-tauri/src/git/` — typed Tauri commands that shell out to system `git`
+  (porcelain v2 parsing, per-repo mutation locks, timeouts).
+- `src-tauri/src/github/` — `gh`-backed commands: pull requests (`pr.rs`) and
+  GitHub Actions (`actions.rs`).
+- `src-tauri/src/{hooks,secrets,instructions}.rs` — git-hook management, OS
+  keychain storage, repo instruction/rule files.
+- `src-tauri/src/agent.rs` — drives local coding-agent CLIs (Claude Code / Codex / GitHub Copilot / opencode).
+- `src/lib/` — invoke bindings + TanStack Query hooks (`git/`, `github/`), the AI
+  layer (`ai/`), settings, and the hotkey registry.
+- `src/features/` — the screens: repository, changes/diff, commit, history,
+  compare, pulls, actions, hooks, branch-rules, settings, and updates.
+- `site/` — the Astro marketing site (separate pnpm workspace).
+
+## Making changes
+
+### Commit messages
+
+We follow [Conventional Commits](https://www.conventionalcommits.org/) with a
+scope, matching the existing history:
+
+```
+feat(github,issues): add issue drafting
+fix(diff,highlight): handle TSX grammars
+chore(deps): bump tauri to 2.x
+```
+
+Common scopes mirror the feature areas: `repos`, `changes`, `branches`, `history`,
+`pulls`, `actions`, `hooks`, `ai`, `github`, `diff`, `ui`, `settings`, `site`.
+
+### Code comments
+
+Write comments as constraint-statements: the decision plus one sentence of why —
+three lines is plenty for almost anything. A comment earns its place by saying
+something the code can't: an invariant, a deliberately non-obvious choice, a
+cross-module contract, or hard-won external-API/platform behavior. Skip what the
+git history already owns (what the code used to do, which PR changed it, how a
+bug was found), don't narrate the next lines, and don't argue the change is
+correct — that's for the PR description. Genuinely multi-constraint blocks may
+run to ~6 lines, and measured figures a later reader would otherwise have to
+re-measure (payload sizes, timed runs) may stay and cite their source (a PR or
+run reference is fine there). When you touch a file, trimming its comments to
+this standard in passing is welcome.
+
+### Convention checks
+
+Seven dependency-free Node scripts guard convention classes a past audit already
+paid to close once. Run them before pushing:
+
+```sh
+# banned patterns · Rust invariants · OG card references ·
+# IPC surface drift · rule-mirror drift · skill-mirror drift ·
+# Tauri npm/crate parity · guard self-tests
+pnpm run checks
+```
+
+They run as the `guards` job in [`quality.yml`](.github/workflows/quality.yml),
+a required check on master, and cover banned frontend UI and state patterns
+(hover-revealed row actions, hand-rolled modifier keys, bare `.mutate(` calls
+in the converted trees, `setQueryData(key, undefined)`, inline clip-measured
+tooltips), the Rust refspec-argv and sync-`#[tauri::command]` invariants,
+blog OG-card references (every post's `ogImage` must resolve to a committed
+card plus its `.webp` sibling — a missing file ships as a 404 social card),
+Tauri IPC drift (every registered command needs a caller, every `invoke()`
+a registration), drift between the files that restate the git-whitelist hard
+rule, drift between the two trees that ship the same skills (`.claude/skills/`
+for Claude Code, `.agents/skills/` for the other agent lanes), and the
+major.minor parity of each Tauri package's npm and crate halves, each declared
+npm half needing a crate half to compare against.
+
+The pattern, Rust-invariant, and surface checks carry allowlists, and they
+ratchet one way (rule-mirror drift and Tauri parity carry none — there is
+nothing to exempt). Adding an entry is a reviewed change like any other: it
+needs an inline rationale naming what makes that site safe, and it isn't the
+way to quiet a fresh violation. The ratchet is enforced, not just documented —
+an entry that no longer suppresses anything (its site gone, or its command back
+in live use) fails the gate as a stale allowlist entry, so the PR that removes
+the site removes its entry too.
+
+Skill-mirror drift declares its skips rather than allowlisting sites: the ones
+rewritten per harness, and the ones living in a single tree, each entry naming
+the reason it belongs there. Those two lists do **not** ratchet the way the
+allowlists above do. The gate reports some stale skips as a `NOTE`: a *committed*
+single-tree skill that has gone absent from both trees, or an exempt skill whose
+copies now match exactly. Entries that are gitignored junction mounts are listed
+in `EXPECTED_ABSENT` and stay quiet, since being absent is their normal state off
+the machine that mounts them. A skip can still go stale with no signal at all, so
+treat both lists as reviewed prose a reader has to re-justify, not as
+self-cleaning.
+
+`knip` and `jscpd` run in the same workflow's `advisory` job — non-blocking on
+purpose. The job publishes unused-export and duplicate-code reports to the run
+summary for a human to triage, and never fails a build.
+
+### Changelog
+
+For any **user-facing** change, add a **changelog fragment** — a small Markdown
+file under [`changelog.d/`](changelog.d/) named `<added|changed|fixed>-<slug>.md`
+(e.g. `changelog.d/added-gitlab-time-tracking.md`). Its body is the finished
+[Keep a Changelog](https://keepachangelog.com/)-style bullet, written **for
+humans** — a clear sentence about what changed for the user, not a copy of your
+commit subject. One file per change means parallel branches never conflict on the
+changelog; see [`changelog.d/README.md`](changelog.d/README.md) for the format.
+
+CI keys on paths, not user impact: `fragment` is a required status check on
+`master`, so a PR that touches `src/` or `src-tauri/` without adding a fragment
+can't merge. If a change genuinely doesn't need one, label the PR `no-changelog`
+or put `skip-changelog` in the title.
+
+Don't edit `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) directly — the
+fragments are assembled there at release time. Preview the pending changelog with
+`pnpm changelog:preview`; `pnpm changelog` still drafts starting-point bullets
+from the git history.
+
+### Docs and the marketing site
+
+For any **user-facing feature**, keep the docs in step in the same change:
+
+- **README.md** — add or extend the relevant bullet under *Highlights* / *Features*.
+- **`site/`** — add the capability to `site/src/data/capabilities.ts` (the
+  catalog's source of truth — `index.astro` and `features.astro` render from it),
+  and a `FeatureRow` section in `site/src/pages/index.astro` when it warrants
+  one; non-AI features belong in both the **AI-native** and **Just Git** views,
+  AI features in the AI view only. `cd site && pnpm build` to verify.
+- Marketing-site screenshots for the **Just Git** view should be captured with the
+  app's *Hide AI features* setting on, so they match the AI-hidden experience.
+
+A truly minor feature can settle for just the capability line + changelog — but make
+that call on purpose.
+
+### UI changes
+
+GitDesktop is keyboard-first and aims for WCAG AA. When you add or change UI:
+
+- Wire up **arrow-key navigation** for any new selectable list, in the same change.
+- Keep **destructive paths safe** — anything that can lose work (discard, reset,
+  force-push, merge) must confirm clearly and give feedback (Design Principle #2).
+- Don't convey meaning by color alone; keep focus indicators visible.
+- The shadcn / Base UI primitives under `src/components/ui/` are vendored — fix
+  things at the feature/call-site level rather than editing those files, except
+  the sanctioned local deltas inventoried in `src/components/ui/README.md` (a
+  re-vendor silently reverts them).
+
+### AI-assisted contributions
+
+Using AI tools to help write your change is fine — but **you own the diff**.
+Review everything you submit, make sure it actually works, and never paste
+secrets, tokens, or proprietary code into a prompt.
+
+If you relied on AI assistance to make a pull request, you **must disclose it in
+the pull request**, together with the extent of the usage. For example, if you
+used AI to generate docs or tests, you must say so. An example disclosure:
+
+> This PR was written primarily by Claude Code.
+
+> I consulted ChatGPT to understand the codebase but the solution was fully
+> authored manually by myself.
+
+Providing this information helps reviewers understand the context of the pull
+request and apply the right level of scrutiny, ensuring a smoother and more
+efficient review process. AI assistance isn't always perfect, even when used with
+the utmost care.
+
+## Opening a pull request
+
+1. Branch off `master`.
+2. Keep PRs small and focused; one logical change per PR is easiest to review.
+3. Link the issue it addresses (`Closes #123`).
+4. Run `pnpm lint` and, if you touched Rust, `cargo test --manifest-path src-tauri/Cargo.toml`.
+5. Add a `changelog.d/` fragment if the change is user-facing — the required
+   `fragment` check blocks merge on `src/` or `src-tauri/` changes without one
+   (see the Changelog section for the escape hatches).
+6. Fill out the PR template — including screenshots or a short screen recording
+   for UI changes.
+
+A maintainer will review and may suggest changes. Thanks for contributing!
+
+## License
+
+By contributing, you agree that your contributions will be licensed under the
+project's [Apache License 2.0](LICENSE).

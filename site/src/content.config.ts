@@ -1,0 +1,83 @@
+import { defineCollection } from "astro:content";
+import { glob } from "astro/loaders";
+// `astro:content` still re-exports `z`, but astro 7.3.2 marks it @deprecated and
+// slates removal for Astro 8 (astro/types/content.d.ts) — importing from
+// astro/zod makes that bump a no-op here.
+import { z } from "astro/zod";
+
+const PILLARS = [
+  "multi-forge", // GitHub + GitLab + Bitbucket + Jira, each on its own identity
+  "ai-you-own", // BYO model, local Ollama, keyless CLI agents, or none at all
+  "review-loop", // the whole PR / review / CI loop without a browser
+  "git-safety", // merge preview, recovery, force-with-lease — the trust surface
+  "built-open", // Tauri 2 + React 19 + Rust, in public
+] as const;
+
+const blog = defineCollection({
+  // `[^_]*.md` keeps `_drafts/` and `_scratch.md` out of the build entirely —
+  // the underscore convention costs nothing and beats a runtime filter.
+  loader: glob({ base: "./src/content/blog", pattern: "[^_]*.md" }),
+
+  // Function form is REQUIRED to get `image()` from the schema context.
+  schema: ({ image }) =>
+    z
+      .object({
+        // Bounded so a post can't silently ship a title that SERPs truncate.
+        title: z.string().max(70),
+        // Doubles as <meta description> and the RSS item description.
+        description: z.string().min(50).max(160),
+        pubDate: z.coerce.date(),
+        updatedDate: z.coerce.date().optional(),
+        author: z.string().default("theBGuy"),
+        // Required on purpose: a post that fits no pillar is a post that
+        // shouldn't ship. The build refuses it. (Editorial gate only —
+        // nothing renders the value yet.)
+        pillar: z.enum(PILLARS),
+        // Tags become path segments (`/blog/tags/<tag>/`), so anything that
+        // isn't a lowercase slug would mangle the route. Refused at build
+        // time, same as the pillar gate above.
+        tags: z
+          .array(
+            z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, {
+              message: "tags must be lowercase slugs (a-z, 0-9, hyphens)",
+            }),
+          )
+          .default([]),
+        heroImage: image().optional(),
+        heroAlt: z.string().optional(),
+        // Site-relative path to a 1200x630 card, e.g. "/og/my-post.png".
+        // A plain string, not image(): OG scrapers cache by URL and gain
+        // nothing from a content-hashed, format-optimized asset.
+        ogImage: z.string().optional(),
+        // Describes the CARD's artwork (og:image:alt / twitter:image:alt),
+        // not the post — the description field already covers the post.
+        ogImageAlt: z.string().optional(),
+        draft: z.boolean().default(false),
+        // Gates the post's CARD in the index under "Just Git" — never its body.
+        ai: z.boolean().default(false),
+        // Syndicated reposts only (dev.to etc. point home; this points away).
+        canonical: z.string().url().optional(),
+      })
+      // image().refine() isn't supported, so the alt-text pairing is enforced
+      // at the object level instead.
+      .refine((d) => !d.heroImage || !!d.heroAlt, {
+        message: "heroImage requires heroAlt (WCAG AA)",
+        path: ["heroAlt"],
+      })
+      // Symmetric on purpose: a lone heroAlt is dead frontmatter.
+      .refine((d) => !d.heroAlt || !!d.heroImage, {
+        message: "heroAlt without heroImage describes nothing",
+        path: ["heroImage"],
+      })
+      .refine((d) => !d.ogImage || !!d.ogImageAlt, {
+        message: "ogImage requires ogImageAlt (WCAG AA)",
+        path: ["ogImageAlt"],
+      })
+      // Symmetric on purpose: alt without a card would describe og-default.
+      .refine((d) => !d.ogImageAlt || !!d.ogImage, {
+        message: "ogImageAlt without ogImage describes the default card",
+        path: ["ogImage"],
+      }),
+});
+
+export const collections = { blog };

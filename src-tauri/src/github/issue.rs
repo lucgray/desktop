@@ -1,0 +1,1662 @@
+use std::fs;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{AppError, AppResult};
+use crate::github::gh_unreadable;
+use crate::github::pr::{PrAuthor, PrListLabel, PrRef, PrThreadOut, RepoLabel};
+use crate::github::runner::{run_gh, run_gh_input, GH_NETWORK_TIMEOUT, GH_TIMEOUT};
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Milestone {
+    pub number: u64,
+    pub title: String,
+}
+
+/// Whether a gh failure is the "issues are turned off on this repo" error. gh's line
+/// is `the '<owner>/<repo>' repository has disabled issues`; match the stable
+/// substring case-insensitively so a wording tweak doesn't slip past. (Forks disable
+/// issues by default, so pinning to the origin slug surfaces this.)
+fn is_issues_disabled(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("has disabled issues")
+}
+
+/// Remaps a gh failure to [`AppError::IssuesDisabled`] when its message is the
+/// disabled-issues signature, leaving every other error untouched. `run_gh`
+/// carries gh's stderr as the `Gh` variant's message, so that's what we inspect.
+fn map_issues_disabled(err: AppError) -> AppError {
+    match &err {
+        AppError::Gh(msg) if is_issues_disabled(msg) => AppError::IssuesDisabled,
+        _ => err,
+    }
+}
+
+/// Whether a gh failure is the "this gh doesn't know that `--json` field" error.
+/// gh validates the field list against its own build before calling the API and
+/// prints `Unknown JSON field: "issueType"` (measured on gh 2.94.0); match the
+/// stable substring case-insensitively like the disabled-issues signature.
+fn is_unknown_json_field(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("unknown json field")
+}
+
+/// Remaps that failure to the version floor it really means, leaving every other
+/// error untouched: [`ISSUE_VIEW_FIELDS`] asks for `issueType`, which gh's field
+/// list gained at v2.94.0, so an older gh rejects the whole read with a dump.
+/// The matcher fires on ANY unknown `--json` field while the message names the
+/// 2.94 floor — the same floor `CLI_FLOORS` spells in src/lib/system/health.ts;
+/// a bump moves both strings.
+fn map_gh_too_old(err: AppError) -> AppError {
+    match &err {
+        AppError::Gh(msg) if is_unknown_json_field(msg) => AppError::Gh(
+            "Opening issues needs GitHub CLI 2.94 or newer — this gh doesn't know the fields \
+             GitDesktop requests. Update gh, then retry."
+                .into(),
+        ),
+        _ => err,
+    }
+}
+
+/// An org-defined issue type (Bug/Feature/Task/…). `color` is a GitHub color
+/// NAME (GRAY/BLUE/GREEN/…), mapped to a swatch on the frontend.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueType {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub color: String,
+}
+
+/// One emoji reaction tally on a reactable subject (issue body or comment).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Reaction {
+    /// GitHub ReactionContent enum value (THUMBS_UP, HEART, ROCKET, …).
+    pub content: String,
+    pub count: u64,
+    /// Whether the signed-in user has this reaction (drives the toggle).
+    pub viewer_reacted: bool,
+}
+
+pub fn map_reaction_groups(groups: Option<&serde_json::Value>) -> Vec<Reaction> {
+    groups
+        .and_then(|g| g.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|g| {
+                    let count = g
+                        .pointer("/reactors/totalCount")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    if count == 0 {
+                        return None;
+                    }
+                    Some(Reaction {
+                        content: g.get("content")?.as_str()?.to_string(),
+                        count,
+                        viewer_reacted: g
+                            .get("viewerHasReacted")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolves the repo's GraphQL `owner` and `name`. GraphQL (unlike REST) has no
+/// `{owner}/{repo}` substitution, so callers must pass them explicitly.
+///
+/// Resolved through the lens (`gh_lens_slug`), NOT a bare `gh repo view`: on a fork
+/// with an `upstream` remote a bare `gh repo view` resolves to the PARENT, so every
+/// GraphQL read built on this pair would answer for the upstream. `None` = origin, so
+/// a single-remote repo is unchanged.
+pub(crate) async fn repo_owner_name(
+    repo_path: &str,
+    lens: Option<&str>,
+) -> AppResult<(String, String)> {
+    let slug = crate::github::gh_lens_slug(repo_path, lens).await?;
+    slug.split_once('/')
+        .map(|(o, n)| (o.to_string(), n.to_string()))
+        .ok_or_else(|| AppError::Gh("could not determine the repository owner".into()))
+}
+
+// `gh issue` covers the REST surface 1:1, and the comment ids it returns are GraphQL
+// node ids — so the shared comment/label/reaction mutations work on issues unchanged.
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueInfo {
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    /// "OPEN" or "CLOSED".
+    pub state: String,
+    pub created_at: String,
+    pub updated_at: String,
+    // Defaults tolerate the ghost author and label-less issues.
+    #[serde(default)]
+    pub author: Option<PrAuthor>,
+    #[serde(default)]
+    pub labels: Vec<PrListLabel>,
+}
+
+const ISSUE_LIST_FIELDS: &str =
+    "number,url,title,state,author,labels,createdAt,updatedAt";
+
+/// What an EMPTY filtered issue page means, given the disabled-issues probe's result.
+/// A probe that succeeded proves the tracker exists, so the empty page is a real "no
+/// matches"; a probe that failed carries the reason, remapped to the typed variant the
+/// panel renders as a non-retryable state. Pure, so both arms are pinned without a
+/// spawn.
+fn empty_filtered_issues(probe: AppResult<()>) -> AppResult<Vec<IssueInfo>> {
+    match probe {
+        Ok(()) => Ok(Vec::new()),
+        Err(e) => Err(map_issues_disabled(e)),
+    }
+}
+
+/// Issues for the Issues list. `state` is "open" or "closed". `gh issue list`
+/// already excludes pull requests, so no extra filtering is needed.
+///
+/// A `filter` with an axis that applies to issues — assigned to me, author, label —
+/// narrows the list SERVER-side through `ISSUE_ADVANCED` search instead (see
+/// [`crate::github::pr_search`]); anything else keeps the `gh issue list` read below.
+pub async fn gh_issue_list(
+    repo_path: String,
+    state: String,
+    limit: Option<u32>,
+    lens: Option<String>,
+    filter: Option<crate::forge::model::RemoteListFilter>,
+) -> AppResult<Vec<IssueInfo>> {
+    // Resolve the lens slug so a fork lists the chosen repo's issues (a bare
+    // `gh issue list` on a fork auto-resolves to the upstream repo).
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    if let Some(q) = crate::github::pr_search::search_query(&slug, false, &state, filter.as_ref())? {
+        let rows = crate::github::pr_search::filtered_issue_list(&repo_path, &q, limit).await?;
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
+        // An empty filtered page is AMBIGUOUS: search answers a repo whose issues are
+        // turned off with zero rows and no error, so "no matches" and "this repo has
+        // no tracker" look identical here. One narrow legacy read separates them —
+        // only ever on an empty page, and `state` is already known-valid because the
+        // query builder rejects anything else.
+        let probe = run_gh(
+            Some(&repo_path),
+            &[
+                "issue", "list", "--repo", &slug, "--state", &state, "--json", "number",
+                "--limit", "1",
+            ],
+            GH_TIMEOUT,
+        )
+        .await;
+        return empty_filtered_issues(probe.map(|_| ()));
+    }
+    let mut args: Vec<&str> = match state.as_str() {
+        "open" => vec![
+            "issue", "list", "--repo", &slug, "--state", "open", "--json", ISSUE_LIST_FIELDS,
+        ],
+        "closed" => vec![
+            "issue", "list", "--repo", &slug, "--state", "closed", "--json", ISSUE_LIST_FIELDS,
+        ],
+        _ => {
+            return Err(AppError::InvalidArgument(format!(
+                "unknown issue state filter: {state}"
+            )));
+        }
+    };
+    // gh defaults to 30. Clamp to gh's accepted 1..=1000 (`--limit 0` errors at
+    // runtime); `None` leaves gh's default untouched.
+    let limit_str;
+    if let Some(n) = limit {
+        limit_str = n.clamp(1, 1000).to_string();
+        args.push("--limit");
+        args.push(&limit_str);
+    }
+    // A fork with issues off (GitHub's default) fails with a stable signature —
+    // remap to the typed variant so the UI shows an informative, non-retryable state.
+    let out = run_gh(Some(&repo_path), &args, GH_TIMEOUT)
+        .await
+        .map_err(map_issues_disabled)?;
+    serde_json::from_str(&out.stdout_lossy())
+        .map_err(|e| gh_unreadable("issues", format!("could not parse gh issue list: {e}")))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawIssueComment {
+    #[serde(default)]
+    id: String,
+    author: Option<PrAuthor>,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    is_minimized: bool,
+    #[serde(default)]
+    minimized_reason: String,
+    #[serde(default)]
+    viewer_did_author: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawIssue {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    number: u64,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+    author: Option<PrAuthor>,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    assignees: Vec<PrAuthor>,
+    #[serde(default)]
+    milestone: Option<Milestone>,
+    #[serde(default)]
+    issue_type: Option<IssueType>,
+    #[serde(default)]
+    is_pinned: bool,
+    #[serde(default)]
+    comments: Vec<RawIssueComment>,
+    #[serde(default)]
+    labels: Vec<RepoLabel>,
+}
+
+/// Lock state isn't exposed by `gh issue view --json`, so it's fetched from the
+/// REST issue object in parallel.
+#[derive(Deserialize, Default)]
+struct LockState {
+    #[serde(default)]
+    locked: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueDetails {
+    /// GraphQL node id, used by the label mutations.
+    pub id: String,
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub author: String,
+    /// The author's avatar URL when the provider supplies one (GitLab). Empty for
+    /// GitHub, where it's login-derived on the frontend.
+    pub author_avatar_url: String,
+    pub state: String,
+    pub created_at: String,
+    pub url: String,
+    /// Assignees (GitHub + GitLab). Carries each user's avatar (GitLab supplies it;
+    /// GitHub is login-derived) so chips render a photo without a candidate fetch.
+    pub assignees: Vec<crate::forge::model::ForgeUserRef>,
+    pub milestone: Option<Milestone>,
+    pub issue_type: Option<IssueType>,
+    pub is_pinned: bool,
+    pub locked: bool,
+    pub active_lock_reason: Option<String>,
+    /// GitLab-only: the issue is hidden from non-members. Always false on GitHub.
+    pub confidential: bool,
+    /// GitLab-only: "YYYY-MM-DD" or None. GitHub has no issue due dates.
+    pub due_date: Option<String>,
+    pub comments: Vec<PrThreadOut>,
+    pub labels: Vec<RepoLabel>,
+}
+
+const ISSUE_VIEW_FIELDS: &str =
+    "id,number,title,body,author,state,createdAt,url,assignees,milestone,issueType,isPinned,comments,labels";
+
+/// Full details for one issue's read view: body, assignees, labels and the
+/// conversation comments (with node ids for editing/hiding).
+pub async fn gh_issue_view(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<IssueDetails> {
+    // Resolve the lens slug so the issue number resolves against the chosen repo, not
+    // the parent gh would auto-detect from an `upstream` remote (used by both the
+    // `issue view --repo` read and the literal `repos/<slug>` lock-state path).
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    // The conversation view and the (REST-only) lock state are fetched
+    // concurrently so the lock state adds no extra round-trip latency.
+    let n = number.to_string();
+    let issue_path = format!("repos/{slug}/issues/{number}");
+    let view_args = ["issue", "view", &n, "--repo", &slug, "--json", ISSUE_VIEW_FIELDS];
+    let lock_args = [
+        "api",
+        &issue_path,
+        "--jq",
+        "{locked: .locked, reason: .active_lock_reason}",
+    ];
+    let (view_res, lock_res) = tokio::join!(
+        run_gh(Some(&repo_path), &view_args, GH_TIMEOUT),
+        run_gh(Some(&repo_path), &lock_args, GH_TIMEOUT),
+    );
+    // Same disabled-issues remap as `gh_issue_list`, plus the version-floor remap:
+    // this read requests fields older gh builds don't have.
+    let out = view_res.map_err(map_issues_disabled).map_err(map_gh_too_old)?;
+    let raw: RawIssue = serde_json::from_str(&out.stdout_lossy())
+        .map_err(|e| gh_unreadable("the issue", format!("could not parse gh issue view: {e}")))?;
+    // Best-effort: a failed lock lookup just leaves the issue shown as unlocked.
+    let lock: LockState = lock_res
+        .ok()
+        .and_then(|o| serde_json::from_str(&o.stdout_lossy()).ok())
+        .unwrap_or_default();
+
+    Ok(IssueDetails {
+        id: raw.id,
+        number: raw.number,
+        title: raw.title,
+        body: raw.body,
+        author: raw.author.map(|a| a.login).unwrap_or_default(),
+        // GitHub avatar is login-derived on the frontend.
+        author_avatar_url: String::new(),
+        state: raw.state,
+        created_at: raw.created_at,
+        url: raw.url,
+        assignees: raw
+            .assignees
+            .into_iter()
+            .map(|a| crate::forge::model::ForgeUserRef {
+                id: a.login.clone(),
+                label: a.login,
+                avatar_url: String::new(),
+                is_bot: false,
+            })
+            .collect(),
+        milestone: raw.milestone,
+        issue_type: raw.issue_type,
+        is_pinned: raw.is_pinned,
+        locked: lock.locked,
+        active_lock_reason: lock.reason,
+        confidential: false,
+        due_date: None,
+        comments: raw
+            .comments
+            .into_iter()
+            .map(|c| PrThreadOut {
+                author: c.author.map(|a| a.login).unwrap_or_default(),
+                author_avatar_url: String::new(),
+                state: String::new(),
+                body: c.body,
+                date: c.created_at,
+                id: c.id,
+                url: c.url,
+                viewer_did_author: c.viewer_did_author,
+                is_minimized: c.is_minimized,
+                minimized_reason: c.minimized_reason,
+                // Issue comments belong to no review.
+                review_id: String::new(),
+            })
+            .collect(),
+        labels: raw.labels,
+    })
+}
+
+#[derive(Deserialize)]
+struct CreatedIssue {
+    number: u64,
+    html_url: String,
+}
+
+/// Creates an issue via the REST API so labels/assignees (arrays) and milestone
+/// (by number) go in one call and the response carries the new number + URL
+/// directly. `labels` and `assignees` are applied by name/login (must exist).
+#[allow(clippy::too_many_arguments)]
+pub async fn gh_issue_create(
+    repo_path: String,
+    title: String,
+    body: String,
+    labels: Vec<String>,
+    assignees: Vec<String>,
+    milestone: Option<u64>,
+    issue_type: Option<String>,
+    lens: Option<String>,
+) -> AppResult<PrRef> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(AppError::InvalidArgument(
+            "an issue title is required".into(),
+        ));
+    }
+    let mut payload = serde_json::json!({
+        "title": title,
+        "body": body,
+        "labels": labels,
+        "assignees": assignees,
+    });
+    if let Some(m) = milestone {
+        payload["milestone"] = serde_json::json!(m);
+    }
+    // Org-defined issue type, by name (REST POST issues accepts `type`).
+    if let Some(t) = issue_type.filter(|t| !t.trim().is_empty()) {
+        payload["type"] = serde_json::json!(t);
+    }
+    let input = serde_json::to_string(&payload)
+        .map_err(|e| AppError::Gh(format!("could not encode issue: {e}")))?;
+    // Resolve the lens slug so a new issue is filed on the chosen repo, not the
+    // parent gh would auto-detect from an `upstream` remote (on a non-fork this is a
+    // no-op).
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    let endpoint = format!("repos/{slug}/issues");
+    // Same disabled-issues remap as `gh_issue_list`.
+    let out = run_gh_input(
+        Some(&repo_path),
+        &["api", "--method", "POST", &endpoint, "--input", "-"],
+        &input,
+        GH_NETWORK_TIMEOUT,
+    )
+    .await
+    .map_err(map_issues_disabled)?;
+    let created: CreatedIssue = serde_json::from_str(&out.stdout_lossy()).map_err(|e| {
+        gh_unreadable(
+            "the new issue",
+            format!("could not parse created issue: {e}"),
+        )
+    })?;
+    Ok(PrRef {
+        number: created.number,
+        url: created.html_url,
+    })
+}
+
+/// Logins that can be assigned to issues/PRs in this repo (collaborators).
+pub async fn gh_assignable_users(
+    repo_path: String,
+    lens: Option<String>,
+) -> AppResult<Vec<String>> {
+    // Resolve the lens slug so a fork lists the chosen repo's assignees.
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    let endpoint = format!("repos/{slug}/assignees");
+    let out = run_gh(
+        Some(&repo_path),
+        &["api", &endpoint, "--jq", "[.[].login]"],
+        GH_TIMEOUT,
+    )
+    .await?;
+    serde_json::from_str(&out.stdout_lossy()).map_err(|e| {
+        gh_unreadable(
+            "the assignable users",
+            format!("could not parse assignable users: {e}"),
+        )
+    })
+}
+
+/// Open milestones for the milestone picker.
+pub async fn gh_milestones(repo_path: String, lens: Option<String>) -> AppResult<Vec<Milestone>> {
+    // Resolve the lens slug so a fork lists the chosen repo's milestones.
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    let endpoint = format!("repos/{slug}/milestones?state=open&per_page=100");
+    let out = run_gh(
+        Some(&repo_path),
+        &["api", &endpoint, "--jq", "[.[] | {number, title}]"],
+        GH_TIMEOUT,
+    )
+    .await?;
+    serde_json::from_str(&out.stdout_lossy())
+        .map_err(|e| gh_unreadable("the milestones", format!("could not parse milestones: {e}")))
+}
+
+/// Replaces an issue's assignees (REST PATCH sends the full desired set).
+pub async fn gh_issue_set_assignees(
+    repo_path: String,
+    number: u64,
+    assignees: Vec<String>,
+    lens: Option<String>,
+) -> AppResult<()> {
+    let input = serde_json::to_string(&serde_json::json!({ "assignees": assignees }))
+        .map_err(|e| AppError::Gh(format!("could not encode assignees: {e}")))?;
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    let endpoint = format!("repos/{slug}/issues/{number}");
+    run_gh_input(
+        Some(&repo_path),
+        &["api", "--method", "PATCH", &endpoint, "--input", "-"],
+        &input,
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Sets (or, with `None`, clears) an issue's milestone by milestone number.
+pub async fn gh_issue_set_milestone(
+    repo_path: String,
+    number: u64,
+    milestone: Option<u64>,
+    lens: Option<String>,
+) -> AppResult<()> {
+    let milestone_value = match milestone {
+        Some(m) => serde_json::json!(m),
+        None => serde_json::Value::Null,
+    };
+    let input =
+        serde_json::to_string(&serde_json::json!({ "milestone": milestone_value }))
+            .map_err(|e| AppError::Gh(format!("could not encode milestone: {e}")))?;
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    let endpoint = format!("repos/{slug}/issues/{number}");
+    run_gh_input(
+        Some(&repo_path),
+        &["api", "--method", "PATCH", &endpoint, "--input", "-"],
+        &input,
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The repo's enabled issue types (org-defined). Empty when the owner defines
+/// none (e.g. a personal repo), which hides the picker on the frontend.
+#[tauri::command]
+pub async fn gh_issue_types(repo_path: String, lens: Option<String>) -> AppResult<Vec<IssueType>> {
+    let (owner, name) = repo_owner_name(&repo_path, lens.as_deref()).await?;
+    let query = "query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ issueTypes(first:25){ nodes{ id name color isEnabled } } } }";
+    let out = run_gh(
+        Some(&repo_path),
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={name}"),
+            "-f",
+            &format!("query={query}"),
+        ],
+        GH_TIMEOUT,
+    )
+    .await?;
+    let value: serde_json::Value = serde_json::from_str(&out.stdout_lossy()).map_err(|e| {
+        gh_unreadable(
+            "the issue types",
+            format!("could not parse issue types: {e}"),
+        )
+    })?;
+    let types = value
+        .pointer("/data/repository/issueTypes/nodes")
+        .and_then(|n| n.as_array())
+        .map(|arr| {
+            arr.iter()
+                // Skip types an admin has disabled.
+                .filter(|n| {
+                    n.get("isEnabled")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true)
+                })
+                .filter_map(|n| {
+                    Some(IssueType {
+                        id: n.get("id")?.as_str()?.to_string(),
+                        name: n.get("name")?.as_str()?.to_string(),
+                        color: n
+                            .get("color")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(types)
+}
+
+/// The `gh issue edit` argv for setting/clearing an issue's type: `--type <t>` and
+/// `--remove-type` are mutually exclusive on gh's own grammar, so a blank or absent
+/// name must switch the WHOLE shape to `--remove-type` rather than sending both or
+/// an empty `--type`. Pure, so the shape is pinned without a spawn.
+fn issue_set_type_args<'a>(slug: &'a str, n: &'a str, type_name: Option<&'a str>) -> Vec<&'a str> {
+    match type_name {
+        Some(t) if !t.trim().is_empty() => {
+            vec!["issue", "edit", n, "--repo", slug, "--type", t]
+        }
+        _ => vec!["issue", "edit", n, "--repo", slug, "--remove-type"],
+    }
+}
+
+/// Sets (or, with `None`, clears) an issue's type by name (`gh issue edit`).
+#[tauri::command]
+pub async fn gh_issue_set_type(
+    repo_path: String,
+    number: u64,
+    type_name: Option<String>,
+    lens: Option<String>,
+) -> AppResult<()> {
+    let n = number.to_string();
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    let args = issue_set_type_args(&slug, &n, type_name.as_deref());
+    run_gh(Some(&repo_path), &args, GH_NETWORK_TIMEOUT).await?;
+    Ok(())
+}
+
+/// Adds a standalone comment to the issue conversation.
+pub async fn gh_issue_comment(
+    repo_path: String,
+    number: u64,
+    body: String,
+    lens: Option<String>,
+) -> AppResult<()> {
+    if body.trim().is_empty() {
+        return Err(AppError::InvalidArgument("a comment is required".into()));
+    }
+    let n = number.to_string();
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    run_gh(
+        Some(&repo_path),
+        &["issue", "comment", &n, "--repo", &slug, "--body", &body],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Closes an issue. `reason` is "completed" or "not_planned" (GitHub's two
+/// close reasons); empty defaults to completed.
+pub async fn gh_issue_close(
+    repo_path: String,
+    number: u64,
+    reason: String,
+    lens: Option<String>,
+) -> AppResult<()> {
+    let n = number.to_string();
+    let reason = match reason.as_str() {
+        "" | "completed" => "completed",
+        "not_planned" => "not_planned",
+        _ => {
+            return Err(AppError::InvalidArgument(format!(
+                "unknown close reason: {reason}"
+            )));
+        }
+    };
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    run_gh(
+        Some(&repo_path),
+        &["issue", "close", &n, "--repo", &slug, "--reason", reason],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Reopens a closed issue.
+pub async fn gh_issue_reopen(repo_path: String, number: u64, lens: Option<String>) -> AppResult<()> {
+    let n = number.to_string();
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    run_gh(
+        Some(&repo_path),
+        &["issue", "reopen", &n, "--repo", &slug],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+// `gh issue edit` selects the sunset Projects-classic field on older gh (same
+// bug as `gh pr edit`), so title/body edits go through the REST API instead.
+
+/// Updates an issue's title and body via the REST API.
+pub async fn gh_issue_edit(
+    repo_path: String,
+    number: u64,
+    title: String,
+    body: String,
+    lens: Option<String>,
+) -> AppResult<()> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(AppError::InvalidArgument(
+            "an issue title is required".into(),
+        ));
+    }
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    let endpoint = format!("repos/{slug}/issues/{number}");
+    run_gh(
+        Some(&repo_path),
+        &[
+            "api",
+            "--method",
+            "PATCH",
+            &endpoint,
+            "-f",
+            &format!("title={title}"),
+            "-f",
+            &format!("body={body}"),
+        ],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Pins an issue (GitHub allows at most 3 pinned issues; gh surfaces the error).
+#[tauri::command]
+pub async fn gh_issue_pin(repo_path: String, number: u64, lens: Option<String>) -> AppResult<()> {
+    let n = number.to_string();
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    run_gh(
+        Some(&repo_path),
+        &["issue", "pin", &n, "--repo", &slug],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn gh_issue_unpin(repo_path: String, number: u64, lens: Option<String>) -> AppResult<()> {
+    let n = number.to_string();
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    run_gh(
+        Some(&repo_path),
+        &["issue", "unpin", &n, "--repo", &slug],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Locks an issue's conversation. `reason`, if given, is one of GitHub's four:
+/// off_topic, resolved, spam, too_heated.
+pub async fn gh_issue_lock(
+    repo_path: String,
+    number: u64,
+    reason: Option<String>,
+    lens: Option<String>,
+) -> AppResult<()> {
+    let n = number.to_string();
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    let mut args = vec!["issue", "lock", &n, "--repo", &slug];
+    if let Some(r) = reason.as_deref() {
+        if !matches!(r, "off_topic" | "resolved" | "spam" | "too_heated") {
+            return Err(AppError::InvalidArgument(format!(
+                "unknown lock reason: {r}"
+            )));
+        }
+        args.push("--reason");
+        args.push(r);
+    }
+    run_gh(Some(&repo_path), &args, GH_NETWORK_TIMEOUT).await?;
+    Ok(())
+}
+
+pub async fn gh_issue_unlock(repo_path: String, number: u64, lens: Option<String>) -> AppResult<()> {
+    let n = number.to_string();
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    run_gh(
+        Some(&repo_path),
+        &["issue", "unlock", &n, "--repo", &slug],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Reactions for an issue's body + each comment, keyed by the comment id as the
+/// thread carries it (a GraphQL node id here; the GitLab impl keys by note id). Kept
+/// out of `gh_issue_view` so it loads in parallel — `viewerHasReacted` requires
+/// GraphQL, which `gh issue view`'s CLI JSON doesn't expose.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueReactions {
+    pub body: Vec<Reaction>,
+    pub comments: std::collections::HashMap<String, Vec<Reaction>>,
+}
+
+const REACTIONS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){ issue(number:$number){ reactionGroups{ content viewerHasReacted reactors{ totalCount } } comments(first:100){ nodes{ id reactionGroups{ content viewerHasReacted reactors{ totalCount } } } } } } }";
+
+pub async fn gh_issue_reactions(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<IssueReactions> {
+    let (owner, name) = repo_owner_name(&repo_path, lens.as_deref()).await?;
+
+    // owner/name/number go in as typed variables (no string interpolation).
+    let out = run_gh(
+        Some(&repo_path),
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={name}"),
+            "-F",
+            &format!("number={number}"),
+            "-f",
+            &format!("query={REACTIONS_QUERY}"),
+        ],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    let value: serde_json::Value = serde_json::from_str(&out.stdout_lossy())
+        .map_err(|e| gh_unreadable("the reactions", format!("could not parse reactions: {e}")))?;
+    let issue = value.pointer("/data/repository/issue");
+
+    let body = map_reaction_groups(issue.and_then(|i| i.get("reactionGroups")));
+    let mut comments = std::collections::HashMap::new();
+    if let Some(nodes) = issue
+        .and_then(|i| i.pointer("/comments/nodes"))
+        .and_then(|n| n.as_array())
+    {
+        for node in nodes {
+            if let Some(id) = node.get("id").and_then(serde_json::Value::as_str) {
+                let reactions = map_reaction_groups(node.get("reactionGroups"));
+                if !reactions.is_empty() {
+                    comments.insert(id.to_string(), reactions);
+                }
+            }
+        }
+    }
+
+    Ok(IssueReactions { body, comments })
+}
+
+fn validate_reaction_content(content: &str) -> AppResult<()> {
+    if matches!(
+        content,
+        "THUMBS_UP"
+            | "THUMBS_DOWN"
+            | "LAUGH"
+            | "HOORAY"
+            | "CONFUSED"
+            | "HEART"
+            | "ROCKET"
+            | "EYES"
+    ) {
+        Ok(())
+    } else {
+        Err(AppError::InvalidArgument(format!(
+            "unknown reaction: {content}"
+        )))
+    }
+}
+
+/// Adds the viewer's reaction to any reactable subject (issue/PR body or
+/// comment) by its GraphQL node id. Generic — reusable for PRs later.
+pub async fn gh_add_reaction(
+    repo_path: String,
+    subject_id: String,
+    content: String,
+) -> AppResult<()> {
+    validate_reaction_content(&content)?;
+    run_gh(
+        Some(&repo_path),
+        &[
+            "api",
+            "graphql",
+            "-f",
+            "query=mutation($id:ID!,$content:ReactionContent!){ addReaction(input:{subjectId:$id,content:$content}){ clientMutationId } }",
+            "-f",
+            &format!("id={subject_id}"),
+            "-f",
+            &format!("content={content}"),
+        ],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn gh_remove_reaction(
+    repo_path: String,
+    subject_id: String,
+    content: String,
+) -> AppResult<()> {
+    validate_reaction_content(&content)?;
+    run_gh(
+        Some(&repo_path),
+        &[
+            "api",
+            "graphql",
+            "-f",
+            "query=mutation($id:ID!,$content:ReactionContent!){ removeReaction(input:{subjectId:$id,content:$content}){ clientMutationId } }",
+            "-f",
+            &format!("id={subject_id}"),
+            "-f",
+            &format!("content={content}"),
+        ],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Transfers an issue to another repository. `destination` is the target
+/// "OWNER/REPO" (or its URL). Returns the transferred issue's new URL.
+pub async fn gh_issue_transfer(
+    repo_path: String,
+    number: u64,
+    destination: String,
+    lens: Option<String>,
+) -> AppResult<String> {
+    let destination = destination.trim();
+    if destination.is_empty() || destination.starts_with('-') {
+        return Err(AppError::InvalidArgument(
+            "a destination repository is required".into(),
+        ));
+    }
+    let n = number.to_string();
+    // Resolve the lens slug so the SOURCE issue resolves against the chosen repo (the
+    // `destination` arg is explicit and unaffected).
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    let out = run_gh(
+        Some(&repo_path),
+        &["issue", "transfer", &n, destination, "--repo", &slug],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    // gh prints the transferred issue's URL on success.
+    Ok(out.stdout_lossy().trim().to_string())
+}
+
+/// Permanently deletes an issue (requires admin/triage; gh confirms the error
+/// when the user lacks permission). `--yes` skips gh's interactive prompt.
+pub async fn gh_issue_delete(repo_path: String, number: u64, lens: Option<String>) -> AppResult<()> {
+    let n = number.to_string();
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    run_gh(
+        Some(&repo_path),
+        &["issue", "delete", &n, "--repo", &slug, "--yes"],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// One issue in a parent/sub-issue relationship.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelatedIssue {
+    /// GraphQL node id (used to remove the relationship).
+    pub id: String,
+    pub number: u64,
+    pub title: String,
+    /// "OPEN" or "CLOSED".
+    pub state: String,
+    pub url: String,
+}
+
+/// An issue's parent and its sub-issues, with the completion summary.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueRelations {
+    pub parent: Option<RelatedIssue>,
+    pub sub_issues: Vec<RelatedIssue>,
+    pub completed: u64,
+    pub total: u64,
+}
+
+const RELATIONS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){ issue(number:$number){ parent { id number title state url } subIssuesSummary { total completed } subIssues(first:100){ nodes { id number title state url } } } } }";
+
+/// Reads an issue's parent + sub-issues (GraphQL — sub-issues aren't in the
+/// `gh issue view` CLI JSON). Kept separate from `gh_issue_view` so it loads in
+/// parallel and adds no latency to the conversation.
+#[tauri::command]
+pub async fn gh_issue_relations(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<IssueRelations> {
+    let (owner, name) = repo_owner_name(&repo_path, lens.as_deref()).await?;
+    let out = run_gh(
+        Some(&repo_path),
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={name}"),
+            "-F",
+            &format!("number={number}"),
+            "-f",
+            &format!("query={RELATIONS_QUERY}"),
+        ],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    let value: serde_json::Value = serde_json::from_str(&out.stdout_lossy()).map_err(|e| {
+        gh_unreadable(
+            "the related issues",
+            format!("could not parse relations: {e}"),
+        )
+    })?;
+    let issue = value.pointer("/data/repository/issue");
+
+    // `parent` is nullable; only deserialize when present (see graphql nullable
+    // rules) and propagate a real parse error instead of swallowing it.
+    let parent = issue
+        .and_then(|i| i.get("parent"))
+        .filter(|p| !p.is_null())
+        .cloned()
+        .map(serde_json::from_value::<RelatedIssue>)
+        .transpose()
+        .map_err(|e| {
+            gh_unreadable(
+                "the parent issue",
+                format!("could not parse parent issue: {e}"),
+            )
+        })?;
+    let sub_issues: Vec<RelatedIssue> = issue
+        .and_then(|i| i.pointer("/subIssues/nodes"))
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| gh_unreadable("the sub-issues", format!("could not parse sub-issues: {e}")))?
+        .unwrap_or_default();
+    let total = issue
+        .and_then(|i| i.pointer("/subIssuesSummary/total"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let completed = issue
+        .and_then(|i| i.pointer("/subIssuesSummary/completed"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    Ok(IssueRelations {
+        parent,
+        sub_issues,
+        completed,
+        total,
+    })
+}
+
+/// Adds issue `sub_number` (in this repo) as a sub-issue of `parent_id` (the
+/// parent's node id). `replaceParent: true` reparents a child that already has a
+/// parent rather than erroring.
+#[tauri::command]
+pub async fn gh_issue_add_sub_issue(
+    repo_path: String,
+    parent_id: String,
+    sub_number: u64,
+    lens: Option<String>,
+) -> AppResult<()> {
+    // Resolve the child's node id (this also rejects PRs / missing numbers).
+    // Resolve the lens slug so the child number resolves against the chosen repo.
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    let n = sub_number.to_string();
+    let id_out = run_gh(
+        Some(&repo_path),
+        &["issue", "view", &n, "--repo", &slug, "--json", "id", "-q", ".id"],
+        GH_TIMEOUT,
+    )
+    .await?;
+    let sub_id = id_out.stdout_lossy().trim().to_string();
+    if sub_id.is_empty() {
+        return Err(AppError::Gh(format!("could not find issue #{sub_number}")));
+    }
+    run_gh(
+        Some(&repo_path),
+        &[
+            "api",
+            "graphql",
+            "-f",
+            "query=mutation($parent:ID!,$child:ID!){ addSubIssue(input:{issueId:$parent,subIssueId:$child,replaceParent:true}){ clientMutationId } }",
+            "-f",
+            &format!("parent={parent_id}"),
+            "-f",
+            &format!("child={sub_id}"),
+        ],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Removes the sub-issue `sub_id` (node id, from the relations read) from its
+/// parent `parent_id`.
+#[tauri::command]
+pub async fn gh_issue_remove_sub_issue(
+    repo_path: String,
+    parent_id: String,
+    sub_id: String,
+) -> AppResult<()> {
+    run_gh(
+        Some(&repo_path),
+        &[
+            "api",
+            "graphql",
+            "-f",
+            "query=mutation($parent:ID!,$child:ID!){ removeSubIssue(input:{issueId:$parent,subIssueId:$child}){ clientMutationId } }",
+            "-f",
+            &format!("parent={parent_id}"),
+            "-f",
+            &format!("child={sub_id}"),
+        ],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// An issue's dependencies: the issues blocking it, and the issues it blocks.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueDependencies {
+    pub blocked_by: Vec<RelatedIssue>,
+    pub blocking: Vec<RelatedIssue>,
+}
+
+const DEPENDENCIES_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){ issue(number:$number){ blockedBy(first:50){ nodes{ id number title state url } } blocking(first:50){ nodes{ id number title state url } } } } }";
+
+/// Reads an issue's blocked-by / blocking dependencies (GraphQL — not in the
+/// `gh issue view` CLI JSON). Loads in parallel with the conversation.
+#[tauri::command]
+pub async fn gh_issue_dependencies(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<IssueDependencies> {
+    let (owner, name) = repo_owner_name(&repo_path, lens.as_deref()).await?;
+    let out = run_gh(
+        Some(&repo_path),
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={name}"),
+            "-F",
+            &format!("number={number}"),
+            "-f",
+            &format!("query={DEPENDENCIES_QUERY}"),
+        ],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    let value: serde_json::Value = serde_json::from_str(&out.stdout_lossy()).map_err(|e| {
+        gh_unreadable(
+            "the issue's dependencies",
+            format!("could not parse dependencies: {e}"),
+        )
+    })?;
+    let issue = value.pointer("/data/repository/issue");
+    let parse = |key: &str| -> AppResult<Vec<RelatedIssue>> {
+        Ok(issue
+            .and_then(|i| i.pointer(&format!("/{key}/nodes")))
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| {
+                gh_unreadable(
+                    "the issue's dependencies",
+                    format!("could not parse {key}: {e}"),
+                )
+            })?
+            .unwrap_or_default())
+    };
+    Ok(IssueDependencies {
+        blocked_by: parse("blockedBy")?,
+        blocking: parse("blocking")?,
+    })
+}
+
+/// Adds or removes a blocked-by / blocking dependency on an issue by the target
+/// issue's number. `relation` is "blocked_by" or "blocking".
+#[tauri::command]
+pub async fn gh_issue_set_dependency(
+    repo_path: String,
+    number: u64,
+    relation: String,
+    target: u64,
+    add: bool,
+    lens: Option<String>,
+) -> AppResult<()> {
+    let flag = match (relation.as_str(), add) {
+        ("blocked_by", true) => "--add-blocked-by",
+        ("blocked_by", false) => "--remove-blocked-by",
+        ("blocking", true) => "--add-blocking",
+        ("blocking", false) => "--remove-blocking",
+        _ => {
+            return Err(AppError::InvalidArgument(format!(
+                "unknown relation: {relation}"
+            )));
+        }
+    };
+    let n = number.to_string();
+    let t = target.to_string();
+    let slug = crate::github::gh_lens_slug(&repo_path, lens.as_deref()).await?;
+    run_gh(
+        Some(&repo_path),
+        &["issue", "edit", &n, "--repo", &slug, flag, &t],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// A pull request linked to an issue (it closes / references it).
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedPr {
+    pub number: u64,
+    pub title: String,
+    /// "OPEN", "CLOSED", or "MERGED".
+    pub state: String,
+    pub url: String,
+}
+
+const ISSUE_TIMELINE_QUERY: &str = r#"query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){ issue(number:$number){ timelineItems(last:100, itemTypes:[LABELED_EVENT, UNLABELED_EVENT, ASSIGNED_EVENT, UNASSIGNED_EVENT, CROSS_REFERENCED_EVENT, CONNECTED_EVENT, DISCONNECTED_EVENT, MILESTONED_EVENT, DEMILESTONED_EVENT, CLOSED_EVENT, REOPENED_EVENT, RENAMED_TITLE_EVENT, PINNED_EVENT, UNPINNED_EVENT, LOCKED_EVENT, UNLOCKED_EVENT, MARKED_AS_DUPLICATE_EVENT, TRANSFERRED_EVENT]){ nodes{ __typename ... on LabeledEvent{ actor{login avatarUrl(size: 48) __typename} createdAt label{name color} } ... on UnlabeledEvent{ actor{login avatarUrl(size: 48) __typename} createdAt label{name color} } ... on AssignedEvent{ actor{login avatarUrl(size: 48) __typename} createdAt assignee{ __typename ... on User{login} ... on Bot{login} ... on Mannequin{login} ... on Organization{login} } } ... on UnassignedEvent{ actor{login avatarUrl(size: 48) __typename} createdAt assignee{ __typename ... on User{login} ... on Bot{login} ... on Mannequin{login} ... on Organization{login} } } ... on CrossReferencedEvent{ actor{login avatarUrl(size: 48) __typename} createdAt willCloseTarget source{ __typename ... on Issue{number title repository{nameWithOwner}} ... on PullRequest{number title repository{nameWithOwner}} } } ... on ConnectedEvent{ actor{login avatarUrl(size: 48) __typename} createdAt source{ __typename ... on Issue{number title repository{nameWithOwner}} ... on PullRequest{number title repository{nameWithOwner}} } subject{ __typename ... on Issue{number title repository{nameWithOwner}} ... on PullRequest{number title repository{nameWithOwner}} } } ... on DisconnectedEvent{ actor{login avatarUrl(size: 48) __typename} createdAt source{ __typename ... on Issue{number title repository{nameWithOwner}} ... on PullRequest{number title repository{nameWithOwner}} } subject{ __typename ... on Issue{number title repository{nameWithOwner}} ... on PullRequest{number title repository{nameWithOwner}} } } ... on MilestonedEvent{ actor{login avatarUrl(size: 48) __typename} createdAt milestoneTitle } ... on DemilestonedEvent{ actor{login avatarUrl(size: 48) __typename} createdAt milestoneTitle } ... on ClosedEvent{ actor{login avatarUrl(size: 48) __typename} createdAt stateReason } ... on ReopenedEvent{ actor{login avatarUrl(size: 48) __typename} createdAt } ... on RenamedTitleEvent{ actor{login avatarUrl(size: 48) __typename} createdAt previousTitle currentTitle } ... on PinnedEvent{ actor{login avatarUrl(size: 48) __typename} createdAt } ... on UnpinnedEvent{ actor{login avatarUrl(size: 48) __typename} createdAt } ... on LockedEvent{ actor{login avatarUrl(size: 48) __typename} createdAt lockReason } ... on UnlockedEvent{ actor{login avatarUrl(size: 48) __typename} createdAt } ... on MarkedAsDuplicateEvent{ actor{login avatarUrl(size: 48) __typename} createdAt canonical{ __typename ... on Issue{number repository{nameWithOwner}} ... on PullRequest{number repository{nameWithOwner}} } } ... on TransferredEvent{ actor{login avatarUrl(size: 48) __typename} createdAt fromRepository{nameWithOwner} } } } } } }"#;
+
+/// The issue's activity timeline — label/assignee/milestone changes, cross-references
+/// and links, state changes — for the conversation view; GitHub's arm of
+/// `forge_issue_timeline`. Nodes arrive oldest→newest and that order is preserved.
+/// One `last:100` window with no pagination, like the PR read: a very busy issue
+/// truncates its oldest events.
+///
+/// Every fragment's selection set is dictated by `map_timeline_node`'s documented
+/// contract — a missing `repository{nameWithOwner}` arrives as an empty string
+/// rather than an error.
+pub async fn gh_issue_timeline(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<Vec<crate::forge::model::ForgeTimelineEventOut>> {
+    let (owner, name) = repo_owner_name(&repo_path, lens.as_deref()).await?;
+    let out = run_gh(
+        Some(&repo_path),
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={name}"),
+            "-F",
+            &format!("number={number}"),
+            "-f",
+            &format!("query={ISSUE_TIMELINE_QUERY}"),
+        ],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    let value: serde_json::Value = serde_json::from_str(&out.stdout_lossy()).map_err(|e| {
+        gh_unreadable(
+            "the issue timeline",
+            format!("could not parse issue timeline: {e}"),
+        )
+    })?;
+    let nodes = value
+        .pointer("/data/repository/issue/timelineItems/nodes")
+        .and_then(serde_json::Value::as_array);
+    Ok(nodes
+        .map(|ns| {
+            ns.iter()
+                .filter_map(crate::github::pr::map_timeline_node)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// An issue's "Development" links: the PRs that close it + branches linked to it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueDevelopment {
+    pub prs: Vec<LinkedPr>,
+    pub branches: Vec<String>,
+}
+
+const DEVELOPMENT_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){ issue(number:$number){ closedByPullRequestsReferences(first:20,includeClosedPrs:true){ nodes{ number title url state } } linkedBranches(first:20){ nodes{ ref{ name } } } } } }";
+
+/// Reads an issue's linked/closing PRs + linked branches (GitHub's "Development"
+/// section). GraphQL-only; loads in parallel with the conversation.
+#[tauri::command]
+pub async fn gh_issue_development(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<IssueDevelopment> {
+    let (owner, name) = repo_owner_name(&repo_path, lens.as_deref()).await?;
+    let out = run_gh(
+        Some(&repo_path),
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={name}"),
+            "-F",
+            &format!("number={number}"),
+            "-f",
+            &format!("query={DEVELOPMENT_QUERY}"),
+        ],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    let value: serde_json::Value = serde_json::from_str(&out.stdout_lossy()).map_err(|e| {
+        gh_unreadable(
+            "the issue's linked branches and pull requests",
+            format!("could not parse development: {e}"),
+        )
+    })?;
+    let issue = value.pointer("/data/repository/issue");
+    let prs: Vec<LinkedPr> = issue
+        .and_then(|i| i.pointer("/closedByPullRequestsReferences/nodes"))
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| {
+            gh_unreadable(
+                "the linked pull requests",
+                format!("could not parse linked PRs: {e}"),
+            )
+        })?
+        .unwrap_or_default();
+    let branches = issue
+        .and_then(|i| i.pointer("/linkedBranches/nodes"))
+        .and_then(|n| n.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|n| {
+                    n.pointer("/ref/name")
+                        .and_then(|x| x.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(IssueDevelopment { prs, branches })
+}
+
+/// Creates a new branch off the default branch's HEAD, linked to the issue
+/// (GitHub's "Create a branch" in the Development section). The branch is made
+/// on the remote; the user can then fetch + check it out.
+#[tauri::command]
+pub async fn gh_issue_create_linked_branch(
+    repo_path: String,
+    issue_id: String,
+    name: String,
+    lens: Option<String>,
+) -> AppResult<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(AppError::InvalidArgument(
+            "a branch name is required".into(),
+        ));
+    }
+    let (owner, repo_name) = repo_owner_name(&repo_path, lens.as_deref()).await?;
+
+    // The new branch points at the default branch's current HEAD.
+    let oid_query = "query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ defaultBranchRef{ target{ oid } } } }";
+    let oid_out = run_gh(
+        Some(&repo_path),
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={repo_name}"),
+            "-f",
+            &format!("query={oid_query}"),
+        ],
+        GH_TIMEOUT,
+    )
+    .await?;
+    let oid_val: serde_json::Value =
+        serde_json::from_str(&oid_out.stdout_lossy()).map_err(|e| {
+            gh_unreadable(
+                "the default branch",
+                format!("could not read the default branch: {e}"),
+            )
+        })?;
+    let oid = oid_val
+        .pointer("/data/repository/defaultBranchRef/target/oid")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            AppError::Gh("could not determine the default branch commit".into())
+        })?;
+
+    run_gh(
+        Some(&repo_path),
+        &[
+            "api",
+            "graphql",
+            "-f",
+            "query=mutation($id:ID!,$oid:GitObjectID!,$name:String!){ createLinkedBranch(input:{issueId:$id,oid:$oid,name:$name}){ linkedBranch{ id } } }",
+            "-f",
+            &format!("id={issue_id}"),
+            "-f",
+            &format!("oid={oid}"),
+            "-f",
+            &format!("name={name}"),
+        ],
+        GH_NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Strips a leading YAML frontmatter block (`---\n…\n---`) from a template body.
+fn strip_frontmatter(text: &str) -> String {
+    let trimmed = text.trim_start_matches(['\u{feff}', '\n', '\r', ' ']);
+    if let Some(rest) = trimmed.strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            return rest[end + 4..].trim_start().to_string();
+        }
+    }
+    text.to_string()
+}
+
+/// Reads the repository's issue templates so the AI issue drafter can follow the
+/// project's expected structure: the `.github/ISSUE_TEMPLATE/` directory first
+/// (each markdown template, frontmatter stripped), else the legacy single-file
+/// locations. Best-effort — returns an empty list when the repo has none.
+#[tauri::command]
+pub fn read_issue_templates(repo_path: String) -> AppResult<Vec<String>> {
+    let root = Path::new(&repo_path);
+    let mut out: Vec<String> = Vec::new();
+
+    let dir = root.join(".github").join("ISSUE_TEMPLATE");
+    if let Ok(entries) = fs::read_dir(&dir) {
+        let mut paths: Vec<_> = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                matches!(
+                    p.extension().and_then(|x| x.to_str()),
+                    Some("md") | Some("markdown")
+                )
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            if let Ok(text) = fs::read_to_string(&path) {
+                let body = strip_frontmatter(&text);
+                if !body.trim().is_empty() {
+                    out.push(body);
+                }
+            }
+        }
+    }
+
+    // Fall back to the legacy single-file templates only if the dir had none.
+    if out.is_empty() {
+        for rel in [
+            ".github/ISSUE_TEMPLATE.md",
+            ".github/issue_template.md",
+            "ISSUE_TEMPLATE.md",
+            "docs/ISSUE_TEMPLATE.md",
+        ] {
+            if let Ok(text) = fs::read_to_string(root.join(rel)) {
+                let body = strip_frontmatter(&text);
+                if !body.trim().is_empty() {
+                    out.push(body);
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        empty_filtered_issues, is_issues_disabled, issue_set_type_args, map_gh_too_old,
+        ISSUE_TIMELINE_QUERY,
+    };
+    use crate::error::AppError;
+
+    /// A `type:issue` search answers a repo with its tracker OFF with zero rows and no
+    /// error (measured), so an empty filtered page alone can't tell "no matches" from
+    /// "no tracker" — the probe's result is what decides, and a disabled tracker must
+    /// still reach the typed non-retryable state rather than rendering as empty.
+    #[test]
+    fn an_empty_filtered_page_defers_to_the_disabled_issues_probe() {
+        // Probe succeeded: the tracker exists, so empty really means no matches.
+        let ok = empty_filtered_issues(Ok(())).expect("a live tracker yields an empty list");
+        assert!(ok.is_empty());
+        // Probe failed with gh's disabled-issues line (verbatim shape) — the typed
+        // variant, not a raw Gh error the panel would show as a retryable failure.
+        let disabled = empty_filtered_issues(Err(AppError::Gh(
+            "the 'berkinory/GitDesktop' repository has disabled issues".into(),
+        )));
+        assert!(matches!(disabled, Err(AppError::IssuesDisabled)));
+        // Any other probe failure propagates unchanged — never swallowed into an
+        // empty list, and never relabelled as a disabled tracker.
+        match empty_filtered_issues(Err(AppError::Gh("HTTP 401: Bad credentials".into()))) {
+            Err(AppError::Gh(m)) => assert_eq!(m, "HTTP 401: Bad credentials"),
+            Err(e) => panic!("a non-disabled failure must ride through: {e:?}"),
+            Ok(_) => panic!("a failed probe must never yield an empty list"),
+        }
+    }
+
+    /// `--type`/`--remove-type` are mutually exclusive on gh's grammar — a blank or
+    /// absent name must switch the whole shape, never send an empty `--type` value
+    /// alongside `--remove-type`.
+    #[test]
+    fn issue_set_type_args_switches_shape_never_sends_both() {
+        let typed = issue_set_type_args("o/r", "7", Some("bug"));
+        assert_eq!(typed, ["issue", "edit", "7", "--repo", "o/r", "--type", "bug"]);
+
+        for cleared in [None, Some(""), Some("   ")] {
+            let args = issue_set_type_args("o/r", "7", cleared);
+            assert_eq!(args, ["issue", "edit", "7", "--repo", "o/r", "--remove-type"]);
+        }
+    }
+
+    #[test]
+    fn detects_the_disabled_issues_signature() {
+        // The full line gh prints on a repo with issues turned off.
+        assert!(is_issues_disabled(
+            "the 'theBGuy/biome' repository has disabled issues"
+        ));
+        // Match is case-insensitive (gh capitalization can drift).
+        assert!(is_issues_disabled("The 'a/b' repository HAS DISABLED ISSUES"));
+    }
+
+    #[test]
+    fn leaves_other_gh_failures_alone() {
+        assert!(!is_issues_disabled(""));
+        assert!(!is_issues_disabled(
+            "GraphQL: Could not resolve to a Repository with the name 'a/b'."
+        ));
+        assert!(!is_issues_disabled(
+            "gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment variable"
+        ));
+    }
+
+    #[test]
+    fn maps_an_unknown_field_failure_to_the_gh_version_floor() {
+        // gh's own output shape: the rejected field, then its known field list.
+        let err = map_gh_too_old(AppError::Gh(
+            "Unknown JSON field: \"issueType\"\nAvailable fields:\n  assignees\n  author".into(),
+        ));
+        let AppError::Gh(msg) = err else {
+            panic!("expected the Gh variant");
+        };
+        assert_eq!(
+            msg,
+            "Opening issues needs GitHub CLI 2.94 or newer — this gh doesn't know the fields \
+             GitDesktop requests. Update gh, then retry."
+        );
+    }
+
+    #[test]
+    fn leaves_unrelated_view_failures_unchanged() {
+        let err = map_gh_too_old(AppError::Gh(
+            "GraphQL: Could not resolve to an Issue with the number 999.".into(),
+        ));
+        let AppError::Gh(msg) = err else {
+            panic!("expected the Gh variant");
+        };
+        assert_eq!(
+            msg,
+            "GraphQL: Could not resolve to an Issue with the number 999."
+        );
+        // Errors already classified upstream pass through untouched.
+        assert!(matches!(
+            map_gh_too_old(AppError::IssuesDisabled),
+            AppError::IssuesDisabled
+        ));
+    }
+
+    #[test]
+    fn issue_timeline_query_selects_every_mapped_field() {
+        // A dropped selection is a SILENT failure — GraphQL simply omits the field
+        // and `map_timeline_node` reads it as "", so pin the contract here.
+        assert!(ISSUE_TIMELINE_QUERY.contains("actor{login avatarUrl(size: 48) __typename}"));
+        // 12 = CrossReferenced `source` + Connected/Disconnected `source` and
+        // `subject` + MarkedAsDuplicate `canonical`, each on its Issue AND
+        // PullRequest fragment. TransferredEvent's `fromRepository{nameWithOwner}`
+        // is a different (capitalized) token and doesn't count here. Exact, so
+        // dropping a whole fragment fails instead of sliding under a floor.
+        assert_eq!(
+            ISSUE_TIMELINE_QUERY
+                .matches("repository{nameWithOwner}")
+                .count(),
+            12
+        );
+        // Connected/Disconnected map from `subject`; drop it and the event silently
+        // self-references, because `source` is the issue the event sits on.
+        assert_eq!(ISSUE_TIMELINE_QUERY.matches("subject{").count(), 2);
+        assert!(ISSUE_TIMELINE_QUERY.contains("willCloseTarget"));
+        assert!(ISSUE_TIMELINE_QUERY.contains("stateReason"));
+        for item_type in [
+            "LABELED_EVENT",
+            "UNLABELED_EVENT",
+            "ASSIGNED_EVENT",
+            "UNASSIGNED_EVENT",
+            "CROSS_REFERENCED_EVENT",
+            "CONNECTED_EVENT",
+            "DISCONNECTED_EVENT",
+            "MILESTONED_EVENT",
+            "DEMILESTONED_EVENT",
+            "CLOSED_EVENT",
+            "REOPENED_EVENT",
+            "RENAMED_TITLE_EVENT",
+            "PINNED_EVENT",
+            "UNPINNED_EVENT",
+            "LOCKED_EVENT",
+            "UNLOCKED_EVENT",
+            "MARKED_AS_DUPLICATE_EVENT",
+            "TRANSFERRED_EVENT",
+        ] {
+            assert!(
+                ISSUE_TIMELINE_QUERY.contains(item_type),
+                "itemTypes missing {item_type}"
+            );
+        }
+    }
+}

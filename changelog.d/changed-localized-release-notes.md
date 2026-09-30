@@ -1,0 +1,1 @@
+- The What's New dialog displays the complete v0.13.0 release notes in the selected interface language and updates when the language changes.

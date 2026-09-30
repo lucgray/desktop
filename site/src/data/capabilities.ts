@@ -1,0 +1,890 @@
+// Single source of truth for the capability catalog. The /features page renders
+// every entry, grouped by `group`; the home page renders the `highlight` subset
+// as "everything else you'd reach for". `ai: true` entries are the hide-AI set —
+// on the site they live under [data-view="ai"] so "Just Git" hides them wholesale
+// (kept out of the non-AI groups so no group empties out in that view).
+//
+// Keep labels SHORT and scannable — one atomic capability each, not a paragraph.
+// This mirrors the app's real feature set (see README Highlights/Features); when
+// a feature ships or changes, update the matching entry here in the same change.
+
+export interface Capability {
+  label: string;
+  group: string;
+  /** AI feature — hidden in the "Just Git" view. */
+  ai?: boolean;
+  /** Surfaced in the home page's curated highlights. */
+  highlight?: boolean;
+}
+
+// Non-AI groups render in both views, in this order; AI groups follow, gated.
+export const GROUP_ORDER = [
+  "Diffs & staging",
+  "Branches & history",
+  "Rewrite & recovery",
+  "Pull requests & review",
+  "Forges & trackers",
+  "Issues & discussions",
+  "CI, tags & releases",
+  "Repository & workspace",
+  "Admin & settings",
+  "Keyboard & Markdown",
+  "AI · generate & review",
+  "AI · agents & sessions",
+  "AI · MCP & providers",
+] as const;
+
+export const capabilities: Capability[] = [
+  // — Diffs & staging —
+  {
+    group: "Diffs & staging",
+    label: "Unified & split diffs, syntax-highlighted in ~190 languages",
+  },
+  {
+    group: "Diffs & staging",
+    label:
+      "Line, hunk & file staging — drag the line numbers or use a keybind; one drag picks up added and removed lines together in unified or split view, with Shift to take one side",
+  },
+  {
+    group: "Diffs & staging",
+    label: "Stage or discard part of a brand-new, untracked file",
+  },
+  {
+    group: "Diffs & staging",
+    label: "Image diffing & collapsible surrounding context",
+  },
+  {
+    group: "Diffs & staging",
+    label:
+      "Raw ⇄ Preview toggle on markdown & MDX diffs — read the change as rendered prose",
+    highlight: true,
+  },
+  {
+    group: "Diffs & staging",
+    label: "Filter the changes list by path or category",
+  },
+  {
+    group: "Diffs & staging",
+    label:
+      "Flat list ⇄ compacted directory tree in the Changes panel — collapsible folders, keyboard-first",
+  },
+  {
+    group: "Diffs & staging",
+    label: "Per-file added/deleted line counts on the changes list",
+  },
+  {
+    group: "Diffs & staging",
+    label: "Commit with co-authors suggested from history; amend, undo, revert",
+  },
+  {
+    group: "Diffs & staging",
+    label:
+      "Pop the commit box out into a dialog — a roomier editor with your staged files alongside",
+  },
+  { group: "Diffs & staging", label: "Recoverable, recycle-bin discards" },
+
+  // — Branches & history —
+  {
+    group: "Branches & history",
+    label:
+      "Branch compare — ahead/behind, three-dot diff, jump to PR, commit menu + tags",
+    highlight: true,
+  },
+  {
+    group: "Branches & history",
+    label: "Update a branch from its upstream — no checkout needed",
+  },
+  {
+    group: "Branches & history",
+    label: "Push or publish a branch to any remote — no checkout needed",
+  },
+  {
+    group: "Branches & history",
+    label:
+      "Start a branch from any base — another local branch or a remote ref",
+  },
+  {
+    group: "Branches & history",
+    label: "Check out or delete remote-only branches from the switcher",
+  },
+  {
+    group: "Branches & history",
+    label: "Archive branches — hide from the switcher without deleting",
+  },
+  {
+    group: "Branches & history",
+    label:
+      "Clean up branches in bulk — archive or delete stale ones in one sweep, including branches merged through a pull request",
+    highlight: true,
+  },
+  {
+    group: "Branches & history",
+    label: "Paged, filterable commit history with rich detail",
+  },
+  { group: "Branches & history", label: "File history & line blame" },
+  { group: "Branches & history", label: "Commit-author avatars in history" },
+  { group: "Branches & history", label: "Unpushed commits flagged in history" },
+
+  // — Rewrite & recovery —
+  {
+    group: "Rewrite & recovery",
+    label:
+      "Interactive rebase — reword / squash / fixup / edit / drop / reorder, atomic replay",
+    highlight: true,
+  },
+  {
+    group: "Rewrite & recovery",
+    label: "Change base — replay only a branch's own commits onto a new base",
+  },
+  {
+    group: "Rewrite & recovery",
+    label: "Cherry-pick commits onto the current or another branch",
+  },
+  {
+    group: "Rewrite & recovery",
+    label:
+      "Merge preview — fast-forward / already up to date / clean / which files conflict, before you merge",
+    highlight: true,
+  },
+  {
+    group: "Rewrite & recovery",
+    label:
+      "In-app conflict editor — current / incoming / both, or mark files resolved as they stand on disk",
+  },
+  { group: "Rewrite & recovery", label: "Stash browser" },
+  {
+    group: "Rewrite & recovery",
+    label:
+      "Stash and reapply — one click when a pull, merge, rebase, update or switch is blocked",
+  },
+  {
+    group: "Rewrite & recovery",
+    label:
+      "Recover lost work — git fsck for orphaned stashes, restored non-destructively",
+    highlight: true,
+  },
+  {
+    group: "Rewrite & recovery",
+    label:
+      "Operation journal — records risky ops & recovers if one is interrupted",
+  },
+
+  // — Pull requests & review —
+  {
+    group: "Pull requests & review",
+    label: "PRs on GitHub, GitLab & Bitbucket + private, offline local PRs",
+    highlight: true,
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "Local-PR merges pre-show conflicts, resolved in an isolated worktree",
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "See when a pull request won't merge cleanly — and resolve the conflicts in-app, in an isolated worktree",
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "A blocked merge names why — unmet checks & required approvals (GitHub), the blocking reason (GitLab)",
+  },
+  {
+    group: "Pull requests & review",
+    label: "Set labels & assignees when you open a PR/MR (GitHub & GitLab)",
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "A PR you're opening holds its place in its list — title, branches & draft state, then its number",
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "A failed PR create raises a notification — branch and reason named, even when it fails in the background",
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "Link related issues as you open or edit a PR — auto-detected from your branch and commits (GitHub & GitLab; Bitbucket via linked Jira)",
+  },
+  {
+    group: "Pull requests & review",
+    label: "Request reviewers on a PR/MR (GitHub, GitLab & Bitbucket)",
+  },
+  {
+    group: "Pull requests & review",
+    label: "Inline review comments — reply, resolve, apply suggestions locally",
+    highlight: true,
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "Compose a review from the diff — batch drafts, submit with a verdict",
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "Drill into a PR's commits — per-file diffs, whole-commit & line comments",
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "PR activity feed — reviews, comments, grouped commits, stale-approval marks, all timestamped",
+  },
+  {
+    group: "Pull requests & review",
+    label: "Comment on commits from History — whole-commit or line-anchored",
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "Fork · Upstream lens — browse & work a fork's PRs and issues or the parent's",
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "Fork PR maintainer actions — approve blocked workflow runs, update the branch, and push follow-ups to the contributor's fork",
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "Stacked PRs — position badges and a stack navigator; create, extend, or dissolve a stack from the PR view; on GitHub, merge a stack bottom-up in one go",
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "Retarget a pull request's base branch from the edit dialog — on GitHub, GitLab, and Bitbucket",
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "Unfinished-review notice — a review you started on GitHub surfaces on the PR, to finish or discard",
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "Triage the PR list — All | Mine | Needs review presets and whole-repo filters (GitHub & GitLab), with grouping by your review state (GitHub)",
+    highlight: true,
+  },
+  {
+    group: "Pull requests & review",
+    label:
+      "Refresh the PR list on demand — one press re-reads the list, its checks, conflict chips & review grouping",
+  },
+
+  // — Forges & trackers —
+  {
+    group: "Forges & trackers",
+    label: "GitHub, GitLab & Bitbucket — first-class, each on its own identity",
+    highlight: true,
+  },
+  {
+    group: "Forges & trackers",
+    label: "GitHub Enterprise — same features, via gh",
+  },
+  {
+    group: "Forges & trackers",
+    label: "CNB — Access Token sign-in, HTTPS repositories and pull requests",
+  },
+  {
+    group: "Forges & trackers",
+    label: "Multiple accounts per host with repository account selection",
+  },
+  {
+    group: "Forges & trackers",
+    label: "Self-managed GitLab — any host glab is signed in to",
+  },
+  {
+    group: "Forges & trackers",
+    label: "Multiple accounts, switch the active one per host",
+  },
+  {
+    group: "Forges & trackers",
+    label:
+      "Sign in & reconnect in-app — session-expired detection & token-expiry warnings, rate limits told apart (with GitHub's reset time), plus scope hints that reconnect with the needed scope",
+  },
+  {
+    group: "Forges & trackers",
+    label:
+      "Repo switcher — forge logo & visibility badge per row, grouped by owner",
+  },
+  {
+    group: "Forges & trackers",
+    label: "Jira Cloud — link a project, browse & work issues in-app",
+    highlight: true,
+  },
+  {
+    group: "Forges & trackers",
+    label: "Jira keys in branches, commits & PRs link back to the Issues tab",
+  },
+
+  // — Issues & discussions —
+  {
+    group: "Issues & discussions",
+    label: "GitHub & GitLab issues, plus private local to-dos",
+  },
+  {
+    group: "Issues & discussions",
+    label:
+      "Refresh the issue list on demand — forge, local & linked-Jira lists in one press",
+  },
+  {
+    group: "Issues & discussions",
+    label:
+      "Code TODOs — scan TODO/FIXME/HACK comments, jump to blame, promote to an issue",
+    highlight: true,
+  },
+  {
+    group: "Issues & discussions",
+    label:
+      "Issue types, sub-issues & dependencies on GitHub; related issues on GitLab",
+  },
+  {
+    group: "Issues & discussions",
+    label:
+      "Issue list filters — All | Mine, plus author & label across the whole repository (GitHub & GitLab)",
+  },
+  {
+    group: "Issues & discussions",
+    label: "GitHub Projects — link issues & PRs to repo and owner projects",
+  },
+  {
+    group: "Issues & discussions",
+    label:
+      "Project field values — read & set Status, Priority, Iteration & dates on issues and PRs, plus organization issue fields on issues",
+  },
+  {
+    group: "Issues & discussions",
+    label:
+      "Project boards — a GitHub Project as a kanban, grouped by any of its single-select or iteration fields (an iteration grouping gives you a sprint board, one column per iteration), with right-click move between columns, keyboard reordering inside a column (Alt/Option+↑↓ to step, Alt/Option+Home/End for the ends, also on the card menu and in the command palette) that writes the project's own card order, and its saved views as lenses (GitHub applies the filter; the board honors the sort and shows the view's fields as chips). Create projects (linked to the repository whenever it can be read), edit their title and description, close, reopen or delete them, and manage saved views from the board: add one in any layout, rename, duplicate (layout, filter and shown fields) or delete it, pick the fields it shows, and save a layout you switched to back onto the view. Closed projects stay listed in their own group and fully workable. A view saved as a table opens as a real table: Title first, then the view's other columns in its saved order (assignees, labels, milestone, repository, reviewers and linked pull requests included, with a +N where a list runs long), a sticky header and Title column, rows in the view's sort with each sorted column marked, the view's row grouping as sections you can fold, cell-by-cell arrow-key movement, the same row selection, menu and bulk bar as the board, and board field values edited right in their cells. A view saved as a roadmap opens as a timeline: a bar from each item's start date to its target on a month, quarter or year axis, with a line for today, the current iteration shaded and named, and milestone due dates marked; pick the date or iteration fields that place items under View options, and shift the item you're on a day (or an iteration) with Alt/Option+←→, adding Shift to move its target alone. Add existing issues and pull requests or write Markdown drafts from the toolbar and the card is there as the write lands, edit a draft's title, notes and assignees, convert a draft to a real issue, archive or remove a card, bring archived cards back into the columns with View options → Show archived cards and restore one in place from its own menu, peek at an issue or pull request card's details with Space, and pick boards for a new issue as you create it. Work on several cards at once: Ctrl/Cmd-click to pick them out, Shift-click (or Shift with the arrow keys) for a range down a column, and a bar above the board moves, archives, restores, removes or sets the fields of the cards each verb can reach — a bulk fields editor whose rows all start on \"Leave as is\", so one Apply writes exactly the fields you drafted to every eligible card, with each row reporting the value where the cards agree and \"(mixed)\" where they don't. Every count shows exactly what that verb will reach (archived cards sit out a field edit, for instance)",
+    highlight: true,
+  },
+  {
+    group: "Issues & discussions",
+    label:
+      "Project status updates — the latest status (On track, At risk, Off track, Complete, Inactive) with its note, target date and age in a strip above the board, the history newest-first with Markdown notes, and post, edit or delete your own updates without leaving the app",
+  },
+  {
+    group: "Issues & discussions",
+    label:
+      "Issue activity timeline — labels, assignees, milestones, renames, linked PRs, mentions & state changes, with actor avatars",
+  },
+  {
+    group: "Issues & discussions",
+    label: "GitHub Discussions — read, post & react",
+  },
+  {
+    group: "Issues & discussions",
+    label:
+      "Close or reopen with a comment — on PRs, issues & discussions, your draft posts alongside",
+  },
+
+  // — CI, tags & releases —
+  {
+    group: "CI, tags & releases",
+    label: "GitHub Actions — runs, jobs, steps, re-run, cancel & dispatch",
+    highlight: true,
+  },
+  {
+    group: "CI, tags & releases",
+    label:
+      "GitLab & Bitbucket pipelines — runs, job logs, re-run, cancel & trigger, in-app",
+  },
+  {
+    group: "CI, tags & releases",
+    label: "CNB builds — history, stage logs and manual trigger",
+  },
+  {
+    group: "CI, tags & releases",
+    label:
+      "CI checks rollup — pass/fail/pending/skipped, live step progress on running Actions checks, one-click re-run of what failed, batch or single job (GitHub & GitLab)",
+  },
+  {
+    group: "CI, tags & releases",
+    label:
+      "Tags, releases & cross-platform assets — edit notes (GitHub & GitLab), sync the updater manifest (GitHub)",
+  },
+  {
+    group: "CI, tags & releases",
+    label: "Insights graphs — commit activity, churn & more, computed locally",
+  },
+  {
+    group: "CI, tags & releases",
+    label:
+      "Fork activity — a repo's recently active forks, with ahead/behind on GitHub",
+  },
+  {
+    group: "CI, tags & releases",
+    label:
+      "Findings tab — GitHub Dependabot/scanning alerts & advisories; GitLab SAST, secrets & code quality; Bitbucket Code Insights",
+    highlight: true,
+  },
+
+  // — Repository & workspace —
+  {
+    group: "Repository & workspace",
+    label: "Clone, add local, create (README/.gitignore/license) or fork",
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "Explore repositories — search GitHub, GitLab & Bitbucket, then clone, fork or star",
+    ai: false,
+    highlight: true,
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "My work — one cross-repo inbox of your open GitHub PRs and issues, GitLab MRs and issues, and Bitbucket PRs",
+    ai: false,
+    highlight: true,
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "Update a fork from its upstream — fetch, then fast-forward or merge",
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "Detach from a fork — remove the upstream remote; leave the fork network on GitHub, GitLab, or Bitbucket (in-app on GitLab)",
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "Publish a local repo to GitHub, GitLab or Bitbucket — choose the GitHub owner or Bitbucket workspace",
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "Locate a moved repo — repoint the entry and bring its local PRs, issues, review history & automations along",
+    ai: false,
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "Worktree manager — create, switch, rename, lock, promote & remove, with a last-active time per worktree",
+    highlight: true,
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "Open a branch's worktree from its row in the branch list, with the worktree actions on the branch's context menu",
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "Submodule manager — add, remove, update & track branches, edit URLs, open as repo",
+    highlight: true,
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "Tasks — register a repo script or write one inline and run it in an interactive terminal, kept to one repository or available in all",
+    highlight: true,
+  },
+  { group: "Repository & workspace", label: "Manage tracked & ignored files" },
+  {
+    group: "Repository & workspace",
+    label: "--force-with-lease + --force-if-includes (Git 2.30+) by default",
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "Rewrite-aware divergence — a server-rebased branch gets a confirmed Reset to origin/…",
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "Fork-point guard — a rebase pull asks before an upstream rewrite drops your commits",
+    highlight: true,
+  },
+  {
+    group: "Repository & workspace",
+    label: "Auto-fetch — quiet background sync, never auto-pulls",
+    highlight: true,
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "Activity & notifications inbox — never miss a finished review or check",
+    highlight: true,
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "Per-source notification controls — in-app vs OS channels, failures-only CI, per-repo overrides",
+  },
+  { group: "Repository & workspace", label: "Environment & CLI health check" },
+  {
+    group: "Repository & workspace",
+    label: "Native macOS menu bar — File menu with Open Recent",
+  },
+  {
+    group: "Repository & workspace",
+    label: "Remembers window size & position",
+  },
+  {
+    group: "Repository & workspace",
+    label:
+      "Narrow windows & split-screen layouts — down to 640px, with a collapsible sidebar and diff file list",
+  },
+  {
+    group: "Repository & workspace",
+    label: "Themes — System, Light, Dark & a softer Slate",
+  },
+
+  // — Admin & settings —
+  { group: "Admin & settings", label: "Repo settings & webhooks (admin)" },
+  { group: "Admin & settings", label: "Collaborators & invitations (admin)" },
+  {
+    group: "Admin & settings",
+    label: "Branch rulesets — create, edit, enable/disable (admin)",
+  },
+  {
+    group: "Admin & settings",
+    label: "Code security & analysis toggles (admin)",
+  },
+  {
+    group: "Admin & settings",
+    label:
+      "Danger zone — rename, archive, visibility, transfer, delete (admin)",
+  },
+  {
+    group: "Admin & settings",
+    label: "GitHub Pages — source, custom domain, HTTPS (admin)",
+  },
+  {
+    group: "Admin & settings",
+    label: "Actions/Dependabot/Codespaces secrets & variables (admin)",
+  },
+  {
+    group: "Admin & settings",
+    label: "Edit the Sponsor button (.github/FUNDING.yml)",
+  },
+  { group: "Admin & settings", label: "Branch-protection rules, locally" },
+  {
+    group: "Admin & settings",
+    label:
+      "Promotion branches — update offers withheld on their PRs and branch menus",
+  },
+  {
+    group: "Admin & settings",
+    label: "Git hooks manager — husky / pre-commit / lefthook aware",
+  },
+  {
+    group: "Admin & settings",
+    label: "Edit git config — identity, default branch, line endings",
+  },
+
+  // — Keyboard & Markdown —
+  {
+    group: "Keyboard & Markdown",
+    label:
+      "Command palette + rebindable, filterable keys — down to a single key",
+    highlight: true,
+  },
+  { group: "Keyboard & Markdown", label: "Arrow-key navigation on every list" },
+  { group: "Keyboard & Markdown", label: "Generated shortcut cheat sheet" },
+  { group: "Keyboard & Markdown", label: "GitHub-Desktop-compatible defaults" },
+  {
+    group: "Keyboard & Markdown",
+    label: "Markdown editor — formatting toolbar & live preview",
+    highlight: true,
+  },
+  {
+    group: "Keyboard & Markdown",
+    label:
+      "Collapsible comment box — reclaim reading space, actions stay docked",
+  },
+  {
+    group: "Keyboard & Markdown",
+    label:
+      "Jump to either end of a long thread — scroll-aware buttons on PR, issue & discussion conversations",
+  },
+  {
+    group: "Keyboard & Markdown",
+    label:
+      "@mention & #reference autocomplete, plus !123 on GitLab — GitHub & GitLab comments, replies, release notes, local PRs & issues",
+  },
+  {
+    group: "Keyboard & Markdown",
+    label:
+      "Reference autolinks — #123, @user, and GitLab's !123 open the issue, pull request, or profile they name",
+  },
+  {
+    group: "Keyboard & Markdown",
+    label:
+      "Reference preview cards — hover or Tab to a #123 or !123 for its state, title & author, or to an @user for their avatar & handle",
+  },
+  {
+    group: "Keyboard & Markdown",
+    label:
+      "Link previews — hover or Tab to a link for its domain & full URL, plus the page's title, description & image",
+  },
+  {
+    group: "Keyboard & Markdown",
+    label:
+      "Fullscreen image viewer — screenshots in any rendered body and both sides of an image diff, with fit/100% zoom and arrow-key stepping in fit view",
+  },
+
+  // — AI · generate & review —
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label: "Generated commit messages, PR & issue titles/descriptions",
+    highlight: true,
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "AI branch names — from your in-progress changes, or the branch's own committed work",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label: "AI suggests PR/MR labels from your repo's existing set",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label: "AI issue drafting from your repo's templates",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label: "AI repo descriptions & topics",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "Generate a task's script from plain English — or analyze one to document it",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label: "AI code review & security audit on any PR",
+    highlight: true,
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "Hand review context to the AI reviewer — per-branch notes deposited by your agent, read by every review (automated or one you start) with a per-run opt-out",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "Agentic review — reads the full diff, files, search & history, read-only",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label: "Reviews keep running in the background & finish in the tray",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label: "Queue the other review mode while one streams — runs it next",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "Review effort — dial the reviewer's reasoning from a light pass to Max",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "Review timeout — agentic reviews get 20 minutes, or pin your own limit",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "AI ignore patterns — .gitignore syntax, keeping chosen files out of generation and review",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "AI excluded files view — every hidden file with the rule that hid it, a warning on a ! line that decides nothing, and rule removal in place",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label: "Iterative reviews build on the last round & other bots' findings",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "Re-reviews remember the discussion — triage replies honored, context sized to your model",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "Reviews converge — a fuller first round, non-blocking leftovers listed apart",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "Every re-review ends with a verdict — blocking issues remain, or merge when ready",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "Reviews know where your docs live — one finding names every stale surface",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "AI reviews are clearly machine-authored — post as a GitLab project bot",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "Automations — review or audit on commit, PR open, or new commits, with notifications for everything or failures only",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label:
+      "Automation history — a per-repo log of what ran, what was skipped & why, plus run an automation on demand",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label: "Resolve merge conflicts with AI — review the proposal, then accept",
+  },
+  {
+    group: "AI · generate & review",
+    ai: true,
+    label: "Debug failed CI with AI — logs to a root-cause & fix",
+  },
+
+  // — AI · agents & sessions —
+  {
+    group: "AI · agents & sessions",
+    ai: true,
+    label:
+      "Delegate a task to a Claude, Codex, Copilot or opencode agent — searchable model picker (opencode's live catalog), any typed id accepted",
+    highlight: true,
+  },
+  {
+    group: "AI · agents & sessions",
+    ai: true,
+    label: "Default agent — pin one, or follow a CLI-agent AI provider",
+  },
+  {
+    group: "AI · agents & sessions",
+    ai: true,
+    label: "Watch the agent work step by step, with an inline diff per edit",
+  },
+  {
+    group: "AI · agents & sessions",
+    ai: true,
+    label: "Best-of-N — run one task across agents/models, keep the best",
+  },
+  {
+    group: "AI · agents & sessions",
+    ai: true,
+    label:
+      "Run agents in a Docker/Podman sandbox (opt-in), per session or by default",
+  },
+  {
+    group: "AI · agents & sessions",
+    ai: true,
+    label: "Add per-repo tools to the agent container via a custom image",
+  },
+  {
+    group: "AI · agents & sessions",
+    ai: true,
+    label: "Integrated terminal in each session (host & container)",
+  },
+  {
+    group: "AI · agents & sessions",
+    ai: true,
+    label:
+      "Research a topic with web search — Brainstorm & Deep research, cited",
+  },
+  {
+    group: "AI · agents & sessions",
+    ai: true,
+    label: "Plan a task into an agent-ready issue (read-only)",
+  },
+  {
+    group: "AI · agents & sessions",
+    ai: true,
+    label: "Hand an issue or plan to an agent to implement",
+  },
+  {
+    group: "AI · agents & sessions",
+    ai: true,
+    label: "Agent sessions — tabs, search & completion alerts",
+  },
+  {
+    group: "AI · agents & sessions",
+    ai: true,
+    label: "Slash commands & skills in the agent composer",
+  },
+
+  // — AI · MCP & providers —
+  {
+    group: "AI · MCP & providers",
+    ai: true,
+    label:
+      "Use GitDesktop as an MCP server — read-only default, opt-in write ladder",
+    highlight: true,
+  },
+  {
+    group: "AI · MCP & providers",
+    ai: true,
+    label: "Trigger GitDesktop's AI generation from an external MCP client",
+  },
+  {
+    group: "AI · MCP & providers",
+    ai: true,
+    label: "Bring your own MCP servers, opted in per session",
+  },
+  {
+    group: "AI · MCP & providers",
+    ai: true,
+    label: "Browse the official MCP registry to add servers",
+  },
+  {
+    group: "AI · MCP & providers",
+    ai: true,
+    label:
+      "Bring your own model — Anthropic, OpenAI, Google AI Studio, OpenRouter, Ollama, or a keyless agent CLI (generation & review)",
+  },
+  {
+    group: "AI · MCP & providers",
+    ai: true,
+    label:
+      "Google AI Studio as a first-class provider — paste an AI Studio key and pick from your live Gemini catalog",
+  },
+  {
+    group: "AI · MCP & providers",
+    ai: true,
+    label: "Point AI at a custom or LAN Ollama / OpenAI-compatible server",
+  },
+  {
+    group: "AI · MCP & providers",
+    ai: true,
+    label: "Keys live in your OS keychain; one switch hides every AI surface",
+  },
+];
+
+export const highlightCapabilities = capabilities.filter((c) => c.highlight);

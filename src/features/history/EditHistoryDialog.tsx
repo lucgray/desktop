@@ -1,0 +1,446 @@
+import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  CaretDownIcon,
+  SparkleIcon,
+  XIcon,
+} from "@phosphor-icons/react";
+import { useMemo, useState } from "react";
+import { toast } from "sonner";
+import { type TranslationKey, useTranslation } from "@/lib/i18n";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Spinner } from "@/components/ui/spinner";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  useRebaseEdit,
+  useRewriteCommits,
+  useUnpushedMessages,
+} from "@/lib/git/queries";
+import type { CommitSummary } from "@/lib/git/types";
+import { useAiEnabled } from "@/lib/settings/queries";
+import { useUiStore } from "@/lib/stores/ui";
+import { toastError } from "@/lib/toast";
+import { useLatestRef } from "@/lib/use-latest-ref";
+import { cn } from "@/lib/utils";
+import { compilePlan, type EditRow, type RowAction } from "./edit-history-plan";
+import { useGenerateSquashMessage } from "./RewriteDialogs";
+
+/** Action labels + one-line descriptions for the per-row picker. */
+const ACTIONS: { value: RowAction; label: string; hint: string }[] = [
+  { value: "pick", label: "Pick", hint: "Keep this commit as-is" },
+  {
+    value: "reword",
+    label: "Reword",
+    hint: "Keep the changes, edit the message",
+  },
+  {
+    value: "squash",
+    label: "Squash",
+    hint: "Merge into the commit below, combine messages",
+  },
+  {
+    value: "fixup",
+    label: "Fixup",
+    hint: "Merge into the commit below, keep its message",
+  },
+  {
+    value: "edit",
+    label: "Edit",
+    hint: "Stop to amend this commit's changes",
+  },
+  { value: "drop", label: "Drop", hint: "Remove this commit entirely" },
+];
+const ACTION_LABEL_KEY: Record<RowAction, TranslationKey> = {
+  pick: "editHistoryUi.pick",
+  reword: "editHistoryUi.reword",
+  squash: "editHistoryUi.squash",
+  fixup: "editHistoryUi.fixup",
+  edit: "editHistoryUi.edit",
+  drop: "editHistoryUi.drop",
+};
+const ACTION_HINT_KEY: Record<RowAction, TranslationKey> = {
+  pick: "editHistoryUi.pickHint",
+  reword: "editHistoryUi.rewordHint",
+  squash: "editHistoryUi.squashHint",
+  fixup: "editHistoryUi.fixupHint",
+  edit: "editHistoryUi.editHint",
+  drop: "editHistoryUi.dropHint",
+};
+
+/**
+ * The unified interactive-rebase editor over the unpushed tip (`base..HEAD`).
+ * Each row picks an action (pick / reword / squash / fixup / drop), reorders
+ * with ↑/↓, and edits its message inline; the plan compiles to the replay
+ * engine, which applies it all at once (a conflict rolls it back).
+ */
+export function EditHistoryDialog({
+  repoPath,
+  base,
+  commits,
+  open,
+  onOpenChange,
+  onDone,
+}: {
+  repoPath: string;
+  base: string;
+  /** Editable unpushed commits, newest-first (matches the history list). */
+  commits: CommitSummary[];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onDone: () => void;
+}) {
+  const { t } = useTranslation();
+  const rewrite = useRewriteCommits(repoPath);
+  const rebaseEdit = useRebaseEdit(repoPath);
+  const setRepoTab = useUiStore((s) => s.setRepoTab);
+  const messages = useUnpushedMessages(repoPath, base, open);
+
+  const [order, setOrder] = useState<string[]>(() =>
+    commits.map((c) => c.hash),
+  );
+  const [actions, setActions] = useState<Record<string, RowAction>>({});
+  const [overrides, setOverrides] = useState<Record<string, string>>({});
+
+  // Reseed when a different set of commits arrives (render-time adjustment, the
+  // same pattern as ReorderDialog).
+  const key = commits.map((c) => c.hash).join();
+  const [lastKey, setLastKey] = useState(key);
+  if (key !== lastKey) {
+    setLastKey(key);
+    setOrder(commits.map((c) => c.hash));
+    setActions({});
+    setOverrides({});
+  }
+
+  const subjectOf = useMemo(
+    () => new Map(commits.map((c) => [c.hash, c.subject])),
+    [commits],
+  );
+  const fullMessages = messages.data ?? {};
+
+  // Per-row AI message generation (reword only — a single commit's own diff).
+  // The hash lives in state so render can read which row is generating; the ref
+  // mirrors it for the async completion callback (which fires after streaming).
+  const [genHash, setGenHash] = useState<string | null>(null);
+  const genHashRef = useLatestRef(genHash);
+  const aiEnabled = useAiEnabled();
+  const ai = useGenerateSquashMessage(repoPath, (message) => {
+    const h = genHashRef.current;
+    if (h) setOverrides((o) => ({ ...o, [h]: message }));
+  });
+
+  const rows: EditRow[] = useMemo(
+    () =>
+      order.map((hash) => {
+        const action = actions[hash] ?? "pick";
+        const subject = subjectOf.get(hash) ?? hash.slice(0, 7);
+        // The full original message (or subject until it loads); compilePlan
+        // uses it only for reword/squash leaders and squash contributions.
+        const message = overrides[hash] ?? fullMessages[hash] ?? subject;
+        return { hash, subject, action, message };
+      }),
+    [order, actions, overrides, subjectOf, fullMessages],
+  );
+
+  const originalHashes = useMemo(() => commits.map((c) => c.hash), [commits]);
+  const plan = useMemo(
+    () => compilePlan(rows, originalHashes),
+    [rows, originalHashes],
+  );
+  // reword/squash bake the message into the rewrite, so they can't be applied
+  // until the full bodies have loaded — otherwise a multi-line body would be
+  // silently truncated to its subject.
+  const needsMessages = rows.some(
+    (r) => r.action === "reword" || r.action === "squash",
+  );
+
+  function setAction(hash: string, action: RowAction) {
+    setActions((a) => ({ ...a, [hash]: action }));
+  }
+
+  function move(index: number, delta: -1 | 1) {
+    const target = index + delta;
+    if (target < 0 || target >= order.length) return;
+    const next = [...order];
+    [next[index], next[target]] = [next[target], next[index]];
+    setOrder(next);
+  }
+
+  const busy = rewrite.isPending || rebaseEdit.isPending;
+  // Awaited rather than per-call mutation callbacks: this dialog is mounted
+  // conditionally, so closing it mid-rewrite would drop the outcome — including
+  // the hand-off to the Changes tab that the paused rebase depends on.
+  async function apply() {
+    if (plan.error || !plan.changed) return;
+    if (plan.hasEdit) {
+      // Resumable path: starts a real rebase that pauses at the first Edit —
+      // the conflict/op banner in Changes takes it from there.
+      try {
+        await rebaseEdit.mutateAsync({ base, steps: plan.steps });
+        toast.success(t("editHistoryUi.rebaseStarted"));
+        onOpenChange(false);
+        setRepoTab("changes");
+        onDone();
+      } catch (e) {
+        toastError(e);
+      }
+      return;
+    }
+    try {
+      await rewrite.mutateAsync({ base, steps: plan.steps });
+      toast.success(
+        t(plan.resultCount === 1 ? "editHistoryUi.rewrittenOne" : "editHistoryUi.rewrittenMany", { count: plan.resultCount }),
+      );
+      onOpenChange(false);
+      onDone();
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  return (
+    <Dialog
+      open={open}
+      // Close requests are ignored while the rewrite runs: it is a seconds-scale
+      // local operation whose outcome this dialog still owes the user, and
+      // unmounting mid-flight drops the hand-off to the Changes tab.
+      onOpenChange={(next) => {
+        if (!next && busy) return;
+        onOpenChange(next);
+      }}
+    >
+      {/* The corner X would be a dead control while the guard above swallows
+          every close path, so it goes away for the duration. */}
+      <DialogContent
+        className="flex max-h-[85vh] flex-col sm:max-w-2xl"
+        showCloseButton={!busy}
+      >
+        <DialogHeader>
+          <DialogTitle>{t("editHistoryUi.title")}</DialogTitle>
+          <DialogDescription>
+            {t("editHistoryUi.description")}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="min-h-0 flex-1 space-y-px overflow-y-auto border">
+          {rows.map((row, index) => {
+            const view = plan.views[index];
+            const dropped = row.action === "drop";
+            return (
+              <div
+                key={row.hash}
+                className="border-b last:border-b-0 data-[dropped=true]:bg-muted/30"
+                data-dropped={dropped}
+              >
+                <div className="flex items-center gap-2 px-2 py-1.5">
+                  <DropdownMenu>
+                    <DropdownMenuTrigger
+                      render={
+                        <Button
+                          variant="outline"
+                          size="xs"
+                          disabled={busy}
+                          className="w-20 justify-between"
+                          aria-label={t("editHistoryUi.actionFor", { subject: row.subject })}
+                        >
+                          {t(ACTION_LABEL_KEY[row.action])}
+                          <CaretDownIcon />
+                        </Button>
+                      }
+                    />
+                    <DropdownMenuContent align="start" className="min-w-56">
+                      {ACTIONS.map((a) => (
+                        <DropdownMenuItem
+                          key={a.value}
+                          onClick={() => setAction(row.hash, a.value)}
+                          className="flex-col items-start gap-0.5"
+                        >
+                          <span className="text-xs font-medium">{t(ACTION_LABEL_KEY[a.value])}</span>
+                          <span className="text-[11px] text-muted-foreground">
+                            {t(ACTION_HINT_KEY[a.value])}
+                          </span>
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+
+                  <span className="font-mono text-[11px] text-muted-foreground">
+                    {row.hash.slice(0, 7)}
+                  </span>
+                  <span
+                    className={cn(
+                      "min-w-0 flex-1 truncate text-xs",
+                      dropped && "text-muted-foreground line-through",
+                    )}
+                  >
+                    {row.subject}
+                  </span>
+                  {view.foldInto && (
+                    <span className="shrink-0 text-[11px] text-muted-foreground">
+                      ↳ {view.foldInto}
+                    </span>
+                  )}
+                  {row.action === "edit" && (
+                    <span className="shrink-0 text-[11px] text-muted-foreground">
+                      ↳ {t("editHistoryUi.pausesToAmend")}
+                    </span>
+                  )}
+                  {dropped && (
+                    <span className="shrink-0 text-[11px] text-muted-foreground">
+                      {t("editHistoryUi.removed")}
+                    </span>
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    aria-label={t("editHistoryUi.moveUp", { subject: row.subject })}
+                    disabled={index === 0 || busy}
+                    onClick={() => move(index, -1)}
+                  >
+                    <ArrowUpIcon />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    aria-label={t("editHistoryUi.moveDown", { subject: row.subject })}
+                    disabled={index === order.length - 1 || busy}
+                    onClick={() => move(index, 1)}
+                  >
+                    <ArrowDownIcon />
+                  </Button>
+                </div>
+
+                {view.showMessage && (
+                  <div className="space-y-1 px-2 pb-2 pl-24">
+                    <Textarea
+                      aria-label={`Message for ${row.subject}`}
+                      rows={row.action === "squash" ? 4 : 3}
+                      // Disabled until the full bodies load, so editing can't
+                      // capture a subject-only message and drop the body.
+                      disabled={busy || !messages.isSuccess}
+                      placeholder={
+                        messages.isLoading ? t("editHistoryUi.loadingMessage") : undefined
+                      }
+                      className="max-h-40 min-h-16 resize-y font-mono text-xs"
+                      value={messages.isSuccess ? row.message : ""}
+                      onChange={(e) =>
+                        setOverrides((o) => ({
+                          ...o,
+                          [row.hash]: e.target.value,
+                        }))
+                      }
+                    />
+                    {aiEnabled &&
+                      row.action === "reword" &&
+                      (ai.generating && genHash === row.hash ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="xs"
+                          onClick={ai.cancel}
+                        >
+                          <XIcon data-icon="inline-start" />
+                          {t("editHistoryUi.cancel")}
+                        </Button>
+                      ) : (
+                        <DisabledReasonButton
+                          type="button"
+                          variant="ghost"
+                          size="xs"
+                          disabled={ai.generating || !messages.isSuccess}
+                          title={t("editHistoryUi.generateMessage")}
+                          // `ai.generating` here means ANOTHER row is
+                          // generating — this row's own run renders Cancel.
+                          reason={
+                            ai.generating
+                              ? t("editHistoryUi.anotherGenerating")
+                              : messages.isError
+                                ? t("editHistoryUi.loadMessagesFailed")
+                                : t("editHistoryUi.loadingMessages")
+                          }
+                          onClick={() => {
+                            setGenHash(row.hash);
+                            ai.generate(`${row.hash}^`, row.hash);
+                          }}
+                        >
+                          <SparkleIcon data-icon="inline-start" />
+                          {t("editHistoryUi.generate")}
+                        </DisabledReasonButton>
+                      ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        <DialogFooter className="sm:items-center sm:justify-between">
+          <div className="mr-auto text-xs text-muted-foreground">
+            {messages.isError ? (
+              <span className="text-warning">
+                {t("editHistoryUi.loadMessagesFailed")}{" "}
+                <button
+                  type="button"
+                  className="cursor-pointer underline underline-offset-2"
+                  onClick={() => messages.refetch()}
+                >
+                  {t("editHistoryUi.retry")}
+                </button>
+              </span>
+            ) : plan.error ? (
+              <span className="text-warning">{plan.error}</span>
+            ) : (
+              <>
+                {t("editHistoryUi.result")}:{" "}
+                <span className="tabular-nums text-foreground">
+                  {plan.resultCount}
+                </span>{" "}
+                {t(plan.resultCount === 1 ? "editHistoryUi.commit" : "editHistoryUi.commits")}
+                {plan.hasEdit && (
+                  <span className="block text-[11px]">
+                    {t("editHistoryUi.editPauseHelp")}
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+          <DisabledReasonButton
+            variant="outline"
+            disabled={busy}
+            reason={t("editHistoryUi.rewriteRunning")}
+            onClick={() => onOpenChange(false)}
+          >
+            {t("editHistoryUi.cancel")}
+          </DisabledReasonButton>
+          <Button
+            disabled={
+              busy ||
+              !plan.changed ||
+              plan.error !== null ||
+              (needsMessages && !messages.isSuccess)
+            }
+            onClick={apply}
+          >
+            {busy && <Spinner data-icon="inline-start" />}
+            {plan.hasEdit ? t("editHistoryUi.startRebase") : t("editHistoryUi.rewriteHistory")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}

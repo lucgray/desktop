@@ -1,0 +1,676 @@
+@import "tailwindcss";
+@import "@fontsource-variable/jetbrains-mono";
+
+/* GitDesktop marketing — one mono family (the brand has no second font), a
+   near-achromatic dark canvas matching the app, and ONE brand accent: mint
+   (#4FE0C4, the app icon). Green/red appear only as code semantics: `//` and
+   `+` markers, and inside the real product screenshots. Mint is reserved for
+   brand + interactive. Nothing else carries hue. */
+@theme {
+  --font-sans: "JetBrains Mono Variable", ui-monospace, monospace;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+
+  --color-bg: oklch(0.145 0 0);
+  --color-surface: oklch(0.205 0 0);
+  --color-surface-2: oklch(0.255 0 0);
+  --color-ink: oklch(0.985 0 0); /* headings, strong emphasis */
+  --color-body: oklch(0.84 0 0); /* paragraph text on dark (~8.5:1) */
+  --color-muted: oklch(0.705 0 0); /* secondary / metadata (~5.6:1) */
+  --color-faint: oklch(0.62 0 0); /* fine print / decoration (~4.6:1) */
+  --color-line: oklch(1 0 0 / 0.09);
+  --color-line-2: oklch(1 0 0 / 0.16);
+
+  --color-mint: #4fe0c4;
+  --color-mint-ink: oklch(0.2 0.03 178); /* dark text on mint */
+  --color-add: oklch(0.74 0.13 155); /* code-add green */
+  --color-del: oklch(0.7 0.16 25); /* code-del red */
+
+  --ease-quint: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-expo: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Base resets live in @layer base so Tailwind's later utilities still win
+   (an unlayered `a { color }` would otherwise beat every text-* utility). */
+@layer base {
+  html {
+    background-color: var(--color-bg);
+    color: var(--color-body);
+    font-family: var(--font-mono);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    scroll-behavior: smooth;
+    overflow-x: clip; /* belt-and-suspenders against any wide child */
+  }
+
+  body {
+    margin: 0;
+    line-height: 1.65; /* light-on-dark wants more leading */
+  }
+
+  h1,
+  h2,
+  h3 {
+    color: var(--color-ink);
+    text-wrap: balance;
+    letter-spacing: -0.02em;
+    line-height: 1.06;
+    font-weight: 600;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-mint);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+
+  ::selection {
+    background: var(--color-mint);
+    color: var(--color-bg);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+  }
+}
+
+/* --- Motion: reveal enhances an already-visible default ---------------------
+   Content is fully visible with no JS. Only when the inline head script adds
+   `.js` to <html> do we arm the entrance; an IntersectionObserver then reveals.
+   Reduced-motion users get the final state instantly. */
+@layer base {
+  [data-reveal] {
+    transition:
+      opacity 0.7s var(--ease-quint),
+      transform 0.7s var(--ease-quint);
+  }
+  .js [data-reveal] {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  [data-reveal].is-visible {
+    opacity: 1;
+    transform: none;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .js [data-reveal] {
+      opacity: 1;
+      transform: none;
+    }
+    [data-reveal] {
+      transition: none;
+    }
+  }
+}
+
+/* --- View modes: AI-native (default) vs "Just Git" (AI hidden) ------------
+   Mirrors the app's "hide AI features" setting. The initial class is set
+   pre-paint by an inline head script, so there's no flash of the wrong view. */
+/* Each arm is only ever HIDDEN, never handed a display: data-view sits on
+   sections, list items, paragraphs AND inline count spans, so imposing
+   `display: block` in git mode would blockify the spans and split their
+   parent pills mid-line. html:not() works because the pre-paint script puts
+   the class on documentElement; with no class at all (JS off) the git arm
+   stays hidden — the same default as before. */
+html:not(.mode-git) [data-view="git"] {
+  display: none;
+}
+.mode-git [data-view="ai"] {
+  display: none;
+}
+
+/* --- Product-window frame: present each real screenshot as a native window -- */
+.window {
+  position: relative;
+  border: 1px solid var(--color-line-2);
+  border-radius: 13px;
+  overflow: hidden;
+  background: var(--color-surface);
+  box-shadow:
+    0 1px 0 0 oklch(1 0 0 / 0.04) inset,
+    0 30px 70px -30px rgba(0, 0, 0, 0.8),
+    0 12px 30px -16px rgba(0, 0, 0, 0.65);
+}
+.window img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+/* Mint "active-line" rule — the editor cursor/active-line motif, used sparingly
+   as a section accent. */
+.rule-mint {
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    var(--color-mint) 0,
+    var(--color-mint) 28px,
+    var(--color-line) 28px,
+    var(--color-line) 100%
+  );
+}
+
+/* Faint editor grid for the hero, masked so it never competes with content. */
+.grid-bg {
+  background-image:
+    linear-gradient(var(--color-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--color-line) 1px, transparent 1px);
+  background-size: 58px 58px;
+  mask-image: radial-gradient(
+    ellipse 90% 70% at 50% 0%,
+    #000 25%,
+    transparent 78%
+  );
+}
+
+/* Restrained mint glow, only behind the hero product window. */
+.mint-glow::before {
+  content: "";
+  position: absolute;
+  inset: -12% -8% auto auto;
+  width: 60%;
+  height: 70%;
+  background: radial-gradient(
+    closest-side,
+    oklch(0.82 0.12 178 / 0.22),
+    transparent 70%
+  );
+  filter: blur(40px);
+  pointer-events: none;
+  z-index: -1;
+}
+
+/* --- Agent "watch it work" session motif (stands in for a screenshot) -------- */
+.session {
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+.session-head,
+.session-foot {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.7rem 1rem;
+  color: var(--color-muted);
+  font-size: 0.78rem;
+}
+.session-head {
+  border-bottom: 1px solid var(--color-line);
+  flex-wrap: wrap;
+}
+.session-foot {
+  border-top: 1px solid var(--color-line);
+  flex-wrap: wrap;
+  gap: 0.85rem;
+}
+.session-body {
+  padding: 1rem 1.1rem;
+}
+
+/* Vertical connected steps — each an agent action; nodes light mint as they run. */
+.steps > li {
+  position: relative;
+  padding: 0 0 0.95rem 1.6rem;
+  color: var(--color-body);
+}
+.steps > li:last-child {
+  padding-bottom: 0;
+}
+.steps > li::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 0.36em;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--color-surface-2);
+  border: 1.5px solid var(--color-line-2);
+}
+.steps > li::after {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: calc(0.36em + 11px);
+  bottom: 0;
+  width: 1px;
+  background: var(--color-line);
+}
+.steps > li:last-child::after {
+  display: none;
+}
+.steps > li[data-done]::before {
+  background: var(--color-mint);
+  border-color: var(--color-mint);
+}
+.steps > li[data-active]::before {
+  background: var(--color-mint);
+  border-color: var(--color-mint);
+  box-shadow: 0 0 0 4px oklch(0.82 0.12 178 / 0.16);
+}
+.step-kind {
+  color: var(--color-faint);
+}
+
+/* A small inline diff — as the agent expands one of its edits. */
+.diff-peek {
+  margin-top: 0.5rem;
+  border: 1px solid var(--color-line);
+  border-radius: 7px;
+  overflow: hidden;
+  font-size: 0.76rem;
+  line-height: 1.6;
+  background: oklch(1 0 0 / 0.015);
+}
+.diff-peek > div {
+  padding: 0.02rem 0.6rem;
+  white-space: pre;
+  overflow-x: auto;
+}
+.diff-peek .add {
+  background: oklch(0.74 0.13 155 / 0.1);
+  color: var(--color-add);
+}
+.diff-peek .del {
+  background: oklch(0.7 0.16 25 / 0.1);
+  color: var(--color-del);
+}
+
+/* --- Terminal / code motif (MCP config, capability ladder) ------------------- */
+.terminal {
+  padding: 1.05rem 1.2rem;
+  font-size: 0.8rem;
+  line-height: 1.75;
+  overflow-x: auto;
+  color: var(--color-body);
+  white-space: pre;
+  tab-size: 2;
+}
+.terminal .c {
+  color: var(--color-faint);
+} /* comment */
+.terminal .k {
+  color: var(--color-mint);
+} /* flag / key */
+
+/* Escalating opt-in ladder — the default (read-only) tier reads mint. */
+.ladder > li {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  padding: 0.6rem 0.85rem;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  font-size: 0.85rem;
+  color: var(--color-body);
+}
+/* Row layout once there's room: the flag takes a fixed 20ch track (exactly the
+   longest flag in monospace), so every description lines up. Stacks below 560px. */
+@media (min-width: 560px) {
+  .ladder > li {
+    flex-direction: row;
+    align-items: baseline;
+    gap: 0.85rem;
+  }
+  .ladder .tier {
+    flex: none;
+    width: 20ch;
+  }
+}
+.ladder > li + li {
+  margin-top: 0.5rem;
+}
+.ladder > li[data-default] {
+  border-color: oklch(0.82 0.12 178 / 0.4);
+  background: oklch(0.82 0.12 178 / 0.06);
+}
+.ladder .tier {
+  color: var(--color-faint);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+.ladder code {
+  color: var(--color-ink);
+}
+
+/* Issue-key chip — the Jira `PROJ-123` reference motif. */
+.key-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid var(--color-line-2);
+  border-radius: 6px;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.8rem;
+  color: var(--color-body);
+  background: var(--color-surface);
+  white-space: nowrap;
+}
+
+kbd {
+  font-family: var(--font-mono);
+  font-size: 0.72em;
+  line-height: 1;
+  padding: 0.18em 0.42em;
+  border: 1px solid var(--color-line-2);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  color: var(--color-muted);
+  background: var(--color-surface-2);
+  white-space: nowrap;
+}
+
+/* --- Legal / long-form pages (privacy, terms): mono prose on the dark canvas,
+   styling the bare HTML that Astro renders from Markdown. */
+.legal h1 {
+  font-size: clamp(1.9rem, 4.5vw, 2.6rem);
+  letter-spacing: -0.02em;
+}
+.legal > p:first-of-type em {
+  color: var(--color-muted);
+  font-style: normal;
+  font-size: 0.875rem;
+}
+.legal h2 {
+  font-size: 1.1rem;
+  margin-top: 2.5rem;
+  font-weight: 600;
+}
+.legal p,
+.legal li {
+  max-width: 72ch;
+  line-height: 1.75;
+}
+.legal p {
+  margin-top: 1rem;
+  color: var(--color-body);
+}
+.legal ul {
+  margin-top: 1rem;
+  padding-left: 1.2rem;
+  list-style: disc;
+}
+.legal li {
+  margin-top: 0.45rem;
+  color: var(--color-body);
+}
+.legal li::marker {
+  color: var(--color-faint);
+}
+.legal a {
+  color: var(--color-mint);
+  text-underline-offset: 3px;
+}
+.legal a:hover {
+  text-decoration: underline;
+}
+.legal strong {
+  color: var(--color-ink);
+  font-weight: 600;
+}
+.legal code {
+  background: var(--color-surface-2);
+  padding: 0.12em 0.38em;
+  border-radius: 4px;
+  font-size: 0.88em;
+}
+.legal hr {
+  border: 0;
+  border-top: 1px solid var(--color-line);
+  margin: 2.75rem 0;
+}
+
+/* --- Blog prose -------------------------------------------------------------
+   A SIBLING of .legal, not an extension: .legal covers only h1/h2/p/li/ul/a/
+   strong/code/hr, and widening it would shift privacy + terms every time the
+   blog needs a new element. Long-form is also the one place the mono-only rule
+   needs help — JetBrains Mono's advance is exactly 0.6em, so .legal's 72ch runs
+   691px, and mono forfeits the word-shape variance that gives the eye landmarks
+   across a return sweep. The fix is geometry, not a second font: the brand has
+   one family and a webfont on the page type where people stay longest is the
+   wrong place to break that. */
+.prose {
+  --measure: min(64ch, 100%);
+}
+
+.prose p,
+.prose li {
+  max-width: var(--measure);
+  line-height: 1.75;
+  color: var(--color-body);
+}
+
+/* Hold 16px below sm, where padding is the real constraint, not measure. */
+@media (min-width: 768px) {
+  .prose {
+    font-size: 1.0625rem;
+  }
+}
+
+.prose > * + * {
+  margin-top: 1.15rem;
+}
+
+.prose h2,
+.prose h3,
+.prose h4 {
+  color: var(--color-ink);
+  max-width: var(--measure);
+  text-wrap: balance;
+}
+.prose h2 {
+  font-size: 1.45rem;
+  margin-top: 3rem;
+  letter-spacing: -0.02em;
+}
+.prose h3 {
+  font-size: 1.15rem;
+  margin-top: 2.25rem;
+}
+/* The base reset stops at h3, so h4 would otherwise lose the brand treatment
+   entirely in a long post. */
+.prose h4 {
+  font-size: 1rem;
+  margin-top: 1.75rem;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+/* The sticky header is 57px; nothing else in this file sets scroll-margin, so
+   without this every TOC link and footnote backref lands UNDER the header. */
+.prose :is(h2, h3, h4)[id],
+.prose .footnotes li {
+  scroll-margin-top: 5rem;
+}
+
+/* Underlined, not mint-only: .legal underlines on :hover alone, which is
+   meaning by color alone. Survivable across two legal pages, not at blog link
+   density. */
+.prose a,
+.release .notes a,
+.release .intro a {
+  color: var(--color-mint);
+  text-decoration: underline;
+  text-decoration-color: oklch(0.82 0.12 178 / 0.45);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.prose a:hover,
+.prose a:focus-visible,
+.release .notes a:hover,
+.release .notes a:focus-visible,
+.release .intro a:hover,
+.release .intro a:focus-visible {
+  text-decoration-color: var(--color-mint);
+}
+
+.prose strong,
+.release strong {
+  color: var(--color-ink);
+  font-weight: 600;
+}
+.prose em,
+.release em {
+  font-style: italic;
+}
+
+.prose ul,
+.prose ol {
+  padding-left: 1.3rem;
+  max-width: var(--measure);
+}
+.prose ul {
+  list-style: disc;
+}
+.prose ol {
+  list-style: decimal;
+}
+.prose li + li {
+  margin-top: 0.4rem;
+}
+.prose li::marker,
+.release .notes li::marker {
+  color: var(--color-faint);
+}
+
+.prose blockquote {
+  border-left: 1px solid var(--color-line-2);
+  padding-left: 1.1rem;
+  color: var(--color-muted);
+  max-width: var(--measure);
+}
+
+.prose :not(pre) > code,
+.release code {
+  background: var(--color-surface-2);
+  padding: 0.12em 0.38em;
+  border-radius: 4px;
+  font-size: 0.88em;
+  color: var(--color-ink);
+}
+
+/* Changelog page (/changelog/): .release/.notes markup is the set:html output
+   of lib/changelog.ts, sharing .prose's link/strong/em/code/marker rules
+   above. Never a bare `.release a` — these rules are unlayered, so it would
+   outrank the article-header links' utility classes; that same unlayered
+   position is what lets the scrollspy rule below beat the rail link's
+   `text-muted`. */
+.release .notes {
+  list-style: disc;
+}
+.release .notes li {
+  max-width: 76ch;
+  line-height: 1.75;
+  color: var(--color-body);
+}
+[data-nav-version][aria-current="location"] {
+  color: var(--color-ink);
+  font-weight: 500;
+}
+
+/* html sets `overflow-x: clip`, which — unlike hidden — creates NO scroll
+   container, so a wide table or an 80-column code line would be permanently
+   unreachable rather than scrollable. Same precedent as .terminal / .diff-peek. */
+.prose pre {
+  border: 1px solid var(--color-line);
+  border-radius: 9px;
+  padding: 1rem 1.15rem;
+  overflow-x: auto;
+  font-size: 0.84rem;
+  line-height: 1.7;
+  background: oklch(1 0 0 / 0.015);
+  tab-size: 2;
+}
+.prose pre code {
+  background: none;
+  padding: 0;
+  font-size: inherit;
+}
+
+/* Shiki's `css-variables` theme, mapped onto the tokens already in use so code
+   reads as the same system as .terminal. (Astro 5 renamed these from
+   --astro-code-color-text/-background.) */
+.prose pre.astro-code {
+  --astro-code-foreground: var(--color-body);
+  /* Shiki inlines `background-color: var(--astro-code-background)` on the
+     <pre>, which beats any stylesheet `background` — so the tint has to ride
+     the VARIABLE. (.prose pre's own background still covers non-Shiki pre.) */
+  --astro-code-background: oklch(1 0 0 / 0.015);
+  --astro-code-token-comment: var(--color-faint);
+  --astro-code-token-keyword: var(--color-mint);
+  --astro-code-token-string: var(--color-add);
+  --astro-code-token-string-expression: var(--color-add);
+  --astro-code-token-function: var(--color-ink);
+  --astro-code-token-constant: var(--color-ink);
+  --astro-code-token-parameter: var(--color-body);
+  --astro-code-token-punctuation: var(--color-muted);
+  --astro-code-token-link: var(--color-mint);
+}
+
+/* The rehype plugin in astro.config.mjs wraps every markdown table in this
+   div, so the WRAPPER owns horizontal overflow (html's `overflow-x: clip`
+   would otherwise make a wide table unreachable) and the table keeps real
+   table display — display:block on the table itself would drop implicit
+   table semantics for assistive tech in some engines. */
+.prose .table-wrap {
+  overflow-x: auto;
+}
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+.prose th,
+.prose td {
+  border-bottom: 1px solid var(--color-line);
+  padding: 0.55rem 0.9rem 0.55rem 0;
+  text-align: left;
+  vertical-align: top;
+}
+.prose th {
+  color: var(--color-ink);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.prose figure {
+  max-width: 100%;
+}
+.prose figcaption {
+  margin-top: 0.6rem;
+  font-size: 0.82rem;
+  color: var(--color-muted);
+}
+.prose img {
+  border-radius: 9px;
+  border: 1px solid var(--color-line);
+}
+
+.prose hr {
+  border: 0;
+  border-top: 1px solid var(--color-line);
+  margin: 2.75rem 0;
+}
+
+.prose .footnotes {
+  margin-top: 3rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--color-line);
+  font-size: 0.9rem;
+  color: var(--color-muted);
+}
+.prose .footnotes h2 {
+  font-size: 0.85rem;
+  color: var(--color-muted);
+  margin-top: 0;
+}

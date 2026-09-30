@@ -1,0 +1,5639 @@
+//! The provider abstraction — one neutral interface over GitHub, GitLab, and
+//! Bitbucket so hosted features (PRs/MRs, issues, CI, settings) work regardless
+//! of where a repo is hosted.
+//!
+//! Transport per provider: GitHub shells `gh`, GitLab shells `glab`, Bitbucket
+//! Cloud speaks direct HTTP — all behind the [`Forge`] trait. Each `forge_*`
+//! command dispatches on the detected provider; which features are wired per
+//! provider is declared in `model.rs::Implemented`.
+
+pub mod accounts;
+pub mod background;
+pub mod bitbucket;
+pub mod bitbucket_findings;
+pub mod cnb;
+pub mod cnb_build;
+pub mod cnb_my_work;
+pub mod cnb_pr;
+pub mod github;
+pub mod gitlab;
+pub mod gitlab_findings;
+pub mod glab;
+pub mod http;
+pub mod jira;
+pub mod model;
+pub mod my_work;
+pub mod session;
+
+use crate::error::{AppError, AppResult};
+use crate::forge::bitbucket::BitbucketForge;
+use crate::forge::cnb::CnbForge;
+use crate::forge::github::GitHubForge;
+use crate::forge::gitlab::GitLabForge;
+use crate::forge::model::{
+    Capabilities, ForgeForkActivity, ForgeForkDivergence, ForgeForkResult, ForgeRepoList,
+    ForgeSearchList, ForgeStatus, Implemented, Provider, ProviderFeatures,
+};
+
+/// A hosted-git provider GitDesktop can talk to — one method per hosted
+/// capability. Called via static dispatch over concrete impls, so there's no
+/// `dyn`/async-trait machinery.
+#[allow(async_fn_in_trait)]
+pub trait Forge {
+    /// Whether the hosted integration is usable for this repo, on which host, as
+    /// whom, and what it supports.
+    async fn status(&self, repo_path: &str) -> AppResult<ForgeStatus>;
+}
+
+/// Split a leading bracketed IPv6 literal off an authority, yielding the `[…]` span
+/// (brackets included) and whatever follows the `]`. `None` for an unterminated `[`,
+/// an empty `[]`, or a `/` inside the span — no IPv6 literal carries one, and refusing
+/// it here keeps callers that pre-split on `/` and callers that don't (`remote_path`'s
+/// scp arm) agreeing on malformed spans. The URL-decomposition idioms, the authority
+/// gate, and glab's hosts-key normalizer share it so a literal's own `:`s can never be
+/// mistaken for a port or an scp path separator.
+pub(crate) fn bracketed_split(rest: &str) -> Option<(&str, &str)> {
+    let after_open = rest.strip_prefix('[')?;
+    let close = after_open.find(']')?;
+    if after_open[..close].contains('/') {
+        return None;
+    }
+    // `[]` carries no address, so it's no host either.
+    (close > 0).then(|| (&rest[..close + 2], &after_open[close + 1..]))
+}
+
+/// The host of a remote URL — both `https://host[:port]/…` and scp-style
+/// `git@host:owner/…`. Lowercased; `None` when there's no parseable host (a local
+/// path, say). Tolerates an optional `user@` and a `:port`.
+///
+/// Derived from [`remote_authority`] minus its port, so a URL has a host EXACTLY when it
+/// has an authority: the session health probe reads the two side by side under paired
+/// `unwrap_or_else` fallbacks, and any Some/None asymmetry there would probe one repo's
+/// host against the github.com default.
+///
+/// A bracketed IPv6 literal keeps its brackets (`[2001:db8::1]`) — git's own
+/// credential-context spelling (measured against git 2.51); a bare `2001:db8::1` would
+/// read as host `2001` plus a garbage port to every downstream `host[:port]` splitter.
+pub(crate) fn remote_host(url: &str) -> Option<String> {
+    let authority = remote_authority(url)?;
+    // A bracketed literal's host is its span; otherwise the first `:` opens the port.
+    let host = bracketed_split(&authority)
+        .map_or_else(|| authority.split(':').next().unwrap_or(&authority), |(span, _)| span);
+    Some(host.to_string())
+}
+
+/// A TCP port as a URL spells one: 1-5 ASCII digits. Deliberately not range-checked —
+/// git and the CLIs reject an out-of-range port themselves; this only has to guarantee
+/// the segment carries no config or shell syntax.
+fn is_port(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 5 && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Whether a string is safe to interpolate as the authority of a `credential.https://…`
+/// config key or a `--hostname` argv: host `[A-Za-z0-9.-]+`, or a bracketed IPv6 literal
+/// whose interior is non-empty, drawn from `[0-9A-Fa-f:.]`, and carries at least one `:`
+/// (RFC 3986 brackets are IPv6-only, so requiring the colon costs nothing and tightens
+/// the gate); either form plus an optional numeric port. A zone id (`%eth0`) is
+/// deliberately NOT admitted: `%` is encoding/config syntax in a credential key, and the
+/// CLIs don't police it themselves (glab 1.105 accepts a zone-id hostname, measured), so
+/// this gate is the layer that keeps it out of keys and argv. THE
+/// reconnect/credential host grammar — `valid_reconnect_host` delegates here and
+/// `isReconnectHostSafe` (`src/lib/git/host.ts`) mirrors it, so the three can't drift.
+/// Needed because `remote_host`/`remote_authority` only split on `/`, `:` and the
+/// bracket span, so a crafted remote can carry `=`, `;`, `$`, or a space through them.
+/// A charset gate, not an IPv6 validator: `[:]` passes both sides, and that's fine —
+/// it's injection-safe garbage git will reject on its own.
+pub(crate) fn is_safe_authority(value: &str) -> bool {
+    // Bracketed literals resolve first: their own `:`s make a first-`:` split wrong.
+    // Sharing `bracketed_split` keeps the gate's idea of the span identical to the
+    // parsers' (it already refuses an unterminated `[` and an empty `[]`).
+    if value.starts_with('[') {
+        let Some((span, after)) = bracketed_split(value) else {
+            return false;
+        };
+        let inner = &span[1..span.len() - 1];
+        if !inner.contains(':')
+            || !inner
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+        {
+            return false;
+        }
+        return match after.strip_prefix(':') {
+            Some(port) => is_port(port),
+            None => after.is_empty(),
+        };
+    }
+    let (host, port) = match value.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (value, None),
+    };
+    if host.is_empty() || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return false;
+    }
+    port.is_none_or(is_port)
+}
+
+/// The `host[:port]` AUTHORITY of a remote URL — [`remote_host`] plus the port it
+/// drops, when that port is one (see [`is_port`]); a non-numeric segment is not a port
+/// and yields the bare host. Host lowercased; `None` on no parseable host. Three
+/// URL-decomposition idioms live here and each has one job: `remote_host` (bare host)
+/// for gates, routing and detection; `remote_authority` for credential-helper keys;
+/// [`fork_url_from_origin`]'s path-splice for preserving a whole URL.
+///
+/// scp form (`git@host:path`) yields the BARE host — that `:` is a path separator and
+/// scp syntax has no port slot (ported SSH uses `ssh://`), and ssh remotes never reach
+/// the https-gated credential paths anyway.
+///
+/// A real port is returned as written, no `:443` special-casing: measured against git
+/// 2.51 (`git credential fill`, isolated config), a `host:port` key matches a ported
+/// request, git normalizes the DEFAULT port both directions, and a portless key does NOT
+/// match a `:8443` request — so the authority is the only key that always matches.
+///
+/// A bracketed IPv6 literal yields `[addr]` or `[addr]:port`, git's own spelling for
+/// those requests (same measurement). After `]`, only the `:`-led port slot may follow;
+/// any other remainder is no authority, in either regime. A scheme URL carries a real
+/// port and drops a non-port to the bare host (same posture as the unbracketed arm);
+/// in scp form the `:` after `]` opens the path, so the bare host comes back. An
+/// unterminated `[` or an empty `[]` is no host.
+pub(crate) fn remote_authority(url: &str) -> Option<String> {
+    let url = url.trim();
+    let (had_scheme, rest) = match url.split_once("://") {
+        Some((_, after)) => (true, after),
+        None => (false, url),
+    };
+    // Drop an optional `user@` (rsplit so `user@host` keeps `host`).
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    // The authority ends at the first `/`; a bracketed literal can't contain one, so
+    // this split is safe to take before the bracket span is resolved.
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.starts_with('[') {
+        let (host, after) = bracketed_split(authority)?;
+        let host = host.to_ascii_lowercase();
+        // Either regime: a remainder that isn't the `:`-led port slot is no authority.
+        if !after.is_empty() && !after.starts_with(':') {
+            return None;
+        }
+        // scp `git@[addr]:path` has no port slot — that `:` is the path separator.
+        if !had_scheme || after.is_empty() {
+            return Some(host);
+        }
+        let after = after.strip_prefix(':')?;
+        // Same posture as the non-bracketed arm below: only a real port is carried.
+        return Some(if is_port(after) {
+            format!("{host}:{after}")
+        } else {
+            host
+        });
+    }
+    // Without a scheme the remaining `:` is scp's path separator, so trim there too.
+    let authority = if had_scheme {
+        authority
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    let (host, port) = match authority.split_once(':') {
+        // Only a real 1-5 digit port is carried. Anything else — an empty port, a mangled
+        // IPv6 fragment, or a crafted `443.helper=!cmd #` — falls back to the bare host:
+        // this string is interpolated into a `-c credential.https://…` key, and git splits
+        // a `-c` at its FIRST `=`, so a non-numeric port smuggles an attacker-chosen
+        // `!`-shell helper onto a key that still matches the real host.
+        Some((h, p)) if is_port(p) => (h, Some(p)),
+        Some((h, _)) => (h, None),
+        None => (authority, None),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let host = host.to_ascii_lowercase();
+    Some(match port {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+/// The `owner/name` (or `group/subgroup/name`) path of a remote URL — the part
+/// after the host, with any `.git` suffix and surrounding slashes trimmed.
+/// Complements [`remote_host`]; `None` when there's no path. Handles both
+/// `https://host[:port]/path` and scp-style `git@host:path`: with a scheme a `:`
+/// is a port (path starts after the next `/`), without one it's the scp path
+/// separator — counted past a bracketed IPv6 literal, whose own `:`s would otherwise
+/// cut the host short. Used to address a repo on a provider's API (e.g. a GitLab
+/// project).
+///
+/// Gated on [`remote_authority`]: a URL it refuses has no path either, so the pair
+/// can't diverge — [`fork_url_from_origin`] splices from this path alone, and a
+/// divergence would build a fork URL on a malformed origin.
+pub(crate) fn remote_path(url: &str) -> Option<String> {
+    let url = url.trim();
+    remote_authority(url)?;
+    let (had_scheme, rest) = match url.split_once("://") {
+        Some((_, after)) => (true, after),
+        None => (false, url),
+    };
+    // Drop an optional `user@` (rsplit so `user@host` keeps `host`).
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    let path = if had_scheme {
+        // `host[:port]/path` → everything after the first `/`.
+        rest.split_once('/').map(|(_, after)| after)?
+    } else {
+        // scp `host:path` → everything after the first `:`, counted past a bracketed
+        // IPv6 literal so the address's own `:`s aren't read as the separator.
+        let after_host = if rest.starts_with('[') {
+            bracketed_split(rest)?.1
+        } else {
+            rest
+        };
+        after_host.split_once(':').map(|(_, after)| after)?
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+/// A remote's web (browser) URL — `{scheme}://{authority}/{path}`. `None` when the
+/// remote has no parseable host+path.
+///
+/// The scheme is preserved for an explicit `http://` origin — a self-managed
+/// instance without TLS termination (the plain-HTTP Gitea case
+/// [[push-failure-classification-task]] already handles) serves its web UI over
+/// `http`, and forcing `https` would point the browser at a listener that never
+/// answers there. Every other form — `https://`, any non-http(s) scheme, and
+/// scp-style `git@host:path` (no scheme to read at all) — defaults to `https`: a
+/// non-http(s) transport (`ssh://`, `git://`, `git+ssh://`, …) carries no
+/// information about the web UI's scheme, so `https` is the reasonable
+/// assumption, and matches what `https://` origins already say.
+///
+/// A non-http(s) scheme also carries its OWN transport port — a self-managed host
+/// commonly exposes git-over-SSH on a non-default port (2222 is the standard
+/// workaround when the host OS already owns 22) or git-daemon on 9418, while the
+/// web UI stays on 443, so that port is dropped rather than reused as a bogus web
+/// port ([`remote_host`], bare). The `http`/`https` schemes are the ONLY ones whose
+/// port IS the web port: a self-managed instance conventionally serves
+/// git-over-http(s) and the web UI on the SAME port ([`remote_authority`], kept).
+/// scp-style `git@host:path` structurally carries no port to begin with, so which
+/// branch it takes doesn't matter.
+///
+/// The authority is gated through [`is_safe_authority`]: unlike [`remote_path`]'s
+/// callers (git argv, API path segments the CLI itself validates), this string is
+/// handed to the OS URL opener, and neither `remote_host` nor `remote_authority`
+/// charset-checks the host — only a malformed port falls back to the bare host. A
+/// crafted origin (`https://evil.com;rm -rf /path`) would otherwise reach the opener
+/// verbatim.
+pub(crate) fn web_repo_url(remote_url: &str) -> Option<String> {
+    let trimmed = remote_url.trim_start();
+    let is_plain_http = trimmed.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://"));
+    let is_https = trimmed.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://"));
+    let has_non_web_scheme = !is_plain_http && !is_https && trimmed.contains("://");
+    let scheme = if is_plain_http { "http" } else { "https" };
+    let authority = if has_non_web_scheme {
+        remote_host(remote_url)
+    } else {
+        remote_authority(remote_url)
+    }
+    .filter(|a| is_safe_authority(a))?;
+    let path = remote_path(remote_url)?;
+    Some(format!("{scheme}://{authority}/{path}"))
+}
+
+/// A remote's WEB authority — `host[:port]` as the provider's own web URL would
+/// spell it, lowercased, or `None` when there's no parseable host. The axis that
+/// distinguishes two instances sharing a hostname on different ports, which
+/// [`remote_host`] cannot see (it strips every port) and [`remote_authority`]
+/// over-reports (it keeps `:443`, deliberately, for credential keys).
+///
+/// The port rules follow the scheme, matching [`web_repo_url`]'s reasoning:
+///  - `https://` — `:443` elided, any other port kept.
+///  - `http://` — `:80` elided, any other port kept.
+///  - scp-style `git@host:path` — carries no port at all; that `:` opens the path.
+///  - ANY other scheme (`ssh://`, `git://`, …) — the port is DROPPED, not kept: it
+///    is a transport port, never the web port. A self-managed host commonly serves
+///    git-over-SSH on 2222 while its web UI stays on 443, so carrying `:2222` here
+///    would make that checkout fail to match its own instance's items.
+///
+/// The elision is what keeps this comparable with the FRONTEND's spelling: the
+/// item side parses a provider web URL with the browser's `URL`, whose `host`
+/// natively elides a scheme-default port (measured: `https://h:443/x` → `h`,
+/// `https://h:8443/x` → `h:8443`). An un-elided `:443` here would mismatch every
+/// default-port item.
+pub(crate) fn web_authority(url: &str) -> Option<String> {
+    let trimmed = url.trim_start();
+    let is_plain_http = trimmed
+        .get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("http://"));
+    let is_https = trimmed
+        .get(..8)
+        .is_some_and(|s| s.eq_ignore_ascii_case("https://"));
+    // A non-web scheme's port belongs to its transport, so only the host survives.
+    if !is_plain_http && !is_https && trimmed.contains("://") {
+        return remote_host(url);
+    }
+    let authority = remote_authority(url)?;
+    let default_port = if is_plain_http { ":80" } else { ":443" };
+    Some(
+        authority
+            .strip_suffix(default_port)
+            .map(str::to_string)
+            .unwrap_or(authority),
+    )
+}
+
+/// Percent-encode a value for an API query string (RFC-3986 unreserved kept,
+/// everything else encoded) — an unencoded `&`/`#`/`?`/`=`/`%`/space corrupts the
+/// query. Shared by the GitLab (`glab api`) and Bitbucket (HTTP) providers, which
+/// interpolate untrusted branch names and search terms.
+pub(crate) fn encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Whether a single repo/owner path *segment* is safe to interpolate into a CLI
+/// arg or URL path. The character set is alphanumerics, dots, underscores, and
+/// hyphens; the FIRST char may be an alphanumeric, a dot, or an underscore (so
+/// legitimate config repos like `.github` / `.gitlab` and `_name` are allowed),
+/// but NEVER a hyphen — a `-`-leading value would be read as a flag by gh/glab.
+/// The two pure-traversal segments `.` and `..` are rejected outright, as is the
+/// empty string. A `/` never appears in a segment (the caller splits on it).
+fn is_valid_path_segment(seg: &str) -> bool {
+    if seg.is_empty() || seg == "." || seg == ".." {
+        return false;
+    }
+    let mut chars = seg.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() || c == '.' || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
+/// Validate a repository `name` against the safe grammar, returning it on success
+/// or an [`AppError::InvalidArgument`] otherwise. A name is a single segment (no
+/// slashes) — used before interpolating into a `gh`/`glab` arg or an API URL path.
+pub(crate) fn validate_repo_name(name: &str) -> AppResult<()> {
+    if is_valid_path_segment(name) {
+        Ok(())
+    } else {
+        Err(AppError::InvalidArgument(format!(
+            "invalid repository name: {name}"
+        )))
+    }
+}
+
+/// Validate an `owner` against the safe grammar. A GitHub/Bitbucket owner is a
+/// single segment; a GitLab owner may be a nested group path (`group/subgroup`),
+/// so each `/`-separated segment is validated independently. An empty owner or any
+/// segment that fails the grammar is rejected.
+pub(crate) fn validate_owner(owner: &str) -> AppResult<()> {
+    if !owner.is_empty() && owner.split('/').all(is_valid_path_segment) {
+        Ok(())
+    } else {
+        Err(AppError::InvalidArgument(format!("invalid owner: {owner}")))
+    }
+}
+
+/// Max README size returned to the frontend (~300 KB); larger bodies are
+/// truncated on a char boundary by [`cap_readme`].
+const README_CAP: usize = 300 * 1024;
+
+/// README filenames each provider probes in order; the first that exists wins.
+/// (GitHub is absent — its API serves the README from a dedicated endpoint.)
+pub(crate) const README_CANDIDATES: &[&str] = &["README.md", "readme.md", "README.rst", "README"];
+
+/// Fork-readiness poll cadence, shared by all three providers' `poll_fork_ready`:
+/// a fork is freshly created and may not be gettable/populated yet, so each polls
+/// its own readiness signal on this bound and reports `false` (never an error) when
+/// it expires.
+pub(crate) const FORK_POLL_ATTEMPTS: u32 = 5;
+/// Delay between fork-readiness attempts (skipped before the first).
+pub(crate) const FORK_POLL_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How many forks the Insights fork-activity card lists. Shared by all three
+/// providers so the card's length is provider-independent: GitLab and Bitbucket ask
+/// their server for exactly this many, GitHub ranks a larger page down to it (its
+/// `/forks` endpoint can't sort by push date).
+pub(crate) const FORK_LIST_CAP: usize = 10;
+
+/// Cap a README body at [`README_CAP`] bytes, truncating on a UTF-8 `char`
+/// boundary (never mid code-point).
+pub(crate) fn cap_readme(body: &str) -> String {
+    if body.len() <= README_CAP {
+        return body.to_string();
+    }
+    let mut end = README_CAP;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    body[..end].to_string()
+}
+
+/// Drive a set of futures CONCURRENTLY and collect their results in input order — a
+/// tiny local `join_all` so we don't pull in the `futures` crate. All futures share
+/// this task (no spawn), so they may borrow non-`'static` data; each poll advances
+/// every not-yet-ready future. Shared by the forge providers (GitLab health probes,
+/// Bitbucket per-workspace search).
+pub(crate) async fn futures_join_all<F, T>(futures: impl IntoIterator<Item = F>) -> Vec<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    use std::future::poll_fn;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    let mut pinned: Vec<Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut results: Vec<Option<T>> = (0..pinned.len()).map(|_| None).collect();
+
+    poll_fn(|cx| {
+        let mut all_done = true;
+        for (i, fut) in pinned.iter_mut().enumerate() {
+            if results[i].is_none() {
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready(v) => results[i] = Some(v),
+                    Poll::Pending => all_done = false,
+                }
+            }
+        }
+        if all_done {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+
+    results
+        .into_iter()
+        .map(|r| r.expect("all futures ready"))
+        .collect()
+}
+
+/// Route a remote host to a non-GitHub provider only when it's unmistakably
+/// GitLab.com or Bitbucket Cloud. github.com, Enterprise, and unknown hosts return
+/// `None` so `gh`'s own (Enterprise-aware) detection stays authoritative.
+/// Self-managed GitLab is indistinguishable from GHE by host alone and is resolved
+/// in [`detect_non_github`] via glab's signed-in host list.
+fn provider_for_host(host: &str) -> Option<Provider> {
+    match host {
+        "gitlab.com" => Some(Provider::GitLab),
+        "bitbucket.org" => Some(Provider::Bitbucket),
+        "cnb.cool" => Some(Provider::Cnb),
+        _ => None,
+    }
+}
+
+/// Detect a non-GitHub provider from `origin`, with its host. Canonical hosts match
+/// directly; any other host glab is signed in to is self-managed GitLab (glab carries
+/// per-host auth, so downstream `glab` calls just work there). Any failure — no
+/// remote, git error, unparseable URL, unknown host — returns `None` so GitHub stays
+/// the resilient default and `gh` decides readiness.
+pub(crate) async fn detect_non_github(repo_path: &str) -> Option<(Provider, String)> {
+    let url = crate::git::remote::git_remote_url(repo_path.to_string(), "origin".to_string())
+        .await
+        .ok()?;
+    let host = remote_host(&url)?;
+    let authority = remote_authority(&url).unwrap_or_else(|| host.clone());
+    if let Some(p) = provider_for_host(&host) {
+        return Some((p, host));
+    }
+    // Skip the config read for the overwhelmingly common case.
+    if host == "github.com" {
+        return None;
+    }
+    if glab::known_hosts().await.iter().any(|saved| saved == &host || saved == &authority)
+        || accounts::list().await.ok().is_some_and(|accounts| accounts.iter().any(|account| account.provider == Provider::GitLab && account.host == authority)) {
+        return Some((Provider::GitLab, authority));
+    }
+    None
+}
+
+/// The one-shot `-c credential.https://<authority>.helper` entries authenticating a
+/// network op on `remote`, resolved to the provider CLI's ABSOLUTE path. The
+/// provider comes from the REQUESTED remote's own host, so a cross-forge
+/// origin/upstream pair each gets the right CLI's helper.
+///
+/// The injection is a `[reset, helper]` PAIR (blank reset entry, then the CLI
+/// helper — what `gh auth setup-git` writes): git stops at the first helper that
+/// returns a complete credential, so an ambient osxkeychain/GCM entry holding a
+/// stale-but-valid credential would otherwise shadow the CLI and act as the wrong
+/// identity. The gates prove a credential EXISTS, not that it WORKS, so
+/// [`crate::git::remote::run_git_mutating_with_creds`] retries once with ambient
+/// auth on an auth-class failure. The CLONE path (`repo.rs` `extra_config`)
+/// deliberately stays strict-injection with no fallback.
+///
+/// Empty (→ git's ambient behavior) for SSH remotes, a missing remote, and an absent
+/// or unauthenticated provider CLI — fail-open, so a GCM user's fetches keep working.
+/// An UNKNOWN HTTPS host takes the GitHub-default route, whose gh gate injects the
+/// pair only when gh holds a token for that host — that is what makes a signed-in
+/// GitHub Enterprise host work, and yields nothing otherwise.
+///
+/// Bitbucket has no CLI: it SEEDS git's credential store with the
+/// `x-bitbucket-api-token-auth` sentinel ([`bitbucket::seed_git_credential`]) and,
+/// on a successful seed only, returns [`bitbucket::bitbucket_credential_entries`]
+/// (interactive-helper suppression + a transient `insteadOf` rewrite for `user@`
+/// remotes).
+pub async fn credential_config_for_remote(repo_path: &str, remote: &str) -> AppResult<Vec<String>> {
+    let url = match crate::git::remote::git_remote_url(repo_path.to_string(), remote.to_string()).await
+    {
+        Ok(u) => u,
+        Err(_) => return Ok(Vec::new()),
+    };
+    if !is_https_remote(&url) {
+        if remote_host(&url).as_deref() == Some("cnb.cool") {
+            return Err(AppError::InvalidArgument("CNB Git remotes require HTTPS".into()));
+        }
+        return Ok(Vec::new()); // SSH → keys, not helpers
+    }
+    let Some(host) = remote_host(&url) else {
+        return Ok(Vec::new());
+    };
+    // Classify by the REQUESTED remote's own host (mirrors `detect_non_github`);
+    // only an unrecognized host pays for the glab-known-hosts config read.
+    let provider = if host == "github.com" || provider_for_host(&host).is_some() {
+        provider_for_remote_host(&host, &[])
+    } else {
+        // Any other host glab is signed in to is self-managed GitLab — mirrors detect_non_github.
+        let mut gitlab_hosts = glab::known_hosts().await;
+        if let Ok(registered) = accounts::list().await {
+            gitlab_hosts.extend(registered.into_iter().filter(|account| account.provider == Provider::GitLab).map(|account| account.host));
+        }
+        let authority = remote_authority(&url).unwrap_or_else(|| host.clone());
+        if gitlab_hosts.iter().any(|saved| saved == &authority) {
+            Some(Provider::GitLab)
+        } else {
+            provider_for_remote_host(&host, &gitlab_hosts)
+        }
+    };
+    let target_provider = provider.unwrap_or(Provider::GitHub);
+    let account_host = remote_authority(&url).unwrap_or_else(|| host.clone());
+    let selected = if let Some(id) = accounts::binding_for_repo(repo_path).await? {
+        Some(accounts::list().await?.into_iter().find(|account| account.id == id)
+            .ok_or_else(|| AppError::Command("Selected repository account no longer exists".into()))?)
+    } else {
+        accounts::active(target_provider, &account_host).await?
+    };
+    if let Some(bound) = selected {
+        if bound.provider == target_provider && bound.host.eq_ignore_ascii_case(&account_host) {
+            match bound.provider {
+                Provider::GitHub => {
+                    let authority = remote_authority(&url)
+                        .ok_or_else(|| AppError::InvalidArgument("Invalid GitHub remote host".into()))?;
+                    let token = match bound.source {
+                        accounts::AccountSource::Cli => crate::github::runner::bound_cli_token(&authority, &bound.login).await?,
+                        accounts::AccountSource::Managed => accounts::managed_token(&bound).await?,
+                    };
+                    return accounts::seed_git_credential(&url, &bound.login, &token).await;
+                }
+                Provider::GitLab if bound.source == accounts::AccountSource::Managed => {
+                    let token = accounts::managed_token(&bound).await?;
+                    return accounts::seed_git_credential(&url, &bound.login, &token).await;
+                }
+                Provider::GitLab if bound.source == accounts::AccountSource::Cli => {
+                    let config = gitlab::clone_credential_config(&url).await?;
+                    if config.is_empty() {
+                        return Err(AppError::Glab("Selected GitLab CLI account cannot authenticate this Git remote".into()));
+                    }
+                    return Ok(config);
+                }
+                Provider::Bitbucket if bound.source == accounts::AccountSource::Managed => {
+                    let token = http::load_credentials_for_repo(repo_path).await?.token;
+                    let stripped = bitbucket::strip_https_userinfo(&url);
+                    let mut extra = accounts::seed_git_credential(&stripped, "x-bitbucket-api-token-auth", &token).await?;
+                    extra.extend(bitbucket::bitbucket_credential_entries(&url));
+                    return Ok(extra);
+                }
+                Provider::Cnb => {}
+                _ => {}
+            }
+        }
+    }
+    // Fail open when the CLI can't be resolved — ambient auth (e.g. GCM) must keep working.
+    match provider {
+        Some(Provider::GitLab) => Ok(gitlab::clone_credential_config(&url).await.unwrap_or_default()),
+        Some(Provider::Bitbucket) => {
+            let creds = http::load_credentials_for_repo(repo_path).await?;
+            let stripped = bitbucket::strip_https_userinfo(&url);
+            let mut extra = accounts::seed_git_credential(&stripped, "x-bitbucket-api-token-auth", &creds.token).await?;
+            extra.extend(bitbucket::bitbucket_credential_entries(&url));
+            Ok(extra)
+        }
+        Some(Provider::Cnb) => {
+            let extra = cnb::git_credential_entries(&url)?;
+            cnb::seed_git_credential_for_repo(repo_path, &url).await?;
+            Ok(extra)
+        }
+        _ => Ok(github::clone_credential_config(&url).await.unwrap_or_default()),
+    }
+}
+
+/// The provider a host maps to — like [`detect_non_github`] but for an arbitrary
+/// remote's host. Canonical hosts match directly; any OTHER host in `glab_hosts` is
+/// self-managed GitLab; github.com / GHE / unknown → `None` (gh-default routing).
+/// Pure/sync for unit tests — the caller supplies `glab_hosts`.
+fn provider_for_remote_host(host: &str, glab_hosts: &[String]) -> Option<Provider> {
+    if let Some(p) = provider_for_host(host) {
+        return Some(p);
+    }
+    if host != "github.com" && glab_hosts.iter().any(|h| h == host) {
+        return Some(Provider::GitLab);
+    }
+    None
+}
+
+/// True when a remote URL uses HTTPS (credential helpers apply). SSH forms
+/// (`git@host:…`, `ssh://…`) and others return false — as does plain `http://`,
+/// since the helper entry we format keys on `credential.https://…` and would
+/// never match an http remote anyway. The scheme is matched case-insensitively —
+/// schemes are case-insensitive per RFC 3986, and a `HTTPS://` remote that read as
+/// non-https would silently skip the helper injection.
+fn is_https_remote(url: &str) -> bool {
+    url.trim()
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+}
+
+/// The provider tag the frontend keys labels on (`"github"`/`"gitlab"`/
+/// `"bitbucket"`), or `None` for unrecognized hosts (the UI treats those as GitHub,
+/// matching the routing above). `glab_hosts` is passed in so batch callers read the
+/// config once.
+pub(crate) fn provider_tag_for_host(host: &str, glab_hosts: &[String]) -> Option<&'static str> {
+    match provider_for_host(host) {
+        Some(Provider::GitLab) => Some("gitlab"),
+        Some(Provider::Bitbucket) => Some("bitbucket"),
+        Some(Provider::Cnb) => Some("cnb"),
+        Some(Provider::GitHub) | None => {
+            if host == "github.com" {
+                Some("github")
+            } else if glab_hosts.iter().any(|h| h == host) {
+                Some("gitlab")
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Resolve a repo's hosted-integration status behind the provider abstraction.
+pub async fn resolve_status(repo_path: &str) -> AppResult<ForgeStatus> {
+    if let Some((provider, host)) = detect_non_github(repo_path).await {
+        return match provider {
+            // GitLab probes glab install/auth; Bitbucket probes the keyring token
+            // + `/user`. Unbuilt panels degrade via the `implemented` flags.
+            Provider::GitLab => GitLabForge::new(host).status(repo_path).await,
+            Provider::Bitbucket => BitbucketForge::new(host).status(repo_path).await,
+            Provider::Cnb => CnbForge.status(repo_path).await,
+            Provider::GitHub => GitHubForge.status(repo_path).await,
+        };
+    }
+    GitHubForge.status(repo_path).await
+}
+
+/// Provider-neutral hosted-integration status for a repo. The frontend gates hosted
+/// features on this (and its `capabilities`) instead of a GitHub-only readiness check.
+#[tauri::command]
+pub async fn forge_status(repo_path: String) -> AppResult<ForgeStatus> {
+    resolve_status(&repo_path).await
+}
+
+// ── Bitbucket account (Settings → Accounts) ───────────────────────────────────
+// Bitbucket Cloud has no CLI to carry credentials, so its token is managed here.
+// It lives in the OS keyring and is NEVER returned to the frontend.
+
+/// Connect a Bitbucket account: validate the Atlassian email + API token against
+/// `GET /2.0/user` BEFORE persisting (nothing is stored if validation fails), then
+/// keep email/token/username in the keyring. Returns the account info sans token.
+#[tauri::command]
+pub async fn forge_bb_set_account(
+    email: String,
+    token: String,
+) -> AppResult<bitbucket::BbAccountInfo> {
+    bitbucket::set_account(&email, &token).await
+}
+
+/// Disconnect the Bitbucket account (delete all stored entries; a missing entry is
+/// tolerated).
+#[tauri::command]
+pub async fn forge_bb_clear_account() -> AppResult<()> {
+    bitbucket::clear_account().await
+}
+
+/// The stored Bitbucket account, if any — a keyring existence read only (no
+/// network). `None` when no token is stored.
+#[tauri::command]
+pub async fn forge_bb_account() -> AppResult<Option<bitbucket::BbAccountInfo>> {
+    bitbucket::account().await
+}
+
+/// Legacy forge routes must never send a recognized CNB repository to GitHub.
+/// Keep the provider check in one place so every existing dispatcher fails closed.
+async fn detect_legacy_forge(repo_path: &str) -> AppResult<Option<(Provider, String)>> {
+    match detect_non_github(repo_path).await {
+        Some((Provider::Cnb, _)) => Err(AppError::Command(
+            "This operation is not implemented for CNB".into(),
+        )),
+        provider => Ok(provider),
+    }
+}
+
+/// Validate and store a CNB access token in the OS credential store.
+#[tauri::command]
+pub async fn forge_cnb_set_account(token: String) -> AppResult<cnb::CnbAccountInfo> {
+    cnb::set_account(&token).await
+}
+
+#[tauri::command]
+pub async fn forge_cnb_clear_account() -> AppResult<()> {
+    cnb::clear_account().await
+}
+
+#[tauri::command]
+pub async fn forge_cnb_account() -> AppResult<Option<cnb::CnbAccountInfo>> {
+    cnb::account().await
+}
+
+/// One Bitbucket pipeline step's log, by its `log_ref` (`"{pipeline_uuid}/{step_uuid}"`
+/// with RAW braced UUIDs — the value a `RunJob.logRef` carries). Bitbucket steps have
+/// no numeric id, so this is the step-log path (the numeric `forge_ci_job_logs` arm
+/// errors for Bitbucket).
+#[tauri::command]
+pub async fn forge_bb_step_logs(repo_path: String, log_ref: String) -> AppResult<String> {
+    bitbucket::step_logs(&repo_path, &log_ref).await
+}
+
+// ── Jira (linked issue provider) ───────────────────────────────────────────────
+// Jira is a per-repo LINKED issue provider, orthogonal to the git-host detection
+// every `forge_issue_*` command dispatches on: no repo has a Jira remote, so Jira is
+// never detected — it's configured. The frontend stores the per-repo
+// `{site, projectKey}` link and passes site/project_key in, keeping Rust stateless
+// about linkage.
+
+/// Connect a Jira account for a site: normalize + validate the site, validate the
+/// (site, email, token) triple via `GET /rest/api/3/myself` BEFORE persisting (nothing
+/// stored on failure), then keep email/token in the keyring under `forge/<site>/*`.
+/// Returns the account info; the token is never returned.
+#[tauri::command]
+pub async fn jira_set_account(
+    site: String,
+    email: String,
+    token: String,
+) -> AppResult<jira::JiraAccountInfo> {
+    jira::set_account(&site, &email, &token).await
+}
+
+/// Connect a Jira account for a site by REUSING the stored Bitbucket credentials
+/// (Bitbucket Cloud shares the Atlassian API-token mechanism). Runs Rust-side because
+/// tokens never cross IPC — the frontend can't read the Bitbucket token to pass it to
+/// `jira_set_account`. Validates via `/myself` before persisting under the site host;
+/// a 403 gets reuse-specific copy pointing at manual entry. The token is never returned.
+#[tauri::command]
+pub async fn jira_set_account_from_bitbucket(site: String) -> AppResult<jira::JiraAccountInfo> {
+    jira::set_account_from_bitbucket(&site).await
+}
+
+/// The stored Jira account for a site (email only) — a keyring existence read (no
+/// network). `None` when no token is stored.
+#[tauri::command]
+pub async fn jira_account(site: String) -> AppResult<Option<jira::JiraStoredAccount>> {
+    jira::account(&site).await
+}
+
+/// Disconnect the Jira account for a site (delete both keyring entries; a missing entry
+/// is tolerated).
+#[tauri::command]
+pub async fn jira_clear_account(site: String) -> AppResult<()> {
+    jira::clear_account(&site).await
+}
+
+/// Validate the stored Jira creds for a site by probing `/myself` — distinct errors for
+/// no-creds-stored / 401 / 403.
+#[tauri::command]
+pub async fn jira_validate(site: String) -> AppResult<jira::JiraAccountInfo> {
+    jira::validate(&site).await
+}
+
+/// Search a site's Jira projects for the link picker (`GET
+/// /rest/api/3/project/search`, single page).
+#[tauri::command]
+pub async fn jira_project_search(
+    site: String,
+    query: String,
+) -> AppResult<Vec<jira::JiraProject>> {
+    jira::project_search(&site, &query).await
+}
+
+/// A linked Jira project's issues. `state` ∈ `"open"` | `"closed"` | `"all"` (mapped
+/// through `statusCategory`). One page of `POST /rest/api/3/search/jql`.
+#[tauri::command]
+pub async fn jira_issue_list(
+    site: String,
+    project_key: String,
+    state: String,
+) -> AppResult<Vec<jira::JiraIssueInfo>> {
+    jira::issue_list(&site, &project_key, &state).await
+}
+
+/// Full details for one Jira issue's read view (ADF description + comments converted to
+/// markdown).
+#[tauri::command]
+pub async fn jira_issue_view(site: String, key: String) -> AppResult<jira::JiraIssueDetails> {
+    jira::issue_view(&site, &key).await
+}
+
+// ── Jira writes ────────────────────────────────────────────────────────────────
+
+/// Add a comment to a Jira issue. `body_md` is markdown (converted to ADF Rust-side); a
+/// whitespace-only body is rejected before any network call. Returns the created comment.
+#[tauri::command]
+pub async fn jira_issue_comment(
+    site: String,
+    key: String,
+    body_md: String,
+) -> AppResult<jira::JiraComment> {
+    jira::issue_comment(&site, &key, &body_md).await
+}
+
+/// Close or reopen a Jira issue via its workflow. `direction` ∈ `"close"` | `"reopen"`.
+/// Returns the issue's fresh status after the transition. Transition ids are per-project
+/// workflow and are never hardcoded.
+#[tauri::command]
+pub async fn jira_issue_transition(
+    site: String,
+    key: String,
+    direction: String,
+) -> AppResult<jira::JiraTransitionResult> {
+    jira::issue_transition(&site, &key, &direction).await
+}
+
+/// The full list of workflow transitions available for a Jira issue right now, for the
+/// status picker (`GET /issue/<key>/transitions`, server order).
+#[tauri::command]
+pub async fn jira_issue_transitions(
+    site: String,
+    key: String,
+) -> AppResult<Vec<jira::JiraTransitionOption>> {
+    jira::issue_transitions(&site, &key).await
+}
+
+/// Execute a specific workflow transition on a Jira issue by its id (from
+/// `jira_issue_transitions`). Returns the issue's fresh status after the transition.
+#[tauri::command]
+pub async fn jira_issue_transition_to(
+    site: String,
+    key: String,
+    transition_id: String,
+) -> AppResult<jira::JiraTransitionResult> {
+    jira::issue_transition_to(&site, &key, &transition_id).await
+}
+
+/// Create a Jira issue. Needs `project_key`, `issue_type_id`, and a non-empty `summary`;
+/// `description_md` (markdown → ADF) is optional. Returns the new issue's key + URL.
+#[tauri::command]
+pub async fn jira_issue_create(
+    site: String,
+    project_key: String,
+    issue_type_id: String,
+    summary: String,
+    description_md: Option<String>,
+) -> AppResult<jira::JiraCreatedIssue> {
+    jira::issue_create(
+        &site,
+        &project_key,
+        &issue_type_id,
+        &summary,
+        description_md.as_deref(),
+    )
+    .await
+}
+
+/// The available issue types for a project's create form (per-project `createmeta`
+/// sub-endpoint). Returns all types including subtasks; the frontend filters.
+#[tauri::command]
+pub async fn jira_issue_types(
+    site: String,
+    project_key: String,
+) -> AppResult<Vec<jira::JiraIssueType>> {
+    jira::issue_types(&site, &project_key).await
+}
+
+/// Assign (or unassign) a Jira issue. `account_id = Some(id)` assigns; `None` unassigns.
+#[tauri::command]
+pub async fn jira_issue_assign(
+    site: String,
+    key: String,
+    account_id: Option<String>,
+) -> AppResult<()> {
+    jira::issue_assign(&site, &key, account_id.as_deref()).await
+}
+
+/// Search users assignable to a Jira issue, for the assignee picker
+/// (`GET /user/assignable/search`).
+#[tauri::command]
+pub async fn jira_user_search(
+    site: String,
+    key: String,
+    query: String,
+) -> AppResult<Vec<model::ForgeUserRef>> {
+    jira::user_search(&site, &key, &query).await
+}
+
+/// The caller's per-project permissions, gating the Jira write actions
+/// (`GET /rest/api/3/mypermissions`).
+#[tauri::command]
+pub async fn jira_permissions(
+    site: String,
+    project_key: String,
+) -> AppResult<jira::JiraProjectPermissions> {
+    jira::permissions(&site, &project_key).await
+}
+
+// ── Jira writes: due date / priority / labels / comment edit-delete + pickers ──
+
+/// The site's priorities for the priority picker (`GET /rest/api/3/priority`).
+#[tauri::command]
+pub async fn jira_priorities(site: String) -> AppResult<Vec<jira::JiraPriority>> {
+    jira::priorities(&site).await
+}
+
+/// The site's labels for the labels picker (first page of `GET /rest/api/3/label`; the UI
+/// filters client-side — no server query param exists).
+#[tauri::command]
+pub async fn jira_labels(site: String) -> AppResult<Vec<String>> {
+    jira::labels(&site).await
+}
+
+/// Set (or clear) a Jira issue's due date. `due_date = Some("YYYY-MM-DD")` sets it; `None`
+/// clears it. The date grammar is validated before any network call.
+#[tauri::command]
+pub async fn jira_issue_set_due_date(
+    site: String,
+    key: String,
+    due_date: Option<String>,
+) -> AppResult<()> {
+    jira::issue_set_due_date(&site, &key, due_date.as_deref()).await
+}
+
+/// Set a Jira issue's priority by id (from `jira_priorities`).
+#[tauri::command]
+pub async fn jira_issue_set_priority(
+    site: String,
+    key: String,
+    priority_id: String,
+) -> AppResult<()> {
+    jira::issue_set_priority(&site, &key, &priority_id).await
+}
+
+/// Replace a Jira issue's labels wholesale. Each label is validated (non-empty, no
+/// whitespace) before any network call; an empty vec clears all labels.
+#[tauri::command]
+pub async fn jira_issue_set_labels(
+    site: String,
+    key: String,
+    labels: Vec<String>,
+) -> AppResult<()> {
+    jira::issue_set_labels(&site, &key, &labels).await
+}
+
+/// Edit one of your own comments on a Jira issue. `body_md` is markdown (converted to ADF);
+/// a whitespace-only body and a non-numeric comment id are rejected before any network
+/// call. Returns the updated comment.
+#[tauri::command]
+pub async fn jira_comment_edit(
+    site: String,
+    key: String,
+    comment_id: String,
+    body_md: String,
+) -> AppResult<jira::JiraComment> {
+    jira::comment_edit(&site, &key, &comment_id, &body_md).await
+}
+
+/// Delete one of your own comments on a Jira issue.
+#[tauri::command]
+pub async fn jira_comment_delete(
+    site: String,
+    key: String,
+    comment_id: String,
+) -> AppResult<()> {
+    jira::comment_delete(&site, &key, &comment_id).await
+}
+
+// ── Jira writes: time tracking (estimates + worklogs) ──
+
+/// Set (or clear) a Jira issue's original estimate. `estimate = Some("2d 4h")` sets it;
+/// `None` clears it. The duration grammar is validated before any network call.
+#[tauri::command]
+pub async fn jira_issue_set_original_estimate(
+    site: String,
+    key: String,
+    estimate: Option<String>,
+) -> AppResult<()> {
+    jira::issue_set_original_estimate(&site, &key, estimate.as_deref()).await
+}
+
+/// Set (or clear) a Jira issue's remaining estimate. `estimate = Some("2d 4h")` sets it;
+/// `None` clears it. The duration grammar is validated before any network call.
+#[tauri::command]
+pub async fn jira_issue_set_remaining_estimate(
+    site: String,
+    key: String,
+    estimate: Option<String>,
+) -> AppResult<()> {
+    jira::issue_set_remaining_estimate(&site, &key, estimate.as_deref()).await
+}
+
+/// Log work on a Jira issue. `time_spent` is a duration (e.g. "2d 4h 30m", validated before
+/// any network call); `comment_md` is optional markdown (converted to ADF). Returns the
+/// created worklog.
+#[tauri::command]
+pub async fn jira_worklog_add(
+    site: String,
+    key: String,
+    time_spent: String,
+    comment_md: Option<String>,
+) -> AppResult<jira::JiraWorklog> {
+    jira::worklog_add(&site, &key, &time_spent, comment_md.as_deref()).await
+}
+
+/// Edit one of your own worklog entries on a Jira issue. `comment_md = None` preserves the
+/// existing note; a note can't be REMOVED via the API (an empty note is rejected). The
+/// duration and the worklog id are validated before any network call. Returns the updated
+/// worklog.
+#[tauri::command]
+pub async fn jira_worklog_update(
+    site: String,
+    key: String,
+    worklog_id: String,
+    time_spent: String,
+    comment_md: Option<String>,
+) -> AppResult<jira::JiraWorklog> {
+    jira::worklog_update(&site, &key, &worklog_id, &time_spent, comment_md.as_deref()).await
+}
+
+/// Delete one of your own worklog entries on a Jira issue.
+#[tauri::command]
+pub async fn jira_worklog_delete(
+    site: String,
+    key: String,
+    worklog_id: String,
+) -> AppResult<()> {
+    jira::worklog_delete(&site, &key, &worklog_id).await
+}
+
+/// The signed-in user's repositories on a provider, for the clone browser.
+/// Dispatches by provider — GitHub via `gh`, GitLab via `glab`, Bitbucket via
+/// direct HTTP. Account-scoped (no repo path), unlike `forge_status`.
+#[tauri::command]
+pub async fn forge_list_repos(provider: Provider) -> AppResult<ForgeRepoList> {
+    match provider {
+        Provider::GitHub => github::list_repos().await,
+        Provider::GitLab => gitlab::list_repos().await,
+        Provider::Bitbucket => bitbucket::list_repos().await,
+        Provider::Cnb => cnb::list_repos().await,
+    }
+}
+
+/// The namespaces the signed-in user owns on a provider — the only remote read the
+/// Bitbucket Fork gate needs, without the repository list [`forge_list_repos`] fetches
+/// to reach it (skipping a repo request per workspace). Each arm derives the set from
+/// the same probe as that command's `owned_namespaces`, so independent calls agree
+/// whenever their probes do — and a probe failure degrades exactly as it does there
+/// (GitHub errors; GitLab, and Bitbucket pages past the first, drop to fail-open).
+#[tauri::command]
+pub async fn forge_owned_namespaces(provider: Provider) -> AppResult<Vec<String>> {
+    match provider {
+        Provider::GitHub => github::owned_namespaces().await,
+        Provider::GitLab => gitlab::owned_namespaces().await,
+        Provider::Bitbucket => bitbucket::owned_namespaces().await,
+        Provider::Cnb => cnb::owned_namespaces().await,
+    }
+}
+
+/// Every open pull/merge request and issue involving the signed-in user — the "My
+/// work" inbox's single cross-repo read. Account-scoped (no repo path), so it
+/// dispatches on an explicit `provider` like the clone browser.
+///
+/// `repo_paths` serves the Bitbucket arm alone: Bitbucket retired every
+/// account-scoped listing, so its inbox has to name the repos to ask. GitHub and
+/// GitLab answer for the whole account and ignore it.
+#[tauri::command]
+pub async fn forge_my_work(
+    provider: Provider,
+    repo_paths: Option<Vec<String>>,
+) -> AppResult<my_work::MyWorkPage> {
+    match provider {
+        Provider::GitHub => crate::github::my_work::my_work().await,
+        Provider::GitLab => gitlab::gitlab_my_work().await,
+        Provider::Bitbucket => bitbucket::bitbucket_my_work(repo_paths.unwrap_or_default()).await,
+        Provider::Cnb => cnb_my_work::cnb_my_work(repo_paths.unwrap_or_default()).await,
+    }
+}
+
+/// Which providers the "My work" inbox can currently ask — its availability
+/// signal, kept out of `Implemented` because those flags are per-repo/per-provider
+/// FEATURE support while this is about whether an ACCOUNT is configured at all.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyWorkSources {
+    pub github: bool,
+    pub gitlab: bool,
+    pub bitbucket: bool,
+}
+
+/// Probe all three providers' account configuration concurrently. This command
+/// never errors: each arm folds its OWN failure to `false`, so a broken probe
+/// reads as "not configured" and the inbox simply doesn't offer that source —
+/// safer than failing the whole picker over one provider.
+///
+/// Every arm is LOCAL — a config read, an env read, or a keyring read; no spawn
+/// and no network. The results are returned together and the frontend gates its
+/// first paint on them, so one slow arm would delay every provider's rows: the
+/// GitHub arm reads gh's own config and token variables rather than running
+/// `gh auth status`, which validates the token over the network behind a 30s
+/// timeout. Each arm therefore answers "an account is configured", not "the
+/// credential still works" — the fetch that follows reports a dead credential as
+/// the error it is, where a probe that timed out would have silently hidden the
+/// source instead.
+#[tauri::command]
+pub async fn forge_my_work_sources() -> AppResult<MyWorkSources> {
+    let (github, gitlab, bitbucket) = tokio::join!(
+        crate::github::auth::gh_has_configured_host(),
+        // The SAME enumeration the GitLab fetch walks — a probe reading a
+        // different set could offer a source that then answers empty.
+        async { !glab::account_hosts().await.is_empty() },
+        async { http::load_credentials().await.is_ok() },
+    );
+    Ok(MyWorkSources {
+        github,
+        gitlab,
+        bitbucket,
+    })
+}
+
+/// The head branch of ONE pull/merge request, plus the repo that branch lives in —
+/// what the inbox's open path needs to prefer the worktree already holding that
+/// branch. Dispatches on an explicit `provider` (the row carries it) rather than
+/// re-detecting from `repo_path`, which the caller has already matched.
+///
+/// Every arm answers `""` for what its provider can't supply rather than erroring:
+/// the caller's question is "which branch, on which repo", and the gate declines
+/// on an unknown — a usable answer where a failed call is not.
+#[tauri::command]
+pub async fn forge_pr_head_ref(
+    provider: Provider,
+    repo_path: String,
+    number: u64,
+) -> AppResult<crate::github::pr::PrHeadRef> {
+    match provider {
+        Provider::GitHub => crate::github::pr::gh_pr_head_ref(repo_path, number).await,
+        Provider::GitLab => gitlab::pr_head_ref(&repo_path, number).await,
+        Provider::Bitbucket => bitbucket::pr_head_ref(&repo_path, number).await,
+        Provider::Cnb => Err(AppError::Command("CNB PR head lookup is not implemented yet".into())),
+    }
+}
+
+// ── Explore: repo search / fork-by-name / star / README / provider features ────
+// Account-scoped (no repo path) — Explore browses arbitrary repos across a provider,
+// so each command dispatches on an explicit `provider` argument. The frontend
+// mirrors these signatures exactly.
+
+/// Search a provider's repositories for the Explore view. `sort` is exactly
+/// `"best" | "stars" | "updated"` (anything else → `InvalidArgument`); `page` is
+/// 1-based. An empty `query` means the Popular/Discover feed on GitHub and GitLab;
+/// Bitbucket rejects it (its search is workspace-scoped and needs a term — the
+/// frontend never sends it).
+#[tauri::command]
+pub async fn forge_search_repos(
+    provider: Provider,
+    query: String,
+    sort: String,
+    page: u32,
+) -> AppResult<ForgeSearchList> {
+    if !matches!(sort.as_str(), "best" | "stars" | "updated") {
+        return Err(AppError::InvalidArgument(format!("invalid sort: {sort}")));
+    }
+    // `page` is 1-based; page 0 is a client bug (every provider would treat it
+    // inconsistently — GitHub 422s, GitLab clamps to 1), so reject it explicitly.
+    if page == 0 {
+        return Err(AppError::InvalidArgument(
+            "page is 1-based; page 0 is invalid".into(),
+        ));
+    }
+    match provider {
+        Provider::GitHub => github::search_repos(&query, &sort, page).await,
+        Provider::GitLab => gitlab::search_repos(&query, &sort, page).await,
+        Provider::Bitbucket => {
+            if query.trim().is_empty() {
+                return Err(AppError::InvalidArgument(
+                    "A search term is required on Bitbucket.".into(),
+                ));
+            }
+            bitbucket::search_repos(&query, &sort, page).await
+        }
+        Provider::Cnb => Err(AppError::Command("CNB repository search is not implemented yet".into())),
+    }
+}
+
+/// Fork a repo by its `owner/name` on a provider (Explore's Fork action). Returns
+/// the fork's identity plus a best-effort readiness flag.
+#[tauri::command]
+pub async fn forge_fork_repo(
+    provider: Provider,
+    owner: String,
+    name: String,
+) -> AppResult<ForgeForkResult> {
+    match provider {
+        Provider::GitHub => github::fork_repo(&owner, &name).await,
+        Provider::GitLab => gitlab::fork_repo(&owner, &name).await,
+        Provider::Bitbucket => bitbucket::fork_repo(&owner, &name).await,
+        Provider::Cnb => Err(AppError::Command("CNB repository forking is not implemented yet".into())),
+    }
+}
+
+/// Star (`star = true`) or unstar a repo by `owner/name`. Bitbucket Cloud has no
+/// stars (`repo_star` false), so its arm errors — the frontend never calls it there.
+#[tauri::command]
+pub async fn forge_star_repo(
+    provider: Provider,
+    owner: String,
+    name: String,
+    star: bool,
+) -> AppResult<()> {
+    match provider {
+        Provider::GitHub => github::star_repo(&owner, &name, star).await,
+        Provider::GitLab => gitlab::star_repo(&owner, &name, star).await,
+        Provider::Bitbucket => bitbucket::star_repo(&owner, &name, star).await,
+        Provider::Cnb => Err(AppError::Command("CNB repository stars are not implemented yet".into())),
+    }
+}
+
+/// Whether the signed-in user has starred `owner/name`. Bitbucket always returns
+/// `false` (no stars).
+#[tauri::command]
+pub async fn forge_starred(provider: Provider, owner: String, name: String) -> AppResult<bool> {
+    match provider {
+        Provider::GitHub => github::starred(&owner, &name).await,
+        Provider::GitLab => gitlab::starred(&owner, &name).await,
+        Provider::Bitbucket => bitbucket::starred(&owner, &name).await,
+        Provider::Cnb => Err(AppError::Command("CNB repository stars are not implemented yet".into())),
+    }
+}
+
+/// A repo's raw README markdown for the Explore preview, or `None` when it has none
+/// (absence is not an error). `default_branch` scopes GitLab/Bitbucket's file read
+/// (GitHub resolves the default branch itself).
+#[tauri::command]
+pub async fn forge_repo_readme(
+    provider: Provider,
+    owner: String,
+    name: String,
+    default_branch: Option<String>,
+) -> AppResult<Option<String>> {
+    match provider {
+        Provider::GitHub => github::repo_readme(&owner, &name).await,
+        Provider::GitLab => gitlab::repo_readme(&owner, &name, default_branch.as_deref()).await,
+        Provider::Bitbucket => bitbucket::repo_readme(&owner, &name).await,
+        Provider::Cnb => Err(AppError::Command("CNB repository README is not implemented yet".into())),
+    }
+}
+
+/// A provider's static feature profile (capabilities + implemented) — pure, no I/O.
+/// Lets the Explore view gate its controls per provider without a repo in hand.
+#[tauri::command]
+pub async fn forge_provider_features(provider: Provider) -> AppResult<ProviderFeatures> {
+    Ok(ProviderFeatures {
+        capabilities: Capabilities::for_provider(provider),
+        implemented: Implemented::for_provider(provider),
+    })
+}
+
+/// Clone a repo, supplying provider auth that plain `git clone` lacks. A private
+/// GitLab repo needs glab's token, injected as a ONE-SHOT `git -c` credential helper
+/// (no persistent config, no token in the URL); GitHub gets the same one-shot gh
+/// helper. Both fall open to git's ambient auth when their CLI is absent. Returns the
+/// path.
+#[tauri::command]
+pub async fn forge_clone(
+    provider: Provider,
+    url: String,
+    parent_dir: String,
+    dir_name: Option<String>,
+    recurse_submodules: bool,
+    account_id: Option<String>,
+) -> AppResult<String> {
+    let _identity_guard = if matches!(provider, Provider::Bitbucket | Provider::Cnb) {
+        Some(accounts::GIT_NETWORK_IDENTITY_LOCK.lock().await)
+    } else { None };
+    // Bitbucket: on a SUCCESSFUL token seed, clone with the API URL's embedded `user@`
+    // stripped — git scopes credential lookup by the URL username, so the bare host is
+    // what finds the sentinel-account seed — and interactive helpers suppressed. No
+    // stored token → URL and behavior untouched (ambient auth still works).
+    let mut clone_url = url;
+    let clone_host = remote_authority(&clone_url)
+        .ok_or_else(|| AppError::InvalidArgument("Clone URL has no host".into()))?;
+    let selected_account = if let Some(id) = account_id {
+        let account = accounts::list().await?.into_iter().find(|account| account.id == id)
+            .ok_or_else(|| AppError::InvalidArgument("Unknown clone account".into()))?;
+        Some(account)
+    } else if is_https_remote(&clone_url) {
+        accounts::active(provider, &clone_host).await?
+    } else {
+        None
+    };
+    if let Some(ref account) = selected_account {
+        if account.provider != provider || !account.host.eq_ignore_ascii_case(&clone_host) {
+            return Err(AppError::InvalidArgument("Clone account does not match its provider and host".into()));
+        }
+    }
+    // The helper entries key on `credential.https://…`, so a non-https URL can only get
+    // inert config — the gate skips that plus the CLI-resolve probes. Both arms fail
+    // open: ambient auth or a public repo must still clone when the CLI is absent.
+    let https = is_https_remote(&clone_url);
+    let extra = if let Some(ref account) = selected_account {
+        if !https {
+            return Err(AppError::InvalidArgument("Selected account requires an HTTPS clone URL".into()));
+        }
+        if provider == Provider::Bitbucket {
+            clone_url = bitbucket::strip_https_userinfo(&clone_url);
+        }
+        if provider == Provider::GitLab && account.source == accounts::AccountSource::Cli {
+            let config = gitlab::clone_credential_config(&clone_url).await?;
+            if config.is_empty() {
+                return Err(AppError::Glab("Selected GitLab CLI account cannot authenticate this clone".into()));
+            }
+            config
+        } else {
+            let token = match (provider, account.source) {
+                (Provider::GitHub, accounts::AccountSource::Cli) => {
+                    crate::github::runner::bound_cli_token(&clone_host, &account.login).await?
+                }
+                (_, accounts::AccountSource::Managed) => accounts::managed_token(account).await?,
+                _ => return Err(AppError::InvalidArgument("Selected CLI account cannot authenticate this clone".into())),
+            };
+            let username = match provider {
+                Provider::Bitbucket => "x-bitbucket-api-token-auth",
+                Provider::Cnb => "cnb",
+                _ => &account.login,
+            };
+            accounts::seed_git_credential(&clone_url, username, &token).await?
+        }
+    } else { match provider {
+        Provider::GitLab if https => {
+            gitlab::clone_credential_config(&clone_url).await.unwrap_or_default()
+        }
+        Provider::GitHub if https => {
+            github::clone_credential_config(&clone_url).await.unwrap_or_default()
+        }
+        Provider::GitLab | Provider::GitHub => Vec::new(),
+        Provider::Bitbucket => {
+            return Err(AppError::Bitbucket("Choose a Bitbucket account before cloning".into()));
+        }
+        Provider::Cnb => {
+            if !https || remote_host(&clone_url).as_deref() != Some("cnb.cool") {
+                return Err(AppError::InvalidArgument("CNB clone requires an HTTPS cnb.cool URL".into()));
+            }
+            let extra = cnb::git_credential_entries(&clone_url)?;
+            cnb::seed_git_credential_for_clone(&clone_url).await?;
+            extra
+        }
+    }};
+    let cloned_path = crate::git::repo::clone_repo_core(
+        &clone_url,
+        &parent_dir,
+        dir_name,
+        recurse_submodules,
+        &extra,
+    )
+    .await?;
+    if let Some(account) = selected_account {
+        accounts::bind_repo(&cloned_path, Some(&account.id)).await?;
+    }
+    Ok(cloned_path)
+}
+
+/// A repo's merge/pull requests, behind the provider abstraction. `state` is `"open"`
+/// or `"closed"` (closed includes merged, matching the GitHub panel's Closed tab).
+///
+/// `lens` (`None`/`Some("origin")`/`Some("upstream")`) is threaded to the GitHub arm
+/// ONLY: it selects whether a fork addresses its own PRs or the parent's. GitLab and
+/// Bitbucket deliberately don't receive it (the frontend gates the lens UI to GitHub),
+/// so a stray upstream lens there simply reads as origin. This note stands for every
+/// `forge_*` PR/issue dispatcher below.
+///
+/// `filter` narrows the list whole-repo, server-side. Each provider answers it from
+/// its own arm — GitHub from a search, GitLab from a fan-out over its single-valued
+/// list params. Bitbucket's author axis is NOT wired: its PR rows expose an author
+/// display name, which BBQL cannot filter on (`author.display_name` answers HTTP 400
+/// "does not support filtering"), and the filterable `author.nickname` is a different
+/// field that diverges from it. An empty or absent filter leaves every arm on its
+/// legacy read. The `listFilterMine` / `listFilterTeam` [`model::Implemented`] flags
+/// are what tell the frontend which filter controls a provider can offer. This note
+/// likewise stands for every filtered `forge_*` dispatcher below.
+#[tauri::command]
+pub async fn forge_pr_list(
+    repo_path: String,
+    state: String,
+    limit: Option<u32>,
+    lens: Option<String>,
+    filter: Option<model::RemoteListFilter>,
+) -> AppResult<Vec<crate::github::pr::PrInfo>> {
+    match detect_non_github(&repo_path).await {
+        Some((Provider::GitLab, _)) => {
+            gitlab::list_prs(&repo_path, &state, limit, filter.as_ref()).await
+        }
+        Some((Provider::Bitbucket, _)) => bitbucket::list_prs(&repo_path, &state, limit).await,
+        Some((Provider::Cnb, _)) => {
+            reject_upstream_on_non_github(lens.as_deref())?;
+            if filter.as_ref().is_some_and(|filter| !filter.is_empty()) {
+                return Err(AppError::InvalidArgument(
+                    "CNB pull request filters are not implemented yet".into(),
+                ));
+            }
+            cnb_pr::list_prs(&repo_path, &state, limit).await
+        }
+        _ => github::list_prs(&repo_path, &state, limit, lens, filter).await,
+    }
+}
+
+/// The viewer's own review state for the PRs a [`forge_pr_list`] call with the same
+/// arguments would return — the input to the list's "not reviewed / updated since my
+/// review / reviewed" grouping. A number ABSENT from the map means NOT reviewed, so
+/// the caller subtracts rather than expecting a row per PR.
+///
+/// Short-circuits to an empty page for any non-open state and for every non-GitHub
+/// provider, before any call: a closed PR's review state drives no grouping, and the
+/// map rests on GitHub's `reviewed-by:` search qualifier, which has no GitLab or
+/// Bitbucket analogue (`reviewGrouping` is false there).
+#[tauri::command]
+pub async fn forge_pr_review_state(
+    repo_path: String,
+    state: String,
+    limit: Option<u32>,
+    lens: Option<String>,
+    filter: Option<model::RemoteListFilter>,
+) -> AppResult<crate::github::pr_search::ReviewStatePage> {
+    if state != "open" {
+        return Ok(crate::github::pr_search::ReviewStatePage::empty());
+    }
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab | Provider::Bitbucket, _)) => {
+            Ok(crate::github::pr_search::ReviewStatePage::empty())
+        }
+        _ => {
+            github::pr_review_state(&repo_path, &state, limit, lens.as_deref(), filter.as_ref())
+                .await
+        }
+    }
+}
+
+/// The viewer's teams in this repo's organization, org-qualified for the PR list's
+/// team-review-request filter. GitHub-only: `team-review-requested:` has no GitLab or
+/// Bitbucket analogue, so those arms error rather than returning an empty list a
+/// caller could read as "you're in no teams" (the `forge_my_work` precedent).
+#[tauri::command]
+pub async fn forge_my_teams(
+    repo_path: String,
+    lens: Option<String>,
+) -> AppResult<crate::github::teams::MyTeams> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => Err(AppError::InvalidArgument(
+            "Team filters aren't supported for GitLab yet.".into(),
+        )),
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Team filters aren't supported for Bitbucket yet.".into(),
+        )),
+        _ => github::my_teams(&repo_path, lens.as_deref()).await,
+    }
+}
+
+/// The rolled-up CI signal for a PR-list page, keyed by number — fetched SEPARATELY
+/// from `forge_pr_list` so a large repo's list never waits on (or 504s expanding)
+/// per-check status. GitHub reads its precomputed `statusCheckRollup` by number,
+/// GitLab `headPipeline.status` by iid (one batched call each); Bitbucket has no batch
+/// endpoint and probes per-commit statuses by `head_sha`. `sample_url` fixes which
+/// repo the numbers belong to — load-bearing for forks, where the list resolves to the
+/// parent while origin points at the fork. Best-effort: an unfetchable PR gets no icon.
+#[tauri::command]
+pub async fn forge_pr_list_ci(
+    repo_path: String,
+    prs: Vec<crate::github::pr::PrCiRefIn>,
+    sample_url: String,
+) -> AppResult<Vec<crate::github::pr::PrCiStatus>> {
+    if prs.is_empty() {
+        return Ok(Vec::new());
+    }
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            let iids: Vec<u64> = prs.iter().map(|p| p.number).collect();
+            gitlab::pr_list_ci(&repo_path, iids, &sample_url).await
+        }
+        Some((Provider::Bitbucket, _)) => bitbucket::pr_list_ci(&repo_path, &prs).await,
+        _ => github::list_ci(&repo_path, &prs, &sample_url).await,
+    }
+}
+
+/// A lightweight snapshot of recently-updated PRs for the notification poller + remote
+/// pr-sync. GitLab/Bitbucket list responses carry no check rollup or review decision,
+/// so those fields come back empty (the poller's checks/review branches never fire
+/// there); `headSha` still drives pr-sync re-review.
+#[tauri::command]
+pub async fn forge_pr_poll(repo_path: String) -> AppResult<Vec<crate::github::pr::PrPollInfo>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::poll_prs(&repo_path).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::poll_prs(&repo_path).await,
+        _ => github::poll_prs(&repo_path).await,
+    }
+}
+
+/// The upstream lens is a GitHub-only fork affordance (Part B). Reject it before a
+/// GitLab/Bitbucket dispatch so a stray upstream value can't be silently treated as
+/// origin on those providers (the frontend gates the lens UI to GitHub anyway).
+fn reject_upstream_on_non_github(lens: Option<&str>) -> AppResult<()> {
+    if lens == Some("upstream") {
+        return Err(AppError::InvalidArgument(
+            "Creating a pull request on the upstream repository is currently supported for GitHub only.".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Open merge/pull requests whose head is `head`, behind the abstraction — the
+/// ComparePanel duplicate probe ("View" instead of "Create" once one exists).
+/// `lens` is GitHub-only (see `forge_pr_list`).
+#[tauri::command]
+pub async fn forge_prs_for_branch(
+    repo_path: String,
+    head: String,
+    lens: Option<String>,
+) -> AppResult<Vec<crate::github::pr::PrInfo>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            reject_upstream_on_non_github(lens.as_deref())?;
+            gitlab::prs_for_branch(&repo_path, &head).await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            reject_upstream_on_non_github(lens.as_deref())?;
+            bitbucket::prs_for_branch(&repo_path, &head).await
+        }
+        _ => github::prs_for_branch(&repo_path, &head, lens).await,
+    }
+}
+
+/// Full details for one merge/pull request's read view, behind the abstraction.
+#[tauri::command]
+pub async fn forge_pr_view(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<crate::github::pr::PrDetails> {
+    match detect_non_github(&repo_path).await {
+        Some((Provider::GitLab, _)) => gitlab::view_pr(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::view_pr(&repo_path, number).await,
+        Some((Provider::Cnb, _)) => {
+            reject_upstream_on_non_github(lens.as_deref())?;
+            cnb_pr::view_pr(&repo_path, number).await
+        }
+        _ => github::view_pr(&repo_path, number, lens).await,
+    }
+}
+
+/// Whether ONE merge/pull request can currently merge, behind the abstraction —
+/// SERVER truth, never inferred here. Fetched separately from `forge_pr_view` so
+/// the frontend can re-poll it while the provider is still computing (GitHub
+/// answers `UNKNOWN` until something asks). Bitbucket has no such field and
+/// answers `"unavailable"` without an HTTP call.
+#[tauri::command]
+pub async fn forge_pr_mergeability(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<crate::github::pr::PrMergeability> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::mr_mergeability(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => Ok(crate::github::pr::PrMergeability::unavailable()),
+        _ => github::pr_mergeability(&repo_path, number, lens.as_deref()).await,
+    }
+}
+
+/// Mergeability for a PR-list page, keyed by number — the sibling of
+/// `forge_pr_list_ci`, and separate from `forge_pr_list` for the same reason:
+/// asking the list read for it measured 3–5s of extra latency on large repos.
+/// Any non-open filter short-circuits to an empty map before any call, on every
+/// arm: a closed/merged row has no live mergeability, and the only rendered state
+/// is "conflicting" — so the Closed tab would pay GitHub's 3–5s for
+/// guaranteed-zero chips. That gate is why the provider arms only ever see "open".
+#[tauri::command]
+pub async fn forge_pr_list_mergeability(
+    repo_path: String,
+    state: String,
+    limit: Option<u32>,
+    lens: Option<String>,
+    filter: Option<model::RemoteListFilter>,
+) -> AppResult<std::collections::HashMap<u64, String>> {
+    if state != "open" {
+        return Ok(std::collections::HashMap::new());
+    }
+    match detect_legacy_forge(&repo_path).await? {
+        // Unfiltered by design: this reads the first 100 open MRs, so a filtered row
+        // outside that page gets no conflict chip — chip absence is no claim.
+        Some((Provider::GitLab, _)) => gitlab::mr_list_mergeability(&repo_path, &state).await,
+        Some((Provider::Bitbucket, _)) => Ok(std::collections::HashMap::new()),
+        _ => {
+            github::list_mergeability(&repo_path, &state, limit, lens.as_deref(), filter.as_ref())
+                .await
+        }
+    }
+}
+
+/// The PR/MR activity timeline — state changes, label edits, approvals — behind the
+/// abstraction. Each provider maps its own event source onto the neutral
+/// `ForgeTimelineEventOut` union: GitHub `timelineItems`, GitLab resource/state/label
+/// events + approval system-notes, Bitbucket PR `activity`. Events sort oldest→newest;
+/// the frontend interleaves `pr.commits` itself, so no arm emits commit events.
+#[tauri::command]
+pub async fn forge_pr_timeline(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<Vec<crate::forge::model::ForgeTimelineEventOut>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::mr_timeline(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::pr_activity(&repo_path, number).await,
+        _ => github::pr_timeline(&repo_path, number, lens.as_deref()).await,
+    }
+}
+
+/// The unified diff for one merge/pull request, behind the abstraction.
+#[tauri::command]
+pub async fn forge_pr_diff(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<String> {
+    match detect_non_github(&repo_path).await {
+        Some((Provider::GitLab, _)) => gitlab::diff_pr(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::diff_pr(&repo_path, number).await,
+        Some((Provider::Cnb, _)) => {
+            reject_upstream_on_non_github(lens.as_deref())?;
+            cnb_pr::diff_pr(&repo_path, number).await
+        }
+        _ => github::diff_pr(&repo_path, number, lens).await,
+    }
+}
+
+/// The unified diff of ONE commit within a merge/pull request, behind the
+/// abstraction. GitHub uses the commit's `.diff` media type; GitLab rebuilds it
+/// from the per-file commit-diff array; Bitbucket returns the raw commit diff.
+#[tauri::command]
+pub async fn forge_pr_commit_diff(
+    repo_path: String,
+    number: u64,
+    oid: String,
+) -> AppResult<String> {
+    // `number` is part of the neutral contract (the diff is scoped to a PR in the
+    // UI), but every provider addresses the commit by sha alone.
+    let _ = number;
+    // No lens param here (Part B): the commit is sha-addressed, and GitHub's
+    // fork-network storage serves any network SHA via the fork's own endpoint, so an
+    // origin/upstream distinction would make no difference to what's returned.
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::commit_diff(&repo_path, &oid).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::commit_diff(&repo_path, &oid).await,
+        _ => github::commit_diff(&repo_path, &oid).await,
+    }
+}
+
+/// A commit's comments, behind the abstraction. GitHub lists the commit-comments
+/// REST endpoint; GitLab flattens its commit discussions (composite ids); Bitbucket
+/// lists its commit comments.
+#[tauri::command]
+pub async fn forge_commit_comments(
+    repo_path: String,
+    sha: String,
+    lens: Option<String>,
+) -> AppResult<Vec<crate::github::pr::CommitCommentOut>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::commit_comments(&repo_path, &sha).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::commit_comments(&repo_path, &sha).await,
+        _ => github::commit_comments(&repo_path, &sha, lens.as_deref()).await,
+    }
+}
+
+/// Post a comment on a commit, behind the abstraction. Whole-commit =
+/// `path`/`line`/`position` all `None`. GitHub anchored uses `path` + `position`
+/// (the frontend computes `position`; `line` is ignored); GitLab and Bitbucket
+/// anchored use `path` + `line`. `start_line` (a multi-line range) is honored on
+/// GitLab only — GitHub and Bitbucket commit comments have no range concept, so
+/// their branches ignore it.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn forge_commit_comment_create(
+    repo_path: String,
+    sha: String,
+    body: String,
+    path: Option<String>,
+    line: Option<u64>,
+    start_line: Option<u64>,
+    position: Option<u64>,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::commit_comment_create(
+                &repo_path,
+                &sha,
+                &body,
+                path.as_deref(),
+                line,
+                start_line,
+            )
+            .await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::commit_comment_create(&repo_path, &sha, &body, path.as_deref(), line).await
+        }
+        _ => {
+            github::commit_comment_create(
+                &repo_path,
+                &sha,
+                &body,
+                path.as_deref(),
+                position,
+                lens.as_deref(),
+            )
+            .await
+        }
+    }
+}
+
+/// Edit a commit comment's body, behind the abstraction. `comment_id`: GitHub /
+/// Bitbucket numeric-as-string; GitLab composite `"discussionId:noteId"`.
+#[tauri::command]
+pub async fn forge_commit_comment_edit(
+    repo_path: String,
+    sha: String,
+    comment_id: String,
+    body: String,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::commit_comment_edit(&repo_path, &sha, &comment_id, &body).await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::commit_comment_edit(&repo_path, &sha, &comment_id, &body).await
+        }
+        // GitHub edits by comment id alone (sha unused, but kept for the neutral shape);
+        // `lens` is a GitHub fork-network concept, so only this arm consumes it.
+        _ => github::commit_comment_edit(&repo_path, &comment_id, &body, lens.as_deref()).await,
+    }
+}
+
+/// Delete a commit comment, behind the abstraction. Same `comment_id` carriage as
+/// `forge_commit_comment_edit`.
+#[tauri::command]
+pub async fn forge_commit_comment_delete(
+    repo_path: String,
+    sha: String,
+    comment_id: String,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::commit_comment_delete(&repo_path, &sha, &comment_id).await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::commit_comment_delete(&repo_path, &sha, &comment_id).await
+        }
+        _ => github::commit_comment_delete(&repo_path, &comment_id, lens.as_deref()).await,
+    }
+}
+
+/// Third-party AI-reviewer findings on a merge/pull request (Copilot/CodeRabbit/…).
+/// GitHub delegates to `gh_pr_external_reviews`; GitLab maps MR discussion notes;
+/// Bitbucket returns an empty list by design — no third-party AI-reviewer ecosystem
+/// posts there, so there's nothing to fetch. The frontend decides which authors are
+/// AI reviewers and folds their findings in as soft re-review context.
+#[tauri::command]
+pub async fn forge_pr_external_reviews(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<Vec<crate::github::pr::ExternalReviewItem>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::external_reviews(&repo_path, number).await,
+        // By design: no bot-review ecosystem posts on Bitbucket PRs — a permanent empty.
+        Some((Provider::Bitbucket, _)) => Ok(Vec::new()),
+        _ => github::external_reviews(&repo_path, number, lens).await,
+    }
+}
+
+/// File:line-anchored review threads on a merge/pull request, behind the
+/// abstraction. GitHub maps `reviewThreads`; GitLab maps positioned MR
+/// discussions; Bitbucket groups inline comments and their reply chains. Each
+/// thread carries its full reply chain (oldest first).
+#[tauri::command]
+pub async fn forge_pr_review_threads(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<Vec<crate::github::pr::ReviewThreadOut>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::review_threads(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::review_threads(&repo_path, number).await,
+        _ => github::review_threads(&repo_path, number, lens).await,
+    }
+}
+
+/// Reply in an existing review thread, behind the abstraction. `thread_id` is the
+/// provider's thread id (GitHub reviewThread node id / GitLab discussion id /
+/// Bitbucket root comment id).
+#[tauri::command]
+pub async fn forge_pr_thread_reply(
+    repo_path: String,
+    number: u64,
+    thread_id: String,
+    body: String,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::reply_thread(&repo_path, number, &thread_id, &body).await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::reply_thread(&repo_path, number, &thread_id, &body).await
+        }
+        _ => github::reply_thread(&repo_path, &thread_id, &body).await,
+    }
+}
+
+/// Create a NEW file:line-anchored review thread on a merge/pull request, behind
+/// the abstraction. `side` is `"new"` (right/added) or `"old"` (left/removed).
+/// `start_line` (a multi-line comment range) is honored on GitHub AND GitLab (both
+/// send a real range); Bitbucket has no range API, so it anchors at the end `line`.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn forge_pr_thread_create(
+    repo_path: String,
+    number: u64,
+    path: String,
+    line: u64,
+    side: String,
+    start_line: Option<u64>,
+    body: String,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::thread_create(&repo_path, number, &path, line, &side, start_line, &body).await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::thread_create(&repo_path, number, &path, line, &side, start_line, &body).await
+        }
+        _ => {
+            github::thread_create(
+                &repo_path,
+                number,
+                &path,
+                line,
+                &side,
+                start_line,
+                &body,
+                lens.as_deref(),
+            )
+            .await
+        }
+    }
+}
+
+/// Submit a review on a merge/pull request — an optional summary + a batch of inline
+/// comments + a verdict, behind the abstraction. `verdict` is `"comment"` /
+/// `"approve"` / `"request_changes"`. GitHub submits atomically (one call); GitLab and
+/// Bitbucket run sequentially and disclose partial state on failure. All
+/// locally-checkable preconditions are validated HERE, before any remote call.
+#[tauri::command]
+pub async fn forge_pr_review_submit(
+    repo_path: String,
+    number: u64,
+    verdict: String,
+    summary: Option<String>,
+    comments: Vec<crate::github::pr::DraftCommentIn>,
+    lens: Option<String>,
+) -> AppResult<crate::github::pr::ReviewSubmitOut> {
+    // Pre-mutation guards.
+    if !matches!(verdict.as_str(), "comment" | "approve" | "request_changes") {
+        return Err(AppError::InvalidArgument(format!(
+            "invalid review verdict: {verdict}"
+        )));
+    }
+    if verdict == "request_changes" && summary.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        return Err(AppError::InvalidArgument(
+            "A summary is required when requesting changes".into(),
+        ));
+    }
+    let summary = summary.as_deref();
+    match detect_non_github(&repo_path).await {
+        Some((Provider::GitLab, _)) => {
+            gitlab::review_submit(&repo_path, number, &verdict, summary, &comments).await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::review_submit(&repo_path, number, &verdict, summary, &comments).await
+        }
+        Some((Provider::Cnb, _)) => {
+            reject_upstream_on_non_github(lens.as_deref())?;
+            cnb_pr::review_submit(&repo_path, number, &verdict, summary, &comments).await
+        }
+        _ => {
+            github::review_submit(&repo_path, number, &verdict, summary, &comments, lens.as_deref())
+                .await
+        }
+    }
+}
+
+/// Resolve / unresolve a review thread, behind the abstraction. Bitbucket has no
+/// thread-resolution surface wired (`mr_thread_resolve` false), so its arm errors.
+#[tauri::command]
+pub async fn forge_pr_thread_resolve(
+    repo_path: String,
+    number: u64,
+    thread_id: String,
+    resolved: bool,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::resolve_thread(&repo_path, number, &thread_id, resolved).await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::resolve_thread(&repo_path, number, &thread_id, resolved).await
+        }
+        _ => github::resolve_thread(&repo_path, &thread_id, resolved).await,
+    }
+}
+
+/// Post a comment on a merge/pull request, behind the abstraction. GitHub delegates
+/// to `gh pr comment`; GitLab posts a note via `glab`; Bitbucket POSTs a PR comment.
+/// `as_bot` (optional — existing callers omit it) is honored only by the GitLab arm:
+/// with `Some(true)` and a review-bot token configured for this repo's GitLab host,
+/// the note is authored by the project bot (else the signed-in user). GitHub and
+/// Bitbucket ignore the flag.
+#[tauri::command]
+pub async fn forge_pr_comment(
+    repo_path: String,
+    number: u64,
+    body: String,
+    as_bot: Option<bool>,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_non_github(&repo_path).await {
+        Some((Provider::GitLab, _)) => {
+            gitlab::comment_mr(&repo_path, number, &body, as_bot.unwrap_or(false)).await
+        }
+        Some((Provider::Bitbucket, _)) => bitbucket::comment_pr(&repo_path, number, &body).await,
+        Some((Provider::Cnb, _)) => {
+            reject_upstream_on_non_github(lens.as_deref())?;
+            if as_bot.unwrap_or(false) {
+                return Err(AppError::InvalidArgument(
+                    "CNB review-bot comments are not implemented yet".into(),
+                ));
+            }
+            cnb_pr::comment_pr(&repo_path, number, &body).await
+        }
+        _ => github::comment_pr(&repo_path, number, &body, lens).await,
+    }
+}
+
+/// The configured GitLab review-bot login, if any (`Some(bot_login)` when a token is
+/// stored). Account-scoped (no repo path); a keyring existence read only (no network).
+/// gitlab.com scope (v1).
+#[tauri::command]
+pub async fn forge_gitlab_review_token_status() -> AppResult<Option<String>> {
+    gitlab::review_token_status().await
+}
+
+/// Validate a GitLab review-bot token live, store it, and return the bot login. On
+/// validation failure the error surfaces and nothing is stored. The token is never
+/// logged or returned.
+#[tauri::command]
+pub async fn forge_gitlab_review_token_set(token: String) -> AppResult<String> {
+    gitlab::review_token_set(token).await
+}
+
+/// Clear the stored GitLab review-bot token + login.
+#[tauri::command]
+pub async fn forge_gitlab_review_token_clear() -> AppResult<()> {
+    gitlab::review_token_clear().await
+}
+
+/// Edit a merge/pull request conversation comment's body, behind the abstraction.
+/// GitHub edits the IssueComment node (both PR and issue comments share the
+/// mutation); GitLab PUTs the MR note; Bitbucket PUTs the PR comment. `comment_id`
+/// is the id the thread already carries (GitHub node id / GitLab note id /
+/// Bitbucket comment id). Gated on `implemented.mrCommentEdit`.
+#[tauri::command]
+pub async fn forge_pr_edit_comment(
+    repo_path: String,
+    number: u64,
+    comment_id: String,
+    body: String,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::edit_mr_comment(&repo_path, number, &comment_id, &body).await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::edit_pr_comment(&repo_path, number, &comment_id, &body).await
+        }
+        _ => github::edit_comment(&repo_path, &comment_id, &body).await,
+    }
+}
+
+/// Delete a merge/pull request conversation comment, behind the abstraction. Same
+/// `comment_id` carriage as `forge_pr_edit_comment`.
+#[tauri::command]
+pub async fn forge_pr_delete_comment(
+    repo_path: String,
+    number: u64,
+    comment_id: String,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::delete_mr_comment(&repo_path, number, &comment_id).await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::delete_pr_comment(&repo_path, number, &comment_id).await
+        }
+        _ => github::delete_comment(&repo_path, &comment_id).await,
+    }
+}
+
+/// Edit a file:line-anchored review-THREAD comment's body. Distinct from
+/// `forge_pr_edit_comment` (flat conversation comments): GitHub review comments are
+/// `PullRequestReviewComment` nodes with their own mutation, while GitLab positioned
+/// notes and Bitbucket inline comments ARE the same objects as their conversation
+/// notes, so those arms reuse the note/comment endpoints. Gated on
+/// `implemented.mrThreadCommentEdit`.
+#[tauri::command]
+pub async fn forge_pr_edit_review_comment(
+    repo_path: String,
+    number: u64,
+    comment_id: String,
+    body: String,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::edit_mr_comment(&repo_path, number, &comment_id, &body).await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::edit_pr_comment(&repo_path, number, &comment_id, &body).await
+        }
+        _ => github::edit_review_comment(&repo_path, &comment_id, &body).await,
+    }
+}
+
+/// Delete a file:line-anchored review-thread comment, behind the abstraction. Same
+/// `comment_id` carriage and per-provider routing as `forge_pr_edit_review_comment`.
+#[tauri::command]
+pub async fn forge_pr_delete_review_comment(
+    repo_path: String,
+    number: u64,
+    comment_id: String,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::delete_mr_comment(&repo_path, number, &comment_id).await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::delete_pr_comment(&repo_path, number, &comment_id).await
+        }
+        _ => github::delete_review_comment(&repo_path, &comment_id).await,
+    }
+}
+
+/// Close a merge/pull request (not merge), behind the abstraction.
+#[tauri::command]
+pub async fn forge_pr_close(repo_path: String, number: u64, lens: Option<String>) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::close_mr(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::decline_pr(&repo_path, number).await,
+        _ => github::close_pr(&repo_path, number, lens).await,
+    }
+}
+
+/// Reopen a closed (not merged) merge/pull request, behind the abstraction.
+#[tauri::command]
+pub async fn forge_pr_reopen(repo_path: String, number: u64, lens: Option<String>) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::reopen_mr(&repo_path, number).await,
+        // A declined Bitbucket PR can't be reopened via API or web (BCLOUD-4954). The
+        // frontend hides the button; this is defense-in-depth.
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket declined pull requests can't be reopened.".into(),
+        )),
+        _ => github::reopen_pr(&repo_path, number, lens).await,
+    }
+}
+
+/// Request changes on a merge/pull request (the blocking reviewer state), with a
+/// comment. Wired for all three providers: GitLab/Bitbucket via their reviewer
+/// APIs, GitHub through `gh pr review --request-changes` (`gh_pr_review`), which
+/// requires a non-empty body. The frontend still gates its own control on
+/// `implemented.mrRequestChanges` (false for GitHub, so it uses GitHub's native
+/// Review menu there); this arm serves the MCP `request_changes` tool.
+#[tauri::command]
+pub async fn forge_pr_request_changes(
+    repo_path: String,
+    number: u64,
+    body: String,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::request_changes_mr(&repo_path, number, &body).await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::request_changes_pr(&repo_path, number, &body).await
+        }
+        _ => crate::github::pr::gh_pr_review(
+            repo_path,
+            number,
+            "request_changes".to_string(),
+            body,
+            lens,
+        )
+        .await,
+    }
+}
+
+/// Revoke the viewer's requested-changes state. Bitbucket-only: its DELETE works on
+/// every plan, so the control is a true toggle there — GitLab's direct undo is a
+/// Premium feature (Free clears it by approving, or by dropping the reviewer on
+/// GitLab), and GitHub reviews live in its own Review menu.
+#[tauri::command]
+pub async fn forge_pr_unrequest_changes(repo_path: String, number: u64) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::unrequest_changes_pr(&repo_path, number).await
+        }
+        Some((Provider::GitLab, _)) => Err(AppError::InvalidArgument(
+            "GitLab can only revoke a change request on Premium — approve instead, or remove yourself as a reviewer on GitLab.".into(),
+        )),
+        _ => Err(AppError::InvalidArgument(
+            "GitHub requests changes through the Review menu.".into(),
+        )),
+    }
+}
+
+/// Toggle a merge/pull request's draft state, each provider via its own mechanism:
+/// Bitbucket PUTs `draft`; GitLab shells `glab mr update --ready|--draft` (a draft is a
+/// `Draft:` title prefix glab manages); GitHub shells `gh pr ready [--undo]`, so
+/// `draft = true` appends `--undo`. `lens` is GitHub-only (see `forge_pr_list`). gh's
+/// error on plans without draft conversion passes through as the actionable message.
+#[tauri::command]
+pub async fn forge_pr_set_draft(
+    repo_path: String,
+    number: u64,
+    draft: bool,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::Bitbucket, _)) => bitbucket::set_pr_draft(&repo_path, number, draft).await,
+        Some((Provider::GitLab, _)) => gitlab::set_mr_draft(&repo_path, number, draft).await,
+        // gh takes a READY flag, so the draft state inverts (`ready = !draft`).
+        _ => crate::github::pr::gh_pr_set_ready(&repo_path, number, !draft, lens.as_deref()).await,
+    }
+}
+
+/// Replace a merge/pull request's reviewer list (ids from
+/// [`forge_pr_reviewer_candidates`]). The setter takes the FULL desired list; each
+/// arm reconciles it to the provider's API (GitHub diffs add/remove, GitLab/BB
+/// PUT the list). Wired for all three (`implemented.mr_reviewers`).
+#[tauri::command]
+pub async fn forge_pr_set_reviewers(
+    repo_path: String,
+    number: u64,
+    reviewers: Vec<String>,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::set_pr_reviewers(&repo_path, number, &reviewers).await
+        }
+        Some((Provider::GitLab, _)) => {
+            gitlab::set_pr_reviewers(&repo_path, number, &reviewers).await
+        }
+        _ => github::set_pr_reviewers(&repo_path, number, &reviewers, lens.as_deref()).await,
+    }
+}
+
+/// The reviewer picker's candidates for a PR — the members who can be requested,
+/// minus the user the provider would reject. For an existing PR (`Some(number)`)
+/// that's the PR author (GitHub/Bitbucket exclude them; GitLab tolerates it); at
+/// create time (`None`, no PR yet) it's the viewer. GitHub: assignable users;
+/// GitLab: project members; Bitbucket: workspace members.
+#[tauri::command]
+pub async fn forge_pr_reviewer_candidates(
+    repo_path: String,
+    number: Option<u64>,
+    lens: Option<String>,
+) -> AppResult<Vec<model::ForgeUserRef>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::reviewer_candidates(&repo_path, number).await
+        }
+        Some((Provider::GitLab, _)) => gitlab::reviewer_candidates(&repo_path, number).await,
+        _ => github::reviewer_candidates(&repo_path, number, lens.as_deref()).await,
+    }
+}
+
+/// Edit a merge/pull request's title/body, behind the abstraction — the shared
+/// edit dialog. GitHub PATCHes the pull; GitLab PUTs title/description.
+///
+/// `base` retargets the request at its new base/target branch; `None` leaves it
+/// alone on every provider (each arm omits its field rather than echoing the
+/// current value). A stacked GitHub PR's base is server-locked — the 422 explaining
+/// that passes through, so the stack must be dissolved first.
+#[tauri::command]
+pub async fn forge_pr_edit(
+    repo_path: String,
+    number: u64,
+    title: String,
+    body: String,
+    lens: Option<String>,
+    base: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::edit_mr(&repo_path, number, &title, &body, base.as_deref()).await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::edit_pr(&repo_path, number, &title, &body, base.as_deref()).await
+        }
+        _ => github::edit_pr(&repo_path, number, &title, &body, lens, base.as_deref()).await,
+    }
+}
+
+/// Group open pull requests into a NEW stack, `pull_requests` bottom→top. GitHub
+/// only: GitLab infers stacks from targeting alone and Bitbucket has no concept of
+/// them, so both arms error rather than falling through to the gh path.
+#[tauri::command]
+pub async fn forge_stack_create(
+    repo_path: String,
+    pull_requests: Vec<u64>,
+    lens: Option<String>,
+) -> AppResult<crate::github::pr::StackWriteOutcome> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => Err(AppError::InvalidArgument(
+            "GitLab detects stacks automatically when a merge request targets another open merge \
+             request's branch — there's nothing to create here."
+                .into(),
+        )),
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket doesn't support stacked pull requests.".into(),
+        )),
+        _ => crate::github::pr::gh_stack_create(repo_path, pull_requests, lens).await,
+    }
+}
+
+/// Append pull requests to an existing stack, on TOP only. GitHub only, for the
+/// same reason as [`forge_stack_create`].
+#[tauri::command]
+pub async fn forge_stack_add(
+    repo_path: String,
+    stack_number: u64,
+    pull_requests: Vec<u64>,
+    lens: Option<String>,
+) -> AppResult<crate::github::pr::StackWriteOutcome> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => Err(AppError::InvalidArgument(
+            "GitLab detects stacks automatically when a merge request targets another open merge \
+             request's branch — there's nothing to add here."
+                .into(),
+        )),
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket doesn't support stacked pull requests.".into(),
+        )),
+        _ => crate::github::pr::gh_stack_add(repo_path, stack_number, pull_requests, lens).await,
+    }
+}
+
+/// Dissolve a stack — every member unstacks at once, and the pull requests stay
+/// open on their branches. GitHub only, for the same reason as
+/// [`forge_stack_create`].
+#[tauri::command]
+pub async fn forge_stack_dissolve(
+    repo_path: String,
+    stack_number: u64,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => Err(AppError::InvalidArgument(
+            "GitLab detects stacks automatically when a merge request targets another open merge \
+             request's branch — there's nothing to dissolve here."
+                .into(),
+        )),
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket doesn't support stacked pull requests.".into(),
+        )),
+        _ => crate::github::pr::gh_stack_dissolve(repo_path, stack_number, lens).await,
+    }
+}
+
+/// The viewer's + the MR's approval state, behind the abstraction. GitLab and
+/// Bitbucket: GitHub surfaces approval through the review flow (`reviewDecision` +
+/// the Review menu), so its arm errors — the frontend gates this on `implemented.mrApprove`
+/// (false for GitHub), so it's never reached there.
+#[tauri::command]
+pub async fn forge_pr_approvals(
+    repo_path: String,
+    number: u64,
+) -> AppResult<crate::github::pr::ApprovalState> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::pr_approvals(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::pr_approvals(&repo_path, number).await,
+        _ => Err(AppError::InvalidArgument(
+            "GitHub surfaces approval through the review flow, not this control.".into(),
+        )),
+    }
+}
+
+/// Approve a merge/pull request (a bodyless reviewer action). Wired for all three:
+/// GitLab/Bitbucket via their reviewer APIs, GitHub via `gh pr review --approve`. The
+/// frontend gates its own control on `implemented.mrApprove` (false for GitHub); this
+/// arm serves the MCP `approve_pull_request` tool.
+#[tauri::command]
+pub async fn forge_pr_approve(repo_path: String, number: u64, lens: Option<String>) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::approve_pr(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::approve_pr(&repo_path, number).await,
+        _ => crate::github::pr::gh_pr_review(
+            repo_path,
+            number,
+            "approve".to_string(),
+            String::new(),
+            lens,
+        )
+        .await,
+    }
+}
+
+/// Revoke the viewer's approval of a merge/pull request, behind the abstraction.
+/// GitLab and Bitbucket; GitHub approvals go through the review flow, so its arm
+/// errors.
+#[tauri::command]
+pub async fn forge_pr_unapprove(repo_path: String, number: u64) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::unapprove_pr(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::unapprove_pr(&repo_path, number).await,
+        _ => Err(AppError::InvalidArgument(
+            "GitHub approvals go through the review flow, not this control.".into(),
+        )),
+    }
+}
+
+/// Merge a merge/pull request. GitHub delegates to `gh pr merge` (it has no `sha`
+/// guard, so that arg is dropped); GitLab merges via `glab` — merge/squash only — with
+/// an optional head-`sha` stale-view guard. `strategy` is merge/squash/rebase; rebase
+/// is GitHub-only.
+///
+/// `cleanup_warning` on the returned [`PrMergeOutcome`](crate::github::pr::PrMergeOutcome)
+/// means the merge was accepted with a caveat — either the PR merged but post-merge
+/// branch cleanup failed, or (`queued`) a stacked PR went to a merge QUEUE and hasn't
+/// landed, so cleanup was skipped. Both are GitHub-only: GitLab/Bitbucket fold branch
+/// deletion into the server-side merge and have no stacked-merge queue. A merge
+/// FAILURE is still an `Err`.
+#[tauri::command]
+pub async fn forge_pr_merge(
+    repo_path: String,
+    number: u64,
+    strategy: String,
+    delete_branch: bool,
+    sha: Option<String>,
+    lens: Option<String>,
+) -> AppResult<crate::github::pr::PrMergeOutcome> {
+    match detect_non_github(&repo_path).await {
+        Some((Provider::GitLab, _)) => gitlab::merge_mr(
+            &repo_path,
+            number,
+            &strategy,
+            delete_branch,
+            sha.as_deref(),
+        )
+        .await
+        .map(|()| crate::github::pr::PrMergeOutcome::default()),
+        // Bitbucket has no expected-hash guard, so `sha` is dropped.
+        Some((Provider::Bitbucket, _)) => bitbucket::merge_pr(&repo_path, number, &strategy, delete_branch)
+            .await
+            .map(|()| crate::github::pr::PrMergeOutcome::default()),
+        Some((Provider::Cnb, _)) => {
+            reject_upstream_on_non_github(lens.as_deref())?;
+            if delete_branch || sha.is_some() {
+                return Err(AppError::InvalidArgument(
+                    "CNB merge does not support deleting the source branch or an expected SHA.".into(),
+                ));
+            }
+            cnb_pr::merge_pr(&repo_path, number, &strategy)
+                .await
+                .map(|()| crate::github::pr::PrMergeOutcome::default())
+        }
+        _ => crate::github::pr::gh_pr_merge(repo_path, number, strategy, delete_branch, lens).await,
+    }
+}
+
+/// A repo's issues, behind the provider abstraction. GitHub delegates to the
+/// existing `gh issue list`; GitLab maps `glab` issues onto the same neutral
+/// [`IssueInfo`](crate::github::issue::IssueInfo). `state` is `"open"` or
+/// `"closed"`.
+#[tauri::command]
+pub async fn forge_issue_list(
+    repo_path: String,
+    state: String,
+    limit: Option<u32>,
+    lens: Option<String>,
+    filter: Option<model::RemoteListFilter>,
+) -> AppResult<Vec<crate::github::issue::IssueInfo>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::list_issues(&repo_path, &state, limit, filter.as_ref()).await
+        }
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::list_issues(&repo_path, &state, limit, lens, filter).await,
+    }
+}
+
+/// Full details for one issue's read view, behind the abstraction.
+#[tauri::command]
+pub async fn forge_issue_view(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<crate::github::issue::IssueDetails> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::view_issue(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::view_issue(&repo_path, number, lens).await,
+    }
+}
+
+/// The issue's activity timeline — label, assignee and milestone changes,
+/// cross-references and links, state changes — behind the abstraction, on the same
+/// neutral `ForgeTimelineEventOut` union as the PR read. GitHub maps
+/// `timelineItems`; GitLab maps its resource label/state/milestone events plus the
+/// assignment/reference/lock system notes. Events sort oldest→newest.
+#[tauri::command]
+pub async fn forge_issue_timeline(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<Vec<crate::forge::model::ForgeTimelineEventOut>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::issue_timeline(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::issue_timeline(&repo_path, number, lens).await,
+    }
+}
+
+/// A repo's CI runs, behind the provider abstraction. GitHub delegates to
+/// `gh run list`; GitLab maps `glab` pipelines onto the same neutral
+/// [`WorkflowRun`](crate::github::actions::WorkflowRun). `limit` caps the count;
+/// `branch` optionally scopes to one ref.
+#[tauri::command]
+pub async fn forge_ci_run_list(
+    repo_path: String,
+    limit: u32,
+    branch: Option<String>,
+) -> AppResult<Vec<crate::github::actions::WorkflowRun>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::list_runs(&repo_path, limit, branch).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::list_runs(&repo_path, limit, branch).await,
+        _ => github::list_runs(&repo_path, limit, branch).await,
+    }
+}
+
+/// One PAGE of a repo's CI runs, behind the provider abstraction — the whole run
+/// history is reachable through it, unlike [`forge_ci_run_list`]'s newest-page-only
+/// read. `page` is 1-based; `limit` is clamped to 1..=100 by each provider arm.
+/// `total_count` is present only where the provider reports one (GitHub always,
+/// Bitbucket usually, GitLab never), so a consumer must treat `None` as unknown
+/// rather than zero.
+#[tauri::command]
+pub async fn forge_ci_run_page(
+    repo_path: String,
+    limit: u32,
+    page: u32,
+    branch: Option<String>,
+) -> AppResult<crate::github::actions::CiRunPage> {
+    let page = page.max(1);
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::run_page(&repo_path, limit, page, branch).await,
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::run_page(&repo_path, limit, page, branch).await
+        }
+        _ => github::run_page(&repo_path, limit, page, branch).await,
+    }
+}
+
+/// Parse a CI run/job id out of its wire form; `kind` names it in the error
+/// ("run" / "job"). Every CI id PARAM rides the wire as a string — JS clients lose
+/// integer precision past 2^53 — while the provider arms that take a numeric id
+/// address it as u64 (Bitbucket job logs ride a separate UUID path). Response ids
+/// stay raw JSON numbers (see actions.rs).
+fn parse_ci_id(kind: &str, raw: &str) -> AppResult<u64> {
+    raw.parse()
+        .map_err(|_| AppError::InvalidArgument(format!("Invalid {kind} id: {raw}")))
+}
+
+/// One CI run with its jobs, behind the abstraction.
+#[tauri::command]
+pub async fn forge_ci_run_view(
+    repo_path: String,
+    run_id: String,
+) -> AppResult<crate::github::actions::RunDetail> {
+    let run_id = parse_ci_id("run", &run_id)?;
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::view_run(&repo_path, run_id).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::view_run(&repo_path, run_id).await,
+        _ => github::view_run(&repo_path, run_id).await,
+    }
+}
+
+/// The failed jobs' logs for one CI run, behind the abstraction.
+#[tauri::command]
+pub async fn forge_ci_run_failed_logs(repo_path: String, run_id: String) -> AppResult<String> {
+    let run_id = parse_ci_id("run", &run_id)?;
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::run_failed_logs(&repo_path, run_id).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::run_failed_logs(&repo_path, run_id).await,
+        _ => github::run_failed_logs(&repo_path, run_id).await,
+    }
+}
+
+/// One CI job's log, behind the abstraction.
+#[tauri::command]
+pub async fn forge_ci_job_logs(repo_path: String, job_id: String) -> AppResult<String> {
+    let job_id = parse_ci_id("job", &job_id)?;
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::job_logs(&repo_path, job_id).await,
+        // Bitbucket steps are addressed by braced UUID, not a numeric id — the
+        // frontend fetches their logs via `forge_bb_step_logs` using RunJob.logRef.
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket step logs are fetched by step reference.".into(),
+        )),
+        _ => github::job_logs(&repo_path, job_id).await,
+    }
+}
+
+/// Re-run a finished CI run, behind the abstraction. GitHub re-runs all jobs or
+/// (`failed`) just failed ones; GitLab retries failed and canceled jobs only,
+/// ignoring `failed` (the UI offers only retry there; "re-run all" stays
+/// GitHub-only). The lens is honored by the GitHub arm only.
+#[tauri::command]
+pub async fn forge_ci_run_rerun(
+    repo_path: String,
+    run_id: String,
+    failed: bool,
+    lens: Option<String>,
+) -> AppResult<()> {
+    let run_id = parse_ci_id("run", &run_id)?;
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::retry_run(&repo_path, run_id).await,
+        // Bitbucket has no rerun-failed-only; a re-run re-triggers the run's branch.
+        Some((Provider::Bitbucket, _)) => bitbucket::rerun_run(&repo_path, run_id).await,
+        _ => github::rerun_run(&repo_path, run_id, failed, lens).await,
+    }
+}
+
+/// Re-run one CI job: GitHub includes its dependents; GitLab retries that job
+/// alone. Bitbucket steps have no retry endpoint. The lens is honored by the
+/// GitHub arm only.
+#[tauri::command]
+pub async fn forge_ci_job_rerun(
+    repo_path: String,
+    job_id: String,
+    lens: Option<String>,
+) -> AppResult<()> {
+    let job_id = parse_ci_id("job", &job_id)?;
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::retry_job(&repo_path, job_id).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Re-running a single job is GitHub/GitLab-only — Bitbucket pipeline steps have no retry endpoint.".into(),
+        )),
+        _ => github::rerun_job(&repo_path, job_id, lens).await,
+    }
+}
+
+/// Approve a CI run GitHub is withholding pending maintainer approval (the gate on
+/// a first-time contributor's fork PR). GitHub-only: GitDesktop surfaces run
+/// approval nowhere else, so the other providers refuse rather than guess.
+#[tauri::command]
+pub async fn forge_ci_run_approve(
+    repo_path: String,
+    run_id: String,
+    lens: Option<String>,
+) -> AppResult<()> {
+    let run_id = parse_ci_id("run", &run_id)?;
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => Err(AppError::InvalidArgument(
+            "Approving held runs is GitHub-only — GitDesktop has no run approval for GitLab pipelines.".into(),
+        )),
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Approving held runs is GitHub-only — GitDesktop has no run approval for Bitbucket pipelines.".into(),
+        )),
+        _ => crate::github::actions::gh_run_approve(repo_path, run_id, lens).await,
+    }
+}
+
+/// Cancel an in-flight CI run, behind the abstraction.
+#[tauri::command]
+pub async fn forge_ci_run_cancel(repo_path: String, run_id: String) -> AppResult<()> {
+    let run_id = parse_ci_id("run", &run_id)?;
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::cancel_run(&repo_path, run_id).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::cancel_run(&repo_path, run_id).await,
+        _ => github::cancel_run(&repo_path, run_id).await,
+    }
+}
+
+/// Manually start a CI run, behind the abstraction. GitHub dispatches `workflow`
+/// (id or file name) on `git_ref` with `inputs`; GitLab runs a new pipeline on the
+/// ref with `inputs` as CI/CD variables — it has no per-workflow dispatch, so the
+/// GitLab arm ignores `workflow` (the UI sends it empty there).
+#[tauri::command]
+pub async fn forge_ci_dispatch(
+    repo_path: String,
+    workflow: String,
+    git_ref: String,
+    inputs: std::collections::HashMap<String, String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::run_pipeline(&repo_path, &git_ref, &inputs).await,
+        // Bitbucket triggers a branch pipeline; a non-empty `workflow` names a CUSTOM
+        // pipeline (via a selector on the target), and `inputs` become pipeline variables.
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::dispatch_ci(&repo_path, &workflow, &git_ref, &inputs).await
+        }
+        _ => github::dispatch_ci(&repo_path, &workflow, &git_ref, inputs).await,
+    }
+}
+
+/// The open fork PR whose head `branch` already contains, if any — what tells the
+/// publish path that pushing this branch means pushing to a contributor's fork.
+/// GitHub-only: it's the only provider where a PR's head can live in a repository
+/// the maintainer doesn't own but may still push to.
+#[tauri::command]
+pub async fn forge_detect_fork_pr_for_branch(
+    repo_path: String,
+    branch: String,
+) -> AppResult<Option<crate::github::pr::ForkPrMatch>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab | Provider::Bitbucket, _)) => Ok(None),
+        _ => crate::github::pr::detect_fork_pr_for_branch(&repo_path, &branch).await,
+    }
+}
+
+/// Normalize a remote URL to `(host, path)` for identity comparison — the same
+/// fork is reachable as `https://…/o/r`, `https://…/o/r.git`, or a differently-cased
+/// host, and all three name one remote.
+fn remote_identity(url: &str) -> Option<(String, String)> {
+    Some((remote_host(url)?, remote_path(url)?))
+}
+
+/// A fork's clone URL, spliced from `origin_url`: only the `owner/repo` path is
+/// replaced, so scheme, userinfo, host and PORT all survive — deriving from a bare
+/// host would drop `:8443` and collapse `ssh://` to scp form, yielding a remote git
+/// adds happily and can never reach. `.git` rides along only when origin had it.
+/// Userinfo carries over deliberately, embedded credential included: origin already
+/// stores that secret in the same `.git/config`, and dropping it would break a
+/// token-authed origin's fork remote.
+fn fork_url_from_origin(origin_url: &str, owner: &str, repo: &str) -> Option<String> {
+    let trimmed = origin_url.trim();
+    let path = remote_path(trimmed)?;
+    // `remote_path` trims trailing slashes then a `.git` suffix, so undoing both
+    // leaves the path as an exact tail — no re-parsing of the URL grammar here.
+    let body = trimmed.trim_end_matches('/');
+    let (body, suffix) = match body.strip_suffix(".git") {
+        Some(b) => (b, ".git"),
+        None => (body, ""),
+    };
+    let start = body.len().checked_sub(path.len())?;
+    if body.get(start..)? != path {
+        return None;
+    }
+    Some(format!("{}{owner}/{repo}{suffix}", &body[..start]))
+}
+
+/// The name of a remote pointing at `owner/repo` on origin's host, adding one if
+/// none exists. Idempotent: a second call finds the remote it added and returns
+/// the same name.
+///
+/// The fork URL is spliced from ORIGIN's own URL ([`fork_url_from_origin`]) so the
+/// new remote authenticates the way the repo already does. An existing remote whose
+/// URL matches wins over the name derivation, so a user's own `fork`/`contrib`
+/// remote is reused instead of duplicated.
+#[tauri::command]
+pub async fn forge_ensure_fork_remote(
+    state: tauri::State<'_, crate::state::AppState>,
+    repo_path: String,
+    owner: String,
+    repo: String,
+) -> AppResult<String> {
+    forge_ensure_fork_remote_core(&state, repo_path, owner, repo).await
+}
+
+pub(crate) async fn forge_ensure_fork_remote_core(
+    state: &crate::state::AppState,
+    repo_path: String,
+    owner: String,
+    repo: String,
+) -> AppResult<String> {
+    validate_owner(&owner)?;
+    validate_repo_name(&repo)?;
+    let origin_url =
+        crate::git::remote::git_remote_url(repo_path.clone(), "origin".to_string()).await?;
+    let Some(fork_url) = fork_url_from_origin(&origin_url, &owner, &repo) else {
+        return Err(AppError::InvalidArgument(
+            "This repository's 'origin' URL has no repository path to derive a fork URL from."
+                .into(),
+        ));
+    };
+    let want = remote_identity(&fork_url);
+
+    let names = crate::git::remote::git_remotes(repo_path.clone()).await?;
+    for name in &names {
+        let Ok(url) = crate::git::remote::git_remote_url(repo_path.clone(), name.clone()).await
+        else {
+            continue;
+        };
+        if want.is_some() && remote_identity(&url) == want {
+            return Ok(name.clone());
+        }
+    }
+
+    // The URL isn't configured yet, so pick a free name: the owner, else an
+    // `-fork` suffix. Both taken by OTHER URLs means the user has to resolve it —
+    // silently retargeting one of theirs would break their remote.
+    let name = if !names.iter().any(|n| n == &owner) {
+        owner.clone()
+    } else {
+        let suffixed = format!("{owner}-fork");
+        if names.iter().any(|n| n == &suffixed) {
+            return Err(AppError::InvalidArgument(format!(
+                "The remote names '{owner}' and '{suffixed}' are both taken by other URLs — \
+                 rename or remove one, then try again."
+            )));
+        }
+        suffixed
+    };
+    crate::git::remote::git_remote_add_core(state, repo_path, name.clone(), fork_url).await?;
+    Ok(name)
+}
+
+/// A repo's releases (list view), behind the provider abstraction. GitHub delegates
+/// to `gh release list`; GitLab maps `glab` releases onto the same neutral
+/// [`ReleaseInfo`](crate::github::release::ReleaseInfo).
+#[tauri::command]
+pub async fn forge_release_list(
+    repo_path: String,
+) -> AppResult<Vec<crate::github::release::ReleaseInfo>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::list_releases(&repo_path).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket releases aren't supported yet.".into(),
+        )),
+        _ => github::list_releases(&repo_path).await,
+    }
+}
+
+/// Full details for one release's read view, by its tag, behind the abstraction.
+#[tauri::command]
+pub async fn forge_release_view(
+    repo_path: String,
+    tag: String,
+) -> AppResult<crate::github::release::ReleaseDetails> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::view_release(&repo_path, &tag).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket releases aren't supported yet.".into(),
+        )),
+        _ => github::view_release(&repo_path, &tag).await,
+    }
+}
+
+/// Publish a release, behind the abstraction; returns its web URL. The
+/// draft / prerelease / latest toggles are GitHub concepts — GitLab has none of
+/// the three, so its arm drops them (the create dialog hides those fields there,
+/// like the issue dialog's milestone/type).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn forge_release_create(
+    repo_path: String,
+    tag: String,
+    title: String,
+    notes: String,
+    target: String,
+    prerelease: bool,
+    draft: bool,
+    latest: bool,
+) -> AppResult<String> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::create_release(&repo_path, &tag, &title, &notes, &target).await
+        }
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket releases aren't supported yet.".into(),
+        )),
+        _ => {
+            github::create_release(
+                &repo_path, &tag, &title, &notes, &target, prerelease, draft, latest,
+            )
+            .await
+        }
+    }
+}
+
+/// Edit a release's title/notes (GitHub also its draft/prerelease/latest state),
+/// behind the abstraction. The GitLab arm drops the GitHub-only toggles.
+#[tauri::command]
+pub async fn forge_release_edit(
+    repo_path: String,
+    tag: String,
+    title: String,
+    notes: String,
+    prerelease: bool,
+    draft: bool,
+    latest: Option<bool>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::edit_release(&repo_path, &tag, &title, &notes).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket releases aren't supported yet.".into(),
+        )),
+        _ => github::edit_release(&repo_path, &tag, &title, &notes, prerelease, draft, latest).await,
+    }
+}
+
+/// Sync a release's `latest.json` updater manifest to the edited notes. GitHub-only —
+/// not for want of release assets (GitLab has those), but because the Tauri updater
+/// feed this app ships is a `latest.json` attached to a GitHub release; a GitLab
+/// release simply isn't where any installed app looks for its update.
+#[tauri::command]
+pub async fn forge_release_sync_updater_notes(
+    repo_path: String,
+    tag: String,
+    notes: String,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => Err(AppError::InvalidArgument(
+            "The updater manifest is published on GitHub releases only.".into(),
+        )),
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket releases aren't supported yet.".into(),
+        )),
+        _ => {
+            crate::github::release::gh_release_sync_updater_notes(&repo_path, &tag, &notes).await
+        }
+    }
+}
+
+/// Delete a release (optionally its git tag too), behind the abstraction.
+#[tauri::command]
+pub async fn forge_release_delete(
+    repo_path: String,
+    tag: String,
+    cleanup_tag: bool,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::delete_release(&repo_path, &tag, cleanup_tag).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket releases aren't supported yet.".into(),
+        )),
+        _ => github::delete_release(&repo_path, &tag, cleanup_tag).await,
+    }
+}
+
+/// Upload a file as a release asset, behind the abstraction. GitHub attaches a
+/// binary; GitLab uploads to the project and links it as a release asset (its
+/// assets are links, so the row renders as a link — no size/download stats).
+#[tauri::command]
+pub async fn forge_release_upload_asset(
+    repo_path: String,
+    tag: String,
+    file_path: String,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::upload_release_asset(&repo_path, &tag, &file_path).await
+        }
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket releases aren't supported yet.".into(),
+        )),
+        _ => github::upload_release_asset(&repo_path, &tag, &file_path).await,
+    }
+}
+
+/// Delete a release asset by its display name, behind the abstraction. GitLab
+/// assets are links with server-side ids, so its arm resolves the name to the
+/// link id first.
+#[tauri::command]
+pub async fn forge_release_delete_asset(
+    repo_path: String,
+    tag: String,
+    asset_name: String,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::delete_release_asset(&repo_path, &tag, &asset_name).await
+        }
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket releases aren't supported yet.".into(),
+        )),
+        _ => github::delete_release_asset(&repo_path, &tag, &asset_name).await,
+    }
+}
+
+/// Post a comment on an issue, behind the provider abstraction. GitHub delegates to
+/// `gh issue comment`; GitLab posts a note via `glab`.
+#[tauri::command]
+pub async fn forge_issue_comment(
+    repo_path: String,
+    number: u64,
+    body: String,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::comment_issue(&repo_path, number, &body).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::comment_issue(&repo_path, number, &body, lens).await,
+    }
+}
+
+/// Edit an issue conversation comment's body, behind the abstraction. GitHub edits
+/// the IssueComment node (the same mutation the PR path uses); GitLab PUTs the
+/// issue note; Bitbucket's tracker is being retired, so its arm errors. Gated on
+/// `implemented.issueCommentEdit` (GitLab true; Bitbucket false; GitHub true).
+#[tauri::command]
+pub async fn forge_issue_edit_comment(
+    repo_path: String,
+    number: u64,
+    comment_id: String,
+    body: String,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::edit_issue_comment(&repo_path, number, &comment_id, &body).await
+        }
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::edit_comment(&repo_path, &comment_id, &body).await,
+    }
+}
+
+/// Delete an issue conversation comment, behind the abstraction. Same `comment_id`
+/// carriage as `forge_issue_edit_comment`; Bitbucket's arm errors.
+#[tauri::command]
+pub async fn forge_issue_delete_comment(
+    repo_path: String,
+    number: u64,
+    comment_id: String,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::delete_issue_comment(&repo_path, number, &comment_id).await
+        }
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::delete_comment(&repo_path, &comment_id).await,
+    }
+}
+
+/// Close an issue, behind the abstraction. `reason` is GitHub's close reason
+/// (`completed`/`not_planned`); GitLab has no close reason and ignores it.
+#[tauri::command]
+pub async fn forge_issue_close(
+    repo_path: String,
+    number: u64,
+    reason: String,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::close_issue(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::close_issue(&repo_path, number, &reason, lens).await,
+    }
+}
+
+/// Reopen a closed issue, behind the abstraction.
+#[tauri::command]
+pub async fn forge_issue_reopen(repo_path: String, number: u64, lens: Option<String>) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::reopen_issue(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::reopen_issue(&repo_path, number, lens).await,
+    }
+}
+
+/// Edit an issue's title/body, behind the abstraction — the shared edit dialog.
+/// GitHub PATCHes the issue; GitLab PUTs title/description.
+#[tauri::command]
+pub async fn forge_issue_edit(
+    repo_path: String,
+    number: u64,
+    title: String,
+    body: String,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::edit_issue(&repo_path, number, &title, &body).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::edit_issue(&repo_path, number, &title, &body, lens).await,
+    }
+}
+
+/// Lock an issue's conversation, behind the abstraction. GitHub locks with an
+/// optional reason; GitLab's `discussion_locked` has none, so its arm ignores
+/// `reason` (the UI hides the reason submenu per provider — a stray reason must
+/// not fail the lock).
+#[tauri::command]
+pub async fn forge_issue_lock(
+    repo_path: String,
+    number: u64,
+    reason: Option<String>,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::lock_issue(&repo_path, number, true).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::lock_issue(&repo_path, number, reason, lens).await,
+    }
+}
+
+/// Unlock an issue's conversation, behind the abstraction.
+#[tauri::command]
+pub async fn forge_issue_unlock(repo_path: String, number: u64, lens: Option<String>) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::lock_issue(&repo_path, number, false).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::unlock_issue(&repo_path, number, lens).await,
+    }
+}
+
+/// Transfer (GitHub) / move (GitLab) an issue to another repository, behind the
+/// abstraction; returns the issue's new URL. `destination` is "owner/repo" on
+/// GitHub, a full "group/name" project path on GitLab.
+#[tauri::command]
+pub async fn forge_issue_transfer(
+    repo_path: String,
+    number: u64,
+    destination: String,
+    lens: Option<String>,
+) -> AppResult<String> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::move_issue(&repo_path, number, &destination).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::transfer_issue(&repo_path, number, &destination, lens).await,
+    }
+}
+
+/// Permanently delete an issue, behind the abstraction. Both providers restrict
+/// this server-side (GitHub: admin/triage; GitLab: owner) — their errors
+/// surface as-is.
+#[tauri::command]
+pub async fn forge_issue_delete(repo_path: String, number: u64, lens: Option<String>) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::delete_issue(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::delete_issue(&repo_path, number, lens).await,
+    }
+}
+
+/// The repo's open/active milestones for the milestone picker, behind the
+/// abstraction. The neutral `Milestone.number` is GitHub's milestone number or
+/// GitLab's GLOBAL milestone id — whichever key that provider's write takes.
+#[tauri::command]
+pub async fn forge_milestones(
+    repo_path: String,
+    lens: Option<String>,
+) -> AppResult<Vec<crate::github::issue::Milestone>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::list_milestones(&repo_path).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket milestones aren't supported yet.".into(),
+        )),
+        _ => github::milestones(&repo_path, lens).await,
+    }
+}
+
+/// Reactions for an issue + its comments, behind the abstraction. GitLab maps
+/// award emoji onto the same shape (comments keyed by note id; GitHub keys them
+/// by GraphQL node id — either way the id the thread already carries).
+#[tauri::command]
+pub async fn forge_issue_reactions(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<crate::github::issue::IssueReactions> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::issue_reactions(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::issue_reactions(&repo_path, number, lens).await,
+    }
+}
+
+/// Reactions for a merge/pull request + its comments, behind the abstraction.
+#[tauri::command]
+pub async fn forge_pr_reactions(
+    repo_path: String,
+    number: u64,
+    lens: Option<String>,
+) -> AppResult<crate::github::issue::IssueReactions> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::mr_reactions(&repo_path, number).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket merge requests aren't supported yet.".into(),
+        )),
+        _ => github::pr_reactions(&repo_path, number, lens).await,
+    }
+}
+
+/// Add the viewer's reaction, behind the abstraction. The subject is carried in
+/// BOTH provider vocabularies (the shared-control different-identifiers rule):
+/// GitHub uses `subject_id` (a GraphQL node id — body or comment) and ignores
+/// `target`/`number`; GitLab uses `target` (`"issue"`/`"mr"`) + `number`, with
+/// `subject_id` empty for the body or the note id for a comment. Discussions
+/// (GitHub-only) ride the GitHub arm with `target: "discussion"`.
+#[tauri::command]
+pub async fn forge_add_reaction(
+    repo_path: String,
+    target: String,
+    number: u64,
+    subject_id: String,
+    content: String,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            let note_id = (!subject_id.is_empty()).then_some(subject_id.as_str());
+            gitlab::add_reaction(&repo_path, &target, number, note_id, &content).await
+        }
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket Cloud has no reactions.".into(),
+        )),
+        _ => github::add_reaction(&repo_path, &subject_id, &content).await,
+    }
+}
+
+/// Remove the viewer's reaction, behind the abstraction (same subject carriage
+/// as `forge_add_reaction`; GitLab resolves the award id server-side).
+#[tauri::command]
+pub async fn forge_remove_reaction(
+    repo_path: String,
+    target: String,
+    number: u64,
+    subject_id: String,
+    content: String,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            let note_id = (!subject_id.is_empty()).then_some(subject_id.as_str());
+            gitlab::remove_reaction(&repo_path, &target, number, note_id, &content).await
+        }
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket Cloud has no reactions.".into(),
+        )),
+        _ => github::remove_reaction(&repo_path, &subject_id, &content).await,
+    }
+}
+
+/// Set (or, with `None`, clear) an issue's milestone, behind the abstraction.
+/// `milestone` is whatever `forge_milestones` returned as `number` for the
+/// chosen entry.
+#[tauri::command]
+pub async fn forge_issue_set_milestone(
+    repo_path: String,
+    number: u64,
+    milestone: Option<u64>,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::set_issue_milestone(&repo_path, number, milestone).await
+        }
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => github::set_issue_milestone(&repo_path, number, milestone, lens).await,
+    }
+}
+
+/// The repo's labels for the label picker, behind the abstraction. GitHub lists them
+/// via GraphQL (each with a node id); GitLab lists project labels via `glab` (by name,
+/// no id). Used by both the issue and MR label pickers.
+#[tauri::command]
+pub async fn forge_repo_labels(
+    repo_path: String,
+    lens: Option<String>,
+) -> AppResult<Vec<crate::github::pr::RepoLabel>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::repo_labels(&repo_path).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket labels aren't supported yet.".into(),
+        )),
+        _ => github::repo_labels(&repo_path, lens).await,
+    }
+}
+
+/// The repo's assignable users for the assignee picker, behind the abstraction.
+/// GitHub lists repo assignees (avatar login-derived); GitLab lists project members
+/// (with their avatars). Returns `ForgeUserRef`s so the picker renders avatars.
+#[tauri::command]
+pub async fn forge_assignable_users(
+    repo_path: String,
+    lens: Option<String>,
+) -> AppResult<Vec<model::ForgeUserRef>> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::assignable_users(&repo_path).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket assignees aren't supported yet.".into(),
+        )),
+        _ => github::assignable_users(&repo_path, lens).await,
+    }
+}
+
+/// Add/remove labels on an issue or merge/pull request, behind the abstraction. A
+/// SHARED control: GitHub keys labels by GraphQL node id (`add_ids`/`remove_ids` on
+/// the `labelable_id`); GitLab keys them by name (`add_names`/`remove_names` on the
+/// numeric `number`). `target` is `"issue"` or `"mr"`. The caller passes both id and
+/// name deltas so each provider takes the pair it addresses by.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn forge_edit_labels(
+    repo_path: String,
+    target: String,
+    number: u64,
+    labelable_id: String,
+    add_ids: Vec<String>,
+    remove_ids: Vec<String>,
+    add_names: Vec<String>,
+    remove_names: Vec<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::edit_labels(&repo_path, &target, number, &add_names, &remove_names).await
+        }
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket labels aren't supported yet.".into(),
+        )),
+        _ => github::edit_labels(&repo_path, &labelable_id, add_ids, remove_ids).await,
+    }
+}
+
+/// Set an issue's assignees (the full desired set, by login), behind the abstraction.
+/// GitHub PATCHes the issue with the login set; GitLab resolves logins→ids and PUTs
+/// `assignee_ids`.
+#[tauri::command]
+pub async fn forge_issue_set_assignees(
+    repo_path: String,
+    number: u64,
+    assignees: Vec<String>,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::set_issue_assignees(&repo_path, number, &assignees).await
+        }
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket assignees aren't supported yet.".into(),
+        )),
+        _ => github::set_issue_assignees(&repo_path, number, assignees, lens).await,
+    }
+}
+
+/// Set a merge/pull request's assignees, behind the abstraction. GitHub PRs are
+/// issues under the hood, so the GitHub arm PATCHes the issues endpoint with the
+/// login set (reusing the issue assignee-set path — a PR number is valid there);
+/// GitLab resolves logins→ids and PUTs `assignee_ids`. Gated on
+/// `implemented.mrAssignees` (GitHub true, GitLab true, Bitbucket false).
+#[tauri::command]
+pub async fn forge_mr_set_assignees(
+    repo_path: String,
+    number: u64,
+    assignees: Vec<String>,
+    lens: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::set_mr_assignees(&repo_path, number, &assignees).await
+        }
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket assignees aren't supported yet.".into(),
+        )),
+        _ => github::set_issue_assignees(&repo_path, number, assignees, lens).await,
+    }
+}
+
+/// Create an issue, behind the abstraction. Returns the new number + URL. GitHub sends
+/// the full field set; GitLab takes everything but the org issue type (no analogue —
+/// the dialog hides that picker). `milestone` is whatever `forge_milestones` returned
+/// as `number`.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn forge_issue_create(
+    repo_path: String,
+    title: String,
+    body: String,
+    labels: Vec<String>,
+    assignees: Vec<String>,
+    milestone: Option<u64>,
+    issue_type: Option<String>,
+    lens: Option<String>,
+) -> AppResult<crate::github::pr::PrRef> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            gitlab::create_issue(&repo_path, &title, &body, &labels, &assignees, milestone).await
+        }
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket issues aren't supported yet.".into(),
+        )),
+        _ => {
+            github::create_issue(
+                &repo_path, &title, &body, labels, assignees, milestone, issue_type, lens,
+            )
+            .await
+        }
+    }
+}
+
+/// The repo's web URL for "View on GitHub/GitLab", behind the abstraction.
+#[tauri::command]
+pub async fn forge_repo_url(repo_path: String, lens: Option<String>) -> AppResult<String> {
+    match detect_legacy_forge(&repo_path).await? {
+        // The remote lens is GitHub-fork-only in this app's model, so the other
+        // two providers answer for their single repo whatever it says.
+        Some((Provider::GitLab, _)) => gitlab::repo_url(&repo_path).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::repo_url(&repo_path).await,
+        _ => github::repo_url(&repo_path, lens).await,
+    }
+}
+
+/// Whether the signed-in viewer has starred this repo, behind the abstraction.
+#[tauri::command]
+pub async fn forge_repo_star_status(repo_path: String) -> AppResult<bool> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::repo_star_status(&repo_path).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket repositories aren't supported yet.".into(),
+        )),
+        _ => github::repo_star_status(&repo_path).await,
+    }
+}
+
+/// Star / unstar this repo, behind the abstraction.
+#[tauri::command]
+pub async fn forge_repo_set_star(repo_path: String, starred: bool) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::repo_set_star(&repo_path, starred).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket repositories aren't supported yet.".into(),
+        )),
+        _ => github::repo_set_star(&repo_path, starred).await,
+    }
+}
+
+// ── Fork activity (Insights) ─────────────────────────────────────────────────
+
+/// The repo's most-recently-active forks plus the provider's total fork count, for
+/// the Insights fork-activity card. Wired for all three providers.
+#[tauri::command]
+pub async fn forge_fork_activity(repo_path: String) -> AppResult<ForgeForkActivity> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::fork_activity(&repo_path).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::fork_activity(&repo_path).await,
+        _ => github::fork_activity(&repo_path).await,
+    }
+}
+
+/// The card's totals — `(total_count, default_branch)` — from the provider's repo
+/// object, which GitHub and GitLab spell identically (`forks_count`,
+/// `default_branch`). An absent or unparsed object yields `(None, None)`: the fork
+/// rows still render, and a count the read couldn't measure stays absent rather than
+/// standing in the fetched page's length, which is capped and would read as the total.
+pub(crate) fn fork_totals_from_meta(
+    meta: Option<&serde_json::Value>,
+) -> (Option<u64>, Option<String>) {
+    use serde_json::Value;
+    (
+        meta.and_then(|v| v.get("forks_count"))
+            .and_then(Value::as_u64),
+        meta.and_then(|v| v.get("default_branch"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    )
+}
+
+/// The owner of a fork's `owner/name`, with BOTH segments validated through the
+/// shared path-segment grammar — the pair is interpolated into an API path. Exactly
+/// two segments: a fork row addressed for compare is GitHub-only, where nested
+/// namespaces don't exist.
+fn fork_owner_from_full_name(full_name: &str) -> AppResult<String> {
+    let mut parts = full_name.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(name), None) => {
+            validate_owner(owner)?;
+            validate_repo_name(name)?;
+            Ok(owner.to_string())
+        }
+        _ => Err(AppError::InvalidArgument(format!(
+            "invalid fork repository: {full_name}"
+        ))),
+    }
+}
+
+/// Whether a branch name is safe to interpolate into a compare `basehead`. Slashes
+/// stay legal (ordinary in ref names, and the greedy `...` capture handles them);
+/// `..` is refused because it would make the separator ambiguous, a leading `-`
+/// because it would read as a flag, and whitespace/control bytes because they can't
+/// reach argv intact. `#`, `?` and `%` are refused because the endpoint goes through
+/// a URL parser: each is git-legal in a ref yet would truncate the path at a fragment
+/// or query, or decode to a different ref — and `{`/`}` because `gh api` expands
+/// `{branch}`-style placeholders in the endpoint to local repo values. Any of these
+/// would make the API answer 200 for the WRONG branch, which renders as a
+/// confident number.
+pub(crate) fn validate_compare_branch(branch: &str) -> AppResult<()> {
+    if branch.is_empty()
+        || branch.starts_with('-')
+        || branch.contains("..")
+        || branch.contains(['#', '?', '%', '{', '}'])
+        || branch.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(AppError::InvalidArgument(format!(
+            "invalid branch name: {branch}"
+        )));
+    }
+    Ok(())
+}
+
+/// How far one fork's branch has diverged from a base branch on this repo. GitHub
+/// only — the other arms error, and the frontend gates the control on the
+/// `forkCompare` flag.
+#[tauri::command]
+pub async fn forge_fork_divergence(
+    repo_path: String,
+    fork_full_name: String,
+    base_branch: String,
+    fork_branch: String,
+) -> AppResult<ForgeForkDivergence> {
+    // Validate before ANY dispatch: all three values are interpolated into the
+    // compare path.
+    let fork_owner = fork_owner_from_full_name(&fork_full_name)?;
+    validate_compare_branch(&base_branch)?;
+    validate_compare_branch(&fork_branch)?;
+    match detect_legacy_forge(&repo_path).await? {
+        // GitLab's cross-project compare returns the full commit+diff payload
+        // (85.9 MB / 49 s measured on a stale fork, probed 2026-08-26) and Bitbucket
+        // has no cross-repo compare endpoint, so neither provider gets this read.
+        Some((Provider::GitLab, _)) => Err(AppError::InvalidArgument(
+            "Fork compare isn't available on GitLab.".into(),
+        )),
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Fork compare isn't available on Bitbucket.".into(),
+        )),
+        _ => github::fork_divergence(&repo_path, &fork_owner, &base_branch, &fork_branch).await,
+    }
+}
+
+/// Canonicalize a provider's raw visibility string to one of the three neutral
+/// values (`public` / `private` / `internal`), case-insensitively — gh emits
+/// uppercase, GitLab lowercase. An unrecognized/empty value maps to `None` so
+/// the caller errors rather than passing a guessed value to the UI.
+fn normalize_visibility(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "public" => Some("public"),
+        "private" => Some("private"),
+        "internal" => Some("internal"),
+        _ => None,
+    }
+}
+
+/// A provider's raw visibility probe result: the un-normalized visibility string
+/// plus fork provenance, gathered in a SINGLE round-trip (each provider already
+/// fetches the whole repo/project record, so fork-ness rides along for free —
+/// never a second API call). `is_fork` is set only on positive API evidence; a
+/// provider that can't say (no field, error) reports `false` + `parent: None`,
+/// so the absence of a badge never lies.
+pub struct RepoVisibilityRaw {
+    pub visibility: String,
+    pub is_fork: bool,
+    /// The upstream repo as an `owner/repo` slug when the API supplies it; `None`
+    /// when it's a fork but the parent slug isn't available.
+    pub parent: Option<String>,
+}
+
+/// The normalized visibility probe result the frontend consumes — the canonical
+/// visibility string plus fork provenance (camelCase over IPC). Backfilled onto
+/// the recent-repo record alongside `visibility` and cleared with it.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoVisibilityOut {
+    pub visibility: String,
+    pub is_fork: bool,
+    pub parent: Option<String>,
+}
+
+/// The repo's remote visibility (`public`/`private`/`internal`) plus fork-ness, for
+/// badging the repo list. Each arm returns a raw provider result whose visibility is
+/// canonicalized here; an undeterminable visibility errors rather than guessing, and
+/// fork-ness falls back to `false` (never a guess), so absence of the badge is honest.
+#[tauri::command]
+pub async fn forge_repo_visibility(repo_path: String) -> AppResult<RepoVisibilityOut> {
+    let raw = match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::repo_visibility(&repo_path).await?,
+        Some((Provider::Bitbucket, _)) => bitbucket::repo_visibility(&repo_path).await?,
+        _ => github::repo_visibility(&repo_path).await?,
+    };
+    let visibility = normalize_visibility(&raw.visibility)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            AppError::InvalidArgument(format!("unrecognized visibility: {}", raw.visibility))
+        })?;
+    Ok(RepoVisibilityOut {
+        visibility,
+        is_fork: raw.is_fork,
+        parent: raw.parent,
+    })
+}
+
+// ── Repository settings & lifecycle ──────────────────────────────────────────
+
+/// Whether the signed-in viewer can manage this repo's settings (`admin`), and
+/// whether they hold the owner-only lifecycle powers (`owner`). GitHub's admin
+/// role implies both; GitLab distinguishes Maintainer (settings) from Owner
+/// (transfer / delete / archive).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForgeRepoAdmin {
+    pub admin: bool,
+    pub owner: bool,
+}
+
+/// The settings-management probe, behind the abstraction — gates the
+/// "Repository settings…" surface.
+#[tauri::command]
+pub async fn forge_repo_admin(repo_path: String) -> AppResult<ForgeRepoAdmin> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => {
+            let (admin, owner) = gitlab::repo_admin(&repo_path).await?;
+            Ok(ForgeRepoAdmin { admin, owner })
+        }
+        Some((Provider::Bitbucket, _)) => {
+            // Bitbucket has no owner/admin distinction here (role=owner matched 0
+            // even for an admin), so owner := admin.
+            let admin = bitbucket::repo_admin(&repo_path).await?;
+            Ok(ForgeRepoAdmin {
+                admin,
+                owner: admin,
+            })
+        }
+        _ => {
+            let admin = crate::github::repo_settings::gh_repo_admin(repo_path).await?;
+            Ok(ForgeRepoAdmin {
+                admin,
+                owner: admin,
+            })
+        }
+    }
+}
+
+/// The viewer's push permission on a repo, as the frontend consumes it.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForgeRepoWriteAccess {
+    /// Some(true/false) only when the provider AFFIRMATIVELY answered;
+    /// None = unknown (failed/ambiguous probe) — the frontend fails OPEN on None.
+    pub can_push: Option<bool>,
+    /// Whether the viewer can manage issue/PR metadata (labels, assignees,
+    /// milestones, review requests, hide-comments) — GitHub's triage tier and
+    /// above; a tier BELOW push.
+    pub can_triage: Option<bool>,
+    /// The provider's tier label ("admin"/"maintain"/"write"/"triage"/"read" on
+    /// GitHub, "owner"/"maintainer"/"developer"/… on GitLab). Diagnostic only —
+    /// the two boolean axes do the gating; nothing on the frontend reads this.
+    pub role: Option<String>,
+    /// The probed repo identity ("owner/repo" / project path / "ws/slug") for UI copy.
+    pub repo: Option<String>,
+    pub unknown_reason: Option<String>,
+}
+
+/// Whether the signed-in viewer can PUSH to this repo — the viewer-PERMISSION
+/// probe, distinct from the provider-capability flags (what this app implements
+/// for a forge) and from the admin probe (who may manage settings). A `None`
+/// `can_push` means the probe couldn't answer: callers keep write controls
+/// ENABLED rather than hiding them on a guess.
+///
+/// `lens` is honored on the GitHub arm ONLY — a fork PR targets the PARENT repo,
+/// so the parent's permission is what gates its controls. The GitLab and
+/// Bitbucket surfaces in this app are origin-pinned (see `forge_pr_list`).
+#[tauri::command]
+pub async fn forge_repo_write_access(
+    repo_path: String,
+    lens: Option<String>,
+) -> AppResult<ForgeRepoWriteAccess> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::repo_write_access(&repo_path).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::repo_write_access(&repo_path).await,
+        _ => crate::github::repo_settings::gh_repo_write_access(repo_path, lens).await,
+    }
+}
+
+/// The GitLab project-settings read. GitLab-only — its settings model (feature
+/// access levels, one merge-method enum, a squash option) doesn't map onto
+/// GitHub's `RepoSettings`, so each provider keeps its own shaped surface
+/// (GitHub stays on `gh_repo_settings_get`).
+#[tauri::command]
+pub async fn forge_gl_repo_settings(repo_path: String) -> AppResult<gitlab::GitLabRepoSettings> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::repo_settings(&repo_path).await,
+        _ => Err(AppError::InvalidArgument(
+            "this repo isn't hosted on GitLab.".into(),
+        )),
+    }
+}
+
+/// Batch-save the GitLab project settings (the General section's Save).
+#[tauri::command]
+pub async fn forge_gl_repo_settings_update(
+    repo_path: String,
+    input: gitlab::GitLabRepoSettingsInput,
+) -> AppResult<gitlab::GitLabRepoSettings> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::update_repo_settings(&repo_path, input).await,
+        _ => Err(AppError::InvalidArgument(
+            "this repo isn't hosted on GitLab.".into(),
+        )),
+    }
+}
+
+/// The GitLab-only settings sub-surfaces (Members, Webhooks, CI/CD variables).
+/// Each guards on the detected provider like `forge_gl_repo_settings` — the
+/// GitHub dialog keeps its own gh-backed sections.
+macro_rules! gl_only {
+    ($repo_path:expr, $call:expr) => {
+        match detect_legacy_forge(&$repo_path).await? {
+            Some((Provider::GitLab, _)) => $call.await,
+            _ => Err(AppError::InvalidArgument(
+                "this repo isn't hosted on GitLab.".into(),
+            )),
+        }
+    };
+}
+
+/// The Bitbucket-only settings sub-surfaces (repo settings, default reviewers,
+/// branch restrictions, pipelines config/variables/schedules, webhooks). Mirrors
+/// [`gl_only!`] — each guards on the detected provider being Bitbucket.
+macro_rules! bb_only {
+    ($repo_path:expr, $call:expr) => {
+        match detect_legacy_forge(&$repo_path).await? {
+            Some((Provider::Bitbucket, _)) => $call.await,
+            _ => Err(AppError::InvalidArgument(
+                "this repo isn't hosted on Bitbucket.".into(),
+            )),
+        }
+    };
+}
+
+/// Mark an issue confidential (members-only) or public again. GitLab-unique —
+/// GitHub has no confidential-issue concept, so this is `gl_only` rather than a
+/// neutral `forge_issue_*` dispatch.
+#[tauri::command]
+pub async fn forge_gl_issue_set_confidential(
+    repo_path: String,
+    number: u64,
+    confidential: bool,
+) -> AppResult<()> {
+    gl_only!(
+        repo_path,
+        gitlab::set_issue_confidential(&repo_path, number, confidential)
+    )
+}
+
+/// Set (`Some("YYYY-MM-DD")`) or clear an issue's due date. GitLab-unique —
+/// GitHub issues have no due dates.
+#[tauri::command]
+pub async fn forge_gl_issue_set_due_date(
+    repo_path: String,
+    number: u64,
+    due_date: Option<String>,
+) -> AppResult<()> {
+    gl_only!(
+        repo_path,
+        gitlab::set_issue_due_date(&repo_path, number, due_date.as_deref())
+    )
+}
+
+#[tauri::command]
+pub async fn forge_gl_members(repo_path: String) -> AppResult<Vec<gitlab::GitLabMember>> {
+    gl_only!(repo_path, gitlab::list_members(&repo_path))
+}
+
+#[tauri::command]
+pub async fn forge_gl_member_add(
+    repo_path: String,
+    username: String,
+    access_level: u8,
+) -> AppResult<()> {
+    gl_only!(
+        repo_path,
+        gitlab::add_member(&repo_path, &username, access_level)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_gl_member_update(
+    repo_path: String,
+    user_id: String,
+    access_level: u8,
+) -> AppResult<()> {
+    gl_only!(
+        repo_path,
+        gitlab::update_member(&repo_path, &user_id, access_level)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_gl_member_remove(repo_path: String, user_id: String) -> AppResult<()> {
+    gl_only!(repo_path, gitlab::remove_member(&repo_path, &user_id))
+}
+
+#[tauri::command]
+pub async fn forge_gl_hooks(repo_path: String) -> AppResult<Vec<gitlab::GitLabHook>> {
+    gl_only!(repo_path, gitlab::list_hooks(&repo_path))
+}
+
+#[tauri::command]
+pub async fn forge_gl_hook_create(
+    repo_path: String,
+    input: gitlab::GitLabHookInput,
+) -> AppResult<()> {
+    gl_only!(repo_path, gitlab::create_hook(&repo_path, input))
+}
+
+#[tauri::command]
+pub async fn forge_gl_hook_update(
+    repo_path: String,
+    hook_id: String,
+    input: gitlab::GitLabHookInput,
+) -> AppResult<()> {
+    gl_only!(repo_path, gitlab::update_hook(&repo_path, &hook_id, input))
+}
+
+#[tauri::command]
+pub async fn forge_gl_hook_delete(repo_path: String, hook_id: String) -> AppResult<()> {
+    gl_only!(repo_path, gitlab::delete_hook(&repo_path, &hook_id))
+}
+
+#[tauri::command]
+pub async fn forge_gl_hook_test(
+    repo_path: String,
+    hook_id: String,
+    trigger: String,
+) -> AppResult<()> {
+    gl_only!(
+        repo_path,
+        gitlab::test_hook(&repo_path, &hook_id, &trigger)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_gl_hook_events(
+    repo_path: String,
+    hook_id: String,
+) -> AppResult<Vec<gitlab::GitLabHookDelivery>> {
+    gl_only!(repo_path, gitlab::hook_events(&repo_path, &hook_id))
+}
+
+#[tauri::command]
+pub async fn forge_gl_hook_resend(
+    repo_path: String,
+    hook_id: String,
+    event_id: String,
+) -> AppResult<()> {
+    gl_only!(
+        repo_path,
+        gitlab::hook_event_resend(&repo_path, &hook_id, &event_id)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_gl_variables(repo_path: String) -> AppResult<Vec<gitlab::GitLabVariable>> {
+    gl_only!(repo_path, gitlab::list_variables(&repo_path))
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // one flat arg per form field, IPC-shaped
+pub async fn forge_gl_variable_set(
+    repo_path: String,
+    key: String,
+    value: String,
+    protected: bool,
+    masked: bool,
+    create: bool,
+    scope: String,
+) -> AppResult<()> {
+    gl_only!(
+        repo_path,
+        gitlab::set_variable(&repo_path, &key, &value, protected, masked, create, &scope)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_gl_variable_delete(
+    repo_path: String,
+    key: String,
+    scope: String,
+) -> AppResult<()> {
+    gl_only!(repo_path, gitlab::delete_variable(&repo_path, &key, &scope))
+}
+
+/// The repo's protected branches, with per-action push/merge access levels.
+#[tauri::command]
+pub async fn forge_gl_protected_branches(
+    repo_path: String,
+) -> AppResult<Vec<gitlab::GitLabProtectedBranch>> {
+    gl_only!(repo_path, gitlab::list_protected_branches(&repo_path))
+}
+
+/// Protect a branch (or wildcard). Access levels are the Free-tier set {0, 30, 40}.
+#[tauri::command]
+pub async fn forge_gl_protected_branch_create(
+    repo_path: String,
+    name: String,
+    push_access_level: u8,
+    merge_access_level: u8,
+    allow_force_push: bool,
+) -> AppResult<()> {
+    gl_only!(
+        repo_path,
+        gitlab::create_protected_branch(
+            &repo_path,
+            &name,
+            push_access_level,
+            merge_access_level,
+            allow_force_push,
+        )
+    )
+}
+
+/// Update a protection. Only `allow_force_push` takes effect on Free tier.
+#[tauri::command]
+pub async fn forge_gl_protected_branch_update(
+    repo_path: String,
+    name: String,
+    allow_force_push: bool,
+) -> AppResult<()> {
+    gl_only!(
+        repo_path,
+        gitlab::update_protected_branch(&repo_path, &name, allow_force_push)
+    )
+}
+
+/// Remove a branch protection.
+#[tauri::command]
+pub async fn forge_gl_protected_branch_delete(repo_path: String, name: String) -> AppResult<()> {
+    gl_only!(
+        repo_path,
+        gitlab::delete_protected_branch(&repo_path, &name)
+    )
+}
+
+/// Project paths the viewer is a member of on THIS repo's host — the Move
+/// dialog's destination suggestions (host-correct for self-managed, unlike the
+/// account-scoped clone-browser listing).
+#[tauri::command]
+pub async fn forge_gl_member_projects(repo_path: String) -> AppResult<Vec<String>> {
+    gl_only!(repo_path, gitlab::member_projects(&repo_path))
+}
+
+/// Read a merge request's auto-merge state (armed flag, detailed merge status,
+/// head-pipeline summary). GitLab-only — the frontend gates the auto-merge
+/// affordance on this; GitHub has no in-app PR auto-merge control here.
+#[tauri::command]
+pub async fn forge_gl_mr_merge_state(
+    repo_path: String,
+    number: u64,
+) -> AppResult<gitlab::GitLabMrMergeState> {
+    gl_only!(repo_path, gitlab::mr_merge_state(&repo_path, number))
+}
+
+/// Arm auto-merge (merge-when-pipeline-succeeds) on a merge request. GitLab-only.
+#[tauri::command]
+pub async fn forge_gl_mr_auto_merge(
+    repo_path: String,
+    number: u64,
+    strategy: String,
+    delete_branch: bool,
+    sha: Option<String>,
+) -> AppResult<()> {
+    gl_only!(
+        repo_path,
+        gitlab::auto_merge_mr(&repo_path, number, &strategy, delete_branch, sha.as_deref())
+    )
+}
+
+/// Cancel a merge request's armed auto-merge. GitLab-only.
+#[tauri::command]
+pub async fn forge_gl_mr_cancel_auto_merge(repo_path: String, number: u64) -> AppResult<()> {
+    gl_only!(repo_path, gitlab::cancel_auto_merge_mr(&repo_path, number))
+}
+
+/// Remove the project's fork relationship (detach from the fork network). GitLab-only.
+#[tauri::command]
+pub async fn forge_gl_remove_fork_relationship(repo_path: String) -> AppResult<()> {
+    gl_only!(repo_path, gitlab::remove_fork_relationship(&repo_path))
+}
+
+/// The Findings tab's GitLab arm: security and quality reports read out of the
+/// newest completed pipeline's job artifacts. GitLab-only — GitHub's findings come
+/// from its own alert APIs (`github::security_findings`), not from CI artifacts.
+#[tauri::command]
+pub async fn forge_gl_pipeline_findings(
+    repo_path: String,
+    limit: Option<u32>,
+) -> AppResult<gitlab_findings::GlFindingsOut> {
+    gl_only!(
+        repo_path,
+        gitlab_findings::pipeline_findings(&repo_path, limit)
+    )
+}
+
+/// Code Insights reports on the remote branch tip, with default-branch fallback.
+#[tauri::command]
+pub async fn forge_bb_commit_findings(
+    repo_path: String,
+    limit: Option<u32>,
+) -> AppResult<bitbucket_findings::BbFindingsOut> {
+    bb_only!(
+        repo_path,
+        bitbucket_findings::commit_findings(&repo_path, limit)
+    )
+}
+
+/// Play (start) a manual CI job. GitLab-only — GitHub Actions has no per-job
+/// manual play, so this is `gl_only` rather than a neutral forge dispatch.
+#[tauri::command]
+pub async fn forge_gl_ci_play_job(repo_path: String, job_id: String) -> AppResult<()> {
+    let job_id = parse_ci_id("job", &job_id)?;
+    gl_only!(repo_path, gitlab::play_job(&repo_path, job_id))
+}
+
+/// An issue's time-tracking stats (estimate + spent). GitLab-only — GitHub has no
+/// native time tracking.
+#[tauri::command]
+pub async fn forge_gl_issue_time_stats(
+    repo_path: String,
+    number: u64,
+) -> AppResult<gitlab::GitLabTimeStats> {
+    gl_only!(repo_path, gitlab::issue_time_stats(&repo_path, number))
+}
+
+/// A merge request's time-tracking stats (estimate + spent). GitLab-only.
+#[tauri::command]
+pub async fn forge_gl_mr_time_stats(
+    repo_path: String,
+    number: u64,
+) -> AppResult<gitlab::GitLabTimeStats> {
+    gl_only!(repo_path, gitlab::mr_time_stats(&repo_path, number))
+}
+
+/// Set (or, when the duration is blank, reset) an issue's time estimate; returns
+/// the updated stats. GitLab-only.
+#[tauri::command]
+pub async fn forge_gl_issue_set_time_estimate(
+    repo_path: String,
+    number: u64,
+    duration: Option<String>,
+) -> AppResult<gitlab::GitLabTimeStats> {
+    gl_only!(
+        repo_path,
+        gitlab::issue_set_time_estimate(&repo_path, number, duration.as_deref())
+    )
+}
+
+/// Add to (or, when the duration is blank, reset) an issue's spent time; returns
+/// the updated stats. GitLab-only.
+#[tauri::command]
+pub async fn forge_gl_issue_add_spent_time(
+    repo_path: String,
+    number: u64,
+    duration: Option<String>,
+) -> AppResult<gitlab::GitLabTimeStats> {
+    gl_only!(
+        repo_path,
+        gitlab::issue_add_spent_time(&repo_path, number, duration.as_deref())
+    )
+}
+
+/// Set (or, when the duration is blank, reset) a merge request's time estimate;
+/// returns the updated stats. GitLab-only.
+#[tauri::command]
+pub async fn forge_gl_mr_set_time_estimate(
+    repo_path: String,
+    number: u64,
+    duration: Option<String>,
+) -> AppResult<gitlab::GitLabTimeStats> {
+    gl_only!(
+        repo_path,
+        gitlab::mr_set_time_estimate(&repo_path, number, duration.as_deref())
+    )
+}
+
+/// Add to (or, when the duration is blank, reset) a merge request's spent time;
+/// returns the updated stats. GitLab-only.
+#[tauri::command]
+pub async fn forge_gl_mr_add_spent_time(
+    repo_path: String,
+    number: u64,
+    duration: Option<String>,
+) -> AppResult<gitlab::GitLabTimeStats> {
+    gl_only!(
+        repo_path,
+        gitlab::mr_add_spent_time(&repo_path, number, duration.as_deref())
+    )
+}
+
+/// An issue's related issues (links). GitLab-only — GitHub has no native issue
+/// links.
+#[tauri::command]
+pub async fn forge_gl_issue_links(
+    repo_path: String,
+    number: u64,
+) -> AppResult<Vec<gitlab::GitLabLinkedIssue>> {
+    gl_only!(repo_path, gitlab::issue_links(&repo_path, number))
+}
+
+/// Link an issue to another issue (in this repo) as related. GitLab-only.
+#[tauri::command]
+pub async fn forge_gl_issue_link(
+    repo_path: String,
+    number: u64,
+    target_number: u64,
+) -> AppResult<()> {
+    gl_only!(
+        repo_path,
+        gitlab::link_issue(&repo_path, number, target_number)
+    )
+}
+
+/// Remove an issue link by its link id. GitLab-only.
+#[tauri::command]
+pub async fn forge_gl_issue_unlink(
+    repo_path: String,
+    number: u64,
+    link_id: String,
+) -> AppResult<()> {
+    gl_only!(
+        repo_path,
+        gitlab::unlink_issue(&repo_path, number, &link_id)
+    )
+}
+
+/// Rename the repository, behind the abstraction. GitHub renames the repo
+/// (old links redirect); GitLab renames both the display name and the URL slug
+/// (old paths redirect).
+#[tauri::command]
+pub async fn forge_repo_rename(
+    state: tauri::State<'_, crate::state::AppState>,
+    repo_path: String,
+    new_name: String,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::rename_repo(&repo_path, &new_name).await,
+        // Bitbucket's rename changes the slug and the OLD slug 404s (no redirect),
+        // so the local origin remote is rewritten — hence the state handle.
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::rename_repo(&state, &repo_path, &new_name).await
+        }
+        _ => crate::github::lifecycle::gh_repo_rename(repo_path, new_name).await,
+    }
+}
+
+/// Archive / unarchive the repository, behind the abstraction.
+#[tauri::command]
+pub async fn forge_repo_set_archived(repo_path: String, archived: bool) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::set_archived(&repo_path, archived).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Bitbucket doesn't support archiving repositories.".into(),
+        )),
+        _ => crate::github::lifecycle::gh_repo_set_archived(repo_path, archived).await,
+    }
+}
+
+/// Change the repository's visibility, behind the abstraction. All three take
+/// "public" / "private"; "internal" is GitHub/GitLab-only — Bitbucket rejects it.
+#[tauri::command]
+pub async fn forge_repo_set_visibility(repo_path: String, visibility: String) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::set_visibility(&repo_path, &visibility).await,
+        Some((Provider::Bitbucket, _)) => match visibility.as_str() {
+            "public" => bitbucket::set_visibility(&repo_path, false).await,
+            "private" => bitbucket::set_visibility(&repo_path, true).await,
+            "internal" => Err(AppError::InvalidArgument(
+                "Bitbucket has no internal visibility.".into(),
+            )),
+            other => Err(AppError::InvalidArgument(format!(
+                "unknown visibility: {other}"
+            ))),
+        },
+        _ => crate::github::lifecycle::gh_repo_set_visibility(repo_path, visibility).await,
+    }
+}
+
+/// Transfer the repository to another owner/namespace, behind the abstraction.
+/// GitHub takes a user/org (with an optional rename); GitLab a namespace path.
+#[tauri::command]
+pub async fn forge_repo_transfer(
+    repo_path: String,
+    new_owner: String,
+    new_name: Option<String>,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::transfer_repo(&repo_path, &new_owner).await,
+        Some((Provider::Bitbucket, _)) => Err(AppError::InvalidArgument(
+            "Transferring isn't available via the Bitbucket API — use the repository's settings on Bitbucket.".into(),
+        )),
+        _ => crate::github::lifecycle::gh_repo_transfer(repo_path, new_owner, new_name).await,
+    }
+}
+
+/// Permanently delete the repository on its provider. After the remote is gone the
+/// local `origin` is a dangling pointer, so it's removed — the repo then reads as
+/// unpublished (the header's "Publish repository…" button reappears).
+#[tauri::command]
+pub async fn forge_repo_delete(
+    state: tauri::State<'_, crate::state::AppState>,
+    repo_path: String,
+) -> AppResult<()> {
+    match detect_legacy_forge(&repo_path).await? {
+        Some((Provider::GitLab, _)) => gitlab::delete_repo(&repo_path).await,
+        Some((Provider::Bitbucket, _)) => bitbucket::delete_repo(&repo_path).await,
+        _ => crate::github::lifecycle::gh_repo_delete(repo_path.clone()).await,
+    }?;
+
+    // Drop the local `origin` so the repo reads as unpublished. An already-absent
+    // origin counts as success; any other failure AFTER the remote is gone discloses
+    // the partial state rather than masking it.
+    if let Err(e) = crate::git::runner::run_git_mutating(
+        &state,
+        &repo_path,
+        &["remote", "remove", "origin"],
+        crate::git::runner::DEFAULT_TIMEOUT,
+    )
+    .await
+    {
+        let already_absent = matches!(
+            &e,
+            AppError::Git { stderr, .. } if stderr.contains("No such remote")
+        );
+        if !already_absent {
+            return Err(AppError::Command(format!(
+                "The repository was deleted on the host, but the local 'origin' \
+                 remote couldn't be removed — remove it manually. ({e})"
+            )));
+        }
+    }
+    // origin is gone (either just removed, or already absent) — drop any cached URL so a
+    // forge query within the TTL sees the repo as unpublished instead of serving the stale
+    // (now-deleted) remote URL.
+    crate::git::remote::invalidate_remote_url_cache(&repo_path, "origin");
+    Ok(())
+}
+
+/// Owners the viewer can publish under — the GitHub publish owner picker.
+/// Account-scoped (no repo_path).
+#[tauri::command]
+pub async fn forge_gh_publish_owners() -> AppResult<crate::github::pr::GithubPublishOwners> {
+    crate::github::pr::gh_publish_owners().await
+}
+
+// ── Bitbucket settings sub-surfaces ──
+
+/// The viewer's Bitbucket workspaces — the publish target picker. Account-scoped
+/// (no repo_path); creds come from the keyring.
+#[tauri::command]
+pub async fn forge_bb_workspaces() -> AppResult<Vec<bitbucket::BitbucketWorkspace>> {
+    bitbucket::workspaces().await
+}
+
+/// The Bitbucket repository-settings read (Bitbucket repos only — its model is
+/// provider-shaped, like GitLab's).
+#[tauri::command]
+pub async fn forge_bb_repo_settings(
+    repo_path: String,
+) -> AppResult<bitbucket::BitbucketRepoSettings> {
+    bb_only!(repo_path, bitbucket::repo_settings(&repo_path))
+}
+
+/// Batch-save the Bitbucket repo settings (the General section's Save). Name and
+/// visibility are deliberately not here — the Danger zone owns them.
+#[tauri::command]
+pub async fn forge_bb_repo_settings_update(
+    repo_path: String,
+    input: bitbucket::BitbucketRepoSettingsInput,
+) -> AppResult<bitbucket::BitbucketRepoSettings> {
+    bb_only!(repo_path, bitbucket::update_repo_settings(&repo_path, input))
+}
+
+#[tauri::command]
+pub async fn forge_bb_default_reviewers(
+    repo_path: String,
+) -> AppResult<Vec<model::ForgeUserRef>> {
+    bb_only!(repo_path, bitbucket::default_reviewers(&repo_path))
+}
+
+#[tauri::command]
+pub async fn forge_bb_default_reviewer_add(repo_path: String, uuid: String) -> AppResult<()> {
+    bb_only!(repo_path, bitbucket::default_reviewer_add(&repo_path, &uuid))
+}
+
+#[tauri::command]
+pub async fn forge_bb_default_reviewer_remove(repo_path: String, uuid: String) -> AppResult<()> {
+    bb_only!(
+        repo_path,
+        bitbucket::default_reviewer_remove(&repo_path, &uuid)
+    )
+}
+
+/// Workspace members WITHOUT the PR-author exclusion — the default-reviewers picker.
+#[tauri::command]
+pub async fn forge_bb_member_candidates(
+    repo_path: String,
+) -> AppResult<Vec<model::ForgeUserRef>> {
+    bb_only!(repo_path, bitbucket::member_candidates(&repo_path))
+}
+
+#[tauri::command]
+pub async fn forge_bb_branch_restrictions(
+    repo_path: String,
+) -> AppResult<Vec<bitbucket::BitbucketBranchRestriction>> {
+    bb_only!(repo_path, bitbucket::branch_restrictions(&repo_path))
+}
+
+#[tauri::command]
+pub async fn forge_bb_branch_restriction_create(
+    repo_path: String,
+    kind: String,
+    pattern: String,
+    value: Option<u32>,
+) -> AppResult<()> {
+    bb_only!(
+        repo_path,
+        bitbucket::branch_restriction_create(&repo_path, &kind, &pattern, value)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_bb_branch_restriction_update(
+    repo_path: String,
+    id: String,
+    kind: String,
+    pattern: String,
+    value: Option<u32>,
+) -> AppResult<()> {
+    bb_only!(
+        repo_path,
+        bitbucket::branch_restriction_update(&repo_path, &id, &kind, &pattern, value)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_bb_branch_restriction_delete(repo_path: String, id: String) -> AppResult<()> {
+    bb_only!(
+        repo_path,
+        bitbucket::branch_restriction_delete(&repo_path, &id)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_bb_pipelines_config(
+    repo_path: String,
+) -> AppResult<bitbucket::BitbucketPipelinesConfig> {
+    bb_only!(repo_path, bitbucket::pipelines_config(&repo_path))
+}
+
+#[tauri::command]
+pub async fn forge_bb_pipelines_config_update(repo_path: String, enabled: bool) -> AppResult<()> {
+    bb_only!(
+        repo_path,
+        bitbucket::pipelines_config_update(&repo_path, enabled)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_bb_pipeline_variables(
+    repo_path: String,
+) -> AppResult<Vec<bitbucket::BitbucketPipelineVariable>> {
+    bb_only!(repo_path, bitbucket::pipeline_variables(&repo_path))
+}
+
+#[tauri::command]
+pub async fn forge_bb_pipeline_variable_create(
+    repo_path: String,
+    key: String,
+    value: String,
+    secured: bool,
+) -> AppResult<()> {
+    bb_only!(
+        repo_path,
+        bitbucket::pipeline_variable_create(&repo_path, &key, &value, secured)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_bb_pipeline_variable_update(
+    repo_path: String,
+    uuid: String,
+    value: String,
+    secured: bool,
+) -> AppResult<()> {
+    bb_only!(
+        repo_path,
+        bitbucket::pipeline_variable_update(&repo_path, &uuid, &value, secured)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_bb_pipeline_variable_delete(repo_path: String, uuid: String) -> AppResult<()> {
+    bb_only!(
+        repo_path,
+        bitbucket::pipeline_variable_delete(&repo_path, &uuid)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_bb_pipeline_schedules(
+    repo_path: String,
+) -> AppResult<Vec<bitbucket::BitbucketPipelineSchedule>> {
+    bb_only!(repo_path, bitbucket::pipeline_schedules(&repo_path))
+}
+
+#[tauri::command]
+pub async fn forge_bb_pipeline_schedule_create(
+    repo_path: String,
+    ref_name: String,
+    cron_pattern: String,
+    enabled: bool,
+) -> AppResult<()> {
+    bb_only!(
+        repo_path,
+        bitbucket::pipeline_schedule_create(&repo_path, &ref_name, &cron_pattern, enabled)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_bb_pipeline_schedule_set_enabled(
+    repo_path: String,
+    uuid: String,
+    enabled: bool,
+) -> AppResult<()> {
+    bb_only!(
+        repo_path,
+        bitbucket::pipeline_schedule_set_enabled(&repo_path, &uuid, enabled)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_bb_pipeline_schedule_delete(repo_path: String, uuid: String) -> AppResult<()> {
+    bb_only!(
+        repo_path,
+        bitbucket::pipeline_schedule_delete(&repo_path, &uuid)
+    )
+}
+
+#[tauri::command]
+pub async fn forge_bb_hooks(repo_path: String) -> AppResult<Vec<bitbucket::BitbucketHook>> {
+    bb_only!(repo_path, bitbucket::hooks(&repo_path))
+}
+
+#[tauri::command]
+pub async fn forge_bb_hook_create(
+    repo_path: String,
+    input: bitbucket::BitbucketHookInput,
+) -> AppResult<()> {
+    bb_only!(repo_path, bitbucket::hook_create(&repo_path, input))
+}
+
+#[tauri::command]
+pub async fn forge_bb_hook_update(
+    repo_path: String,
+    uuid: String,
+    input: bitbucket::BitbucketHookInput,
+) -> AppResult<()> {
+    bb_only!(repo_path, bitbucket::hook_update(&repo_path, &uuid, input))
+}
+
+#[tauri::command]
+pub async fn forge_bb_hook_delete(repo_path: String, uuid: String) -> AppResult<()> {
+    bb_only!(repo_path, bitbucket::hook_delete(&repo_path, &uuid))
+}
+
+// ── Bitbucket PR tasks + custom pipelines + environments ──
+
+/// A pull request's task checklist, in list order (Bitbucket-only —
+/// `implemented.pr_tasks`).
+#[tauri::command]
+pub async fn forge_bb_pr_tasks(
+    repo_path: String,
+    number: u64,
+) -> AppResult<Vec<bitbucket::PrTask>> {
+    bb_only!(repo_path, bitbucket::pr_tasks(&repo_path, number))
+}
+
+/// Create a PR task from free-text (empty text is rejected before the request).
+#[tauri::command]
+pub async fn forge_bb_pr_task_create(
+    repo_path: String,
+    number: u64,
+    text: String,
+) -> AppResult<bitbucket::PrTask> {
+    bb_only!(repo_path, bitbucket::pr_task_create(&repo_path, number, &text))
+}
+
+/// Edit a PR task's text (`task_id` is the numeric server id as a String).
+#[tauri::command]
+pub async fn forge_bb_pr_task_edit(
+    repo_path: String,
+    number: u64,
+    task_id: String,
+    text: String,
+) -> AppResult<bitbucket::PrTask> {
+    bb_only!(
+        repo_path,
+        bitbucket::pr_task_edit(&repo_path, number, &task_id, &text)
+    )
+}
+
+/// Resolve / unresolve a PR task.
+#[tauri::command]
+pub async fn forge_bb_pr_task_set_state(
+    repo_path: String,
+    number: u64,
+    task_id: String,
+    resolved: bool,
+) -> AppResult<bitbucket::PrTask> {
+    bb_only!(
+        repo_path,
+        bitbucket::pr_task_set_state(&repo_path, number, &task_id, resolved)
+    )
+}
+
+/// Delete a PR task.
+#[tauri::command]
+pub async fn forge_bb_pr_task_delete(
+    repo_path: String,
+    number: u64,
+    task_id: String,
+) -> AppResult<()> {
+    bb_only!(
+        repo_path,
+        bitbucket::pr_task_delete(&repo_path, number, &task_id)
+    )
+}
+
+/// The CUSTOM pipeline names declared in the working-tree `bitbucket-pipelines.yml`
+/// (the custom-dispatch picker's options). Reads the local file only (no network); a
+/// missing file yields an empty list.
+#[tauri::command]
+pub async fn forge_bb_custom_pipelines(repo_path: String) -> AppResult<Vec<String>> {
+    bb_only!(repo_path, bitbucket::custom_pipelines(&repo_path))
+}
+
+/// The repo's deployment environments, sorted by rank ascending (Bitbucket-only).
+#[tauri::command]
+pub async fn forge_bb_environments(
+    repo_path: String,
+) -> AppResult<Vec<bitbucket::BbEnvironment>> {
+    bb_only!(repo_path, bitbucket::environments(&repo_path))
+}
+
+/// Which providers this machine can publish a local repo to. A repo with no
+/// hosted remote has nothing to detect a provider from, so the publish UI asks
+/// explicitly and offers each ready target.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishTargets {
+    pub github: bool,
+    pub gitlab: bool,
+    pub bitbucket: bool,
+}
+
+#[tauri::command]
+pub async fn forge_publish_targets(repo_path: String) -> AppResult<PublishTargets> {
+    let gh = crate::github::pr::gh_status(repo_path)
+        .await
+        .map(|s| s.installed && s.authenticated)
+        .unwrap_or(false);
+    let gl = gitlab::cli_ready().await;
+    // Bitbucket is publishable iff an account is stored (keyring read, no network).
+    let bb = bitbucket::account().await.map(|a| a.is_some()).unwrap_or(false);
+    Ok(PublishTargets {
+        github: gh,
+        gitlab: gl,
+        bitbucket: bb,
+    })
+}
+
+/// Publish a local repo, behind the abstraction. The PROVIDER IS EXPLICIT — a
+/// not-yet-published repo has no remote to detect one from. GitHub creates +
+/// pushes via `gh repo create --push`; GitLab creates via `glab repo create`,
+/// wires `origin`, and pushes with the one-shot credential helper. GitLab has no
+/// homepage field (the dialog hides it) and drops it here.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // mirrors gh_publish_repo's field set + provider
+pub async fn forge_publish_repo(
+    state: tauri::State<'_, crate::state::AppState>,
+    provider: Provider,
+    repo_path: String,
+    name: String,
+    private: bool,
+    description: String,
+    homepage: String,
+    topics: Vec<String>,
+    // Optional — GitHub/GitLab arms ignore it; a missing arg deserializes to None.
+    workspace: Option<String>,
+) -> AppResult<String> {
+    match provider {
+        Provider::GitLab => {
+            gitlab::publish_repo(&state, &repo_path, &name, private, &description, &topics).await
+        }
+        // Bitbucket: homepage maps to `website`; topics are dropped (no topics on
+        // Bitbucket); `workspace` names the target (required).
+        Provider::Bitbucket => {
+            bitbucket::publish_repo(
+                &state,
+                &repo_path,
+                &name,
+                private,
+                &description,
+                &homepage,
+                workspace,
+            )
+            .await
+        }
+        Provider::GitHub => {
+            github::publish_repo(&repo_path, &name, private, &description, &homepage, topics)
+                .await
+        }
+        Provider::Cnb => Err(AppError::Command("CNB repository publishing is not implemented yet".into())),
+    }
+}
+
+/// Create a merge/pull request, behind the abstraction. Every arm pushes the head
+/// branch to origin first (an MR/PR needs it on the remote). GitHub and Bitbucket
+/// route that push through `credential_config_for_remote` like `forge_clone`; the
+/// GitLab arm injects glab's own one-shot helper (`clone_credential_config`).
+/// GitHub then delegates to `gh pr create`; GitLab POSTs the MR with draft mapped to
+/// the `Draft:` title prefix; Bitbucket POSTs after a duplicate-PR pre-guard (a
+/// duplicate create silently overwrites there). Returns the new number + URL.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn forge_pr_create(
+    state: tauri::State<'_, crate::state::AppState>,
+    repo_path: String,
+    base: String,
+    head: String,
+    title: String,
+    body: String,
+    draft: bool,
+    reviewers: Option<Vec<String>>,
+    labels: Option<Vec<String>>,
+    assignees: Option<Vec<String>>,
+    lens: Option<String>,
+) -> AppResult<crate::github::pr::PrRef> {
+    // Deref the managed `State` and delegate to the core, so non-Tauri callers (the
+    // MCP server) can create a PR with an `AppState` they own.
+    forge_pr_create_core(
+        &state, repo_path, base, head, title, body, draft, reviewers, labels, assignees, lens,
+    )
+    .await
+}
+
+/// The provider-dispatch core of [`forge_pr_create`], taking a plain `&AppState`
+/// (not a Tauri-managed `State`) so it is callable off the Tauri runtime — the MCP
+/// server's `create_pull_request` tool routes through it. The `#[tauri::command]`
+/// wrapper above delegates here after dereffing its `State`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forge_pr_create_core(
+    state: &crate::state::AppState,
+    repo_path: String,
+    base: String,
+    head: String,
+    title: String,
+    body: String,
+    draft: bool,
+    reviewers: Option<Vec<String>>,
+    labels: Option<Vec<String>>,
+    assignees: Option<Vec<String>>,
+    lens: Option<String>,
+) -> AppResult<crate::github::pr::PrRef> {
+    let detected = detect_non_github(&repo_path).await;
+    // The upstream lens (a fork contribution to the PARENT) is GitHub-only. Reject it
+    // for GitLab/Bitbucket BEFORE any dispatch or remote work (`None`/`Some("origin")`
+    // proceed as today; an unknown lens is caught in `gh_pr_create_core`).
+    if lens.as_deref() == Some("upstream") && detected.is_some() {
+        return Err(AppError::InvalidArgument(
+            "Creating a pull request on the upstream repository is currently supported for GitHub only.".into(),
+        ));
+    }
+    // Create-time reviewers are Bitbucket-only. GitHub/GitLab reject a non-empty list
+    // BEFORE dispatching (existing callers omit the key → `None` → untouched behavior).
+    if reviewers.as_deref().is_some_and(|r| !r.is_empty())
+        && !matches!(detected, Some((Provider::Bitbucket, _)))
+    {
+        return Err(AppError::InvalidArgument(
+            "Create-time reviewers aren't supported for this provider.".into(),
+        ));
+    }
+    // Mirror case: Bitbucket PRs have no label/assignee concept, so reject a non-empty
+    // list BEFORE dispatching.
+    let labels = labels.unwrap_or_default();
+    let assignees = assignees.unwrap_or_default();
+    if (!labels.is_empty() || !assignees.is_empty())
+        && matches!(detected, Some((Provider::Bitbucket, _)))
+    {
+        return Err(AppError::InvalidArgument(
+            "Labels and assignees aren't supported for Bitbucket pull requests.".into(),
+        ));
+    }
+    match detected {
+        Some((Provider::GitLab, _)) => {
+            gitlab::create_mr(
+                state, &repo_path, &base, &head, &title, &body, draft, &labels, &assignees,
+            )
+            .await
+        }
+        Some((Provider::Bitbucket, _)) => {
+            bitbucket::create_pr(
+                state,
+                &repo_path,
+                &base,
+                &head,
+                &title,
+                &body,
+                draft,
+                reviewers.as_deref().unwrap_or(&[]),
+            )
+            .await
+        }
+        Some((Provider::Cnb, _)) => {
+            if draft || !labels.is_empty() || !assignees.is_empty() {
+                return Err(AppError::InvalidArgument(
+                    "CNB pull creation does not accept draft, labels, or assignees.".into(),
+                ));
+            }
+            cnb_pr::create_pr(state, &repo_path, &head, &base, &title, &body).await
+        }
+        _ => {
+            crate::github::pr::gh_pr_create_core(
+                state, repo_path, base, head, title, body, draft, labels, assignees, lens,
+            )
+            .await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_host_parses_https_and_ssh_forms() {
+        assert_eq!(remote_host("https://github.com/o/r").as_deref(), Some("github.com"));
+        assert_eq!(
+            remote_host("https://gitlab.acme.com:8443/g/s/r.git").as_deref(),
+            Some("gitlab.acme.com"),
+        );
+        assert_eq!(remote_host("git@github.com:o/r.git").as_deref(), Some("github.com"));
+        assert_eq!(remote_host("ssh://git@gitlab.com/g/r.git").as_deref(), Some("gitlab.com"));
+        // Mixed case is normalized.
+        assert_eq!(remote_host("https://GitLab.com/o/r").as_deref(), Some("gitlab.com"));
+        // No host → None (local path).
+        assert_eq!(remote_host("/local/path"), None);
+    }
+
+    #[test]
+    fn remote_host_keeps_bracketed_ipv6_literals_whole() {
+        // The brackets ride along — they're git's own spelling and the only form a
+        // downstream `host[:port]` splitter reads correctly.
+        assert_eq!(
+            remote_host("https://[2001:db8::1]:8443/o/r").as_deref(),
+            Some("[2001:db8::1]"),
+        );
+        assert_eq!(
+            remote_host("https://[2001:DB8::1]/o/r").as_deref(),
+            Some("[2001:db8::1]"),
+        );
+        assert_eq!(
+            remote_host("ssh://git@[2001:db8::1]/g/r.git").as_deref(),
+            Some("[2001:db8::1]"),
+        );
+        // scp form: the `:` after `]` is the path separator.
+        assert_eq!(
+            remote_host("git@[2001:db8::1]:o/r.git").as_deref(),
+            Some("[2001:db8::1]"),
+        );
+        assert_eq!(
+            remote_host("https://user@[2001:db8::1]:8443/o/r").as_deref(),
+            Some("[2001:db8::1]"),
+        );
+        // An unterminated bracket or an empty one is no host at all.
+        assert_eq!(remote_host("https://[2001:db8::1/o/r"), None);
+        assert_eq!(remote_host("https://[]/o/r"), None);
+    }
+
+    /// The session health probe reads host and authority side by side under paired
+    /// github.com fallbacks, so a URL must yield both or neither.
+    #[test]
+    fn remote_host_and_authority_agree_on_having_a_host() {
+        for url in [
+            "https://[::1]junk/o/r",
+            "git@[2001:db8::1]junk:o/r.git",
+            "https://[::1/o]/r",
+            "https://[::1",
+            "https://[]",
+            "/local/path",
+        ] {
+            assert_eq!(remote_host(url), None, "host {url}");
+            assert_eq!(remote_authority(url), None, "authority {url}");
+        }
+    }
+
+    #[test]
+    fn remote_authority_keeps_the_port_remote_host_drops() {
+        // The whole point: a non-default port survives, verbatim.
+        assert_eq!(
+            remote_authority("https://gitlab.acme.com:8443/g/s/r.git").as_deref(),
+            Some("gitlab.acme.com:8443"),
+        );
+        // No port → identical to `remote_host`.
+        assert_eq!(
+            remote_authority("https://github.com/o/r").as_deref(),
+            Some("github.com"),
+        );
+        // An explicit default port is kept as written — git normalizes it either way.
+        assert_eq!(
+            remote_authority("https://gitlab.acme.com:443/g/r.git").as_deref(),
+            Some("gitlab.acme.com:443"),
+        );
+        // scp form: the `:` is a PATH separator, never a port.
+        assert_eq!(
+            remote_authority("git@github.com:o/r.git").as_deref(),
+            Some("github.com"),
+        );
+        // Userinfo is dropped, port kept.
+        assert_eq!(
+            remote_authority("https://user@gitlab.acme.com:8443/g/r.git").as_deref(),
+            Some("gitlab.acme.com:8443"),
+        );
+        // Scheme case doesn't matter; the host lowercases, the port rides along.
+        assert_eq!(
+            remote_authority("HTTPS://GitLab.Acme.com:8443/g/r").as_deref(),
+            Some("gitlab.acme.com:8443"),
+        );
+        // A degenerate empty port drops the `:`, matching the gate's bare host.
+        assert_eq!(
+            remote_authority("https://gitlab.example.com:/g/r.git").as_deref(),
+            Some("gitlab.example.com"),
+        );
+        // The full 5-digit range is a real port and survives.
+        assert_eq!(
+            remote_authority("https://gitlab.acme.com:65535/g/r.git").as_deref(),
+            Some("gitlab.acme.com:65535"),
+        );
+        // A non-numeric port is not a port — fall back to the bare host.
+        assert_eq!(
+            remote_authority("https://gitlab.acme.com:8443x/g/r.git").as_deref(),
+            Some("gitlab.acme.com"),
+        );
+        // No host → None (local path).
+        assert_eq!(remote_authority("/local/path"), None);
+    }
+
+    #[test]
+    fn remote_authority_brackets_ipv6_hosts_and_their_ports() {
+        assert_eq!(
+            remote_authority("https://[2001:db8::1]:8443/o/r").as_deref(),
+            Some("[2001:db8::1]:8443"),
+        );
+        assert_eq!(
+            remote_authority("https://[2001:db8::1]/o/r").as_deref(),
+            Some("[2001:db8::1]"),
+        );
+        assert_eq!(
+            remote_authority("HTTPS://[2001:DB8::1]:8443/o/r").as_deref(),
+            Some("[2001:db8::1]:8443"),
+        );
+        assert_eq!(
+            remote_authority("https://user@[::1]:8443/o/r").as_deref(),
+            Some("[::1]:8443"),
+        );
+        // scp form: the `:` after `]` is the path separator, never a port.
+        assert_eq!(
+            remote_authority("git@[2001:db8::1]:o/r.git").as_deref(),
+            Some("[2001:db8::1]"),
+        );
+        // A non-port segment falls back to the bare host, injection shapes included.
+        assert_eq!(
+            remote_authority("https://[2001:db8::1]:8443x/o/r").as_deref(),
+            Some("[2001:db8::1]"),
+        );
+        assert_eq!(
+            remote_authority("https://[2001:db8::1]:443.helper=!evil/o/r").as_deref(),
+            Some("[2001:db8::1]"),
+        );
+        // A remainder after `]` that isn't a `:port` is no authority, in either regime.
+        assert_eq!(remote_authority("https://[2001:db8::1]junk/o/r"), None);
+        assert_eq!(remote_authority("git@[2001:db8::1]junk:o/r.git"), None);
+        assert_eq!(remote_authority("https://[::1"), None);
+        assert_eq!(remote_authority("https://[]"), None);
+        assert_eq!(
+            remote_authority("https://[::1]:65535/o/r").as_deref(),
+            Some("[::1]:65535"),
+        );
+    }
+
+    #[test]
+    fn a_crafted_port_segment_never_reaches_a_credential_key() {
+        // A remote URL any opened repo's .git/config can carry. git splits a `-c` at its
+        // FIRST `=`, so keeping this port verbatim would key an attacker-chosen `!`-shell
+        // helper on `credential.https://github.com:443` — which matches plain github.com.
+        let poisoned = "https://github.com:443.helper=!evil #/o/r.git";
+        assert_eq!(remote_authority(poisoned).as_deref(), Some("github.com"));
+        // The gate's own spelling is unchanged, so the two agree again.
+        assert_eq!(remote_host(poisoned).as_deref(), Some("github.com"));
+    }
+
+    #[test]
+    fn is_safe_authority_admits_hosts_and_numeric_ports_only() {
+        assert!(is_safe_authority("github.com"));
+        assert!(is_safe_authority("gitlab.acme-corp.com:8443"));
+        assert!(is_safe_authority("gitlab.acme.com:65535"));
+        // Config/shell syntax a crafted remote can carry through the URL parse.
+        assert!(!is_safe_authority("github.com:443.helper=!evil #"));
+        assert!(!is_safe_authority("github.com;rm -rf /"));
+        assert!(!is_safe_authority("github.com:8443x"));
+        assert!(!is_safe_authority("git hub.com"));
+        assert!(!is_safe_authority("host:"));
+        assert!(!is_safe_authority("host:123456"));
+        assert!(!is_safe_authority(":8443"));
+        assert!(!is_safe_authority(""));
+    }
+
+    #[test]
+    fn is_safe_authority_admits_bracketed_ipv6_literals() {
+        assert!(is_safe_authority("[2001:db8::1]"));
+        assert!(is_safe_authority("[::1]"));
+        assert!(is_safe_authority("[2001:db8::1]:8443"));
+        assert!(is_safe_authority("[::ffff:192.0.2.1]"));
+        assert!(is_safe_authority("[::1]:65535"));
+        // Malformed brackets, and the unbracketed spelling no splitter reads right.
+        assert!(!is_safe_authority("[]"));
+        assert!(!is_safe_authority("[::1"));
+        assert!(!is_safe_authority("::1]"));
+        assert!(!is_safe_authority("2001:db8::1"));
+        // Brackets are IPv6-only, so an interior without a `:` is not one.
+        assert!(!is_safe_authority("[gh.com]"));
+        // The port rules are the bare host's, applied after the bracket close.
+        assert!(!is_safe_authority("[::1]:"));
+        assert!(!is_safe_authority("[::1]:123456"));
+        assert!(!is_safe_authority("[::1]:8443x"));
+        assert!(!is_safe_authority("[::1]x"));
+        assert!(!is_safe_authority("[::1] "));
+        // Config/shell syntax stays out, and a zone id fails closed.
+        assert!(!is_safe_authority("[::1];rm -rf /"));
+        assert!(!is_safe_authority("[::1%25eth0]"));
+        assert!(!is_safe_authority("[2001:db8::1]:443.helper=!evil #"));
+    }
+
+    /// The web authority's port rules, including the elision that has to agree
+    /// with the browser `URL` spelling the item side is parsed with.
+    #[test]
+    fn web_authority_elides_only_the_scheme_default_web_port() {
+        let a = |u: &str| web_authority(u).unwrap_or_default();
+
+        // https: the default elides, anything else is the instance's identity.
+        assert_eq!(a("https://gitlab.example/team/repo"), "gitlab.example");
+        assert_eq!(a("https://gitlab.example:443/team/repo"), "gitlab.example");
+        assert_eq!(
+            a("https://gitlab.example:8443/team/repo"),
+            "gitlab.example:8443"
+        );
+        // http keeps its own default.
+        assert_eq!(a("http://gitea.example:80/team/repo"), "gitea.example");
+        assert_eq!(
+            a("http://gitea.example:8080/team/repo"),
+            "gitea.example:8080"
+        );
+        // Case folds, so the two sides compare without either re-normalizing.
+        assert_eq!(a("https://GitLab.EXAMPLE/team/repo"), "gitlab.example");
+
+        // scp-style carries no port — that `:` opens the path.
+        assert_eq!(a("git@gitlab.example:team/repo.git"), "gitlab.example");
+
+        // A TRANSPORT port is dropped, never carried: ssh on 2222 beside a web UI
+        // on 443 is the common self-managed shape, and keeping it would make the
+        // checkout fail to match its own instance's items.
+        assert_eq!(a("ssh://git@gitlab.example:22/team/repo"), "gitlab.example");
+        assert_eq!(
+            a("ssh://git@gitlab.example:2222/team/repo"),
+            "gitlab.example"
+        );
+        assert_eq!(a("git://gitlab.example:9418/team/repo"), "gitlab.example");
+
+        // A bracketed IPv6 literal keeps its brackets, and its default elides.
+        assert_eq!(a("https://[2001:db8::1]:443/team/repo"), "[2001:db8::1]");
+        assert_eq!(
+            a("https://[2001:db8::1]:8443/team/repo"),
+            "[2001:db8::1]:8443"
+        );
+
+        // No parseable host → unproven.
+        assert_eq!(web_authority(""), None);
+        assert_eq!(web_authority("   "), None);
+        // A Windows drive-path remote reads as host "c" here, exactly as
+        // `remote_host`/`remote_authority` already spell it — harmless for an
+        // identity proof, since no provider item can present that authority.
+        assert_eq!(a("C:/local/path"), "c");
+    }
+
+    #[test]
+    fn is_https_remote_distinguishes_https_from_ssh() {
+        assert!(is_https_remote("https://github.com/o/r.git"));
+        assert!(!is_https_remote("git@github.com:o/r.git"));
+        assert!(!is_https_remote("ssh://git@github.com/o/r.git"));
+        // Plain http never matches the https-keyed helper entry we format.
+        assert!(!is_https_remote("http://github.example.com/o/r.git"));
+        // Schemes are case-insensitive; `HTTPS://` is still https.
+        assert!(is_https_remote("HTTPS://github.com/o/r.git"));
+        assert!(is_https_remote("  HttPs://github.com/o/r.git  "));
+        assert!(!is_https_remote("HTTP://github.example.com/o/r.git"));
+    }
+
+    #[test]
+    fn provider_for_remote_host_classifies_by_requested_host() {
+        let glab_hosts = vec!["gitlab.acme.com".to_string()];
+        // Canonical hosts route directly, no glab config needed.
+        assert_eq!(provider_for_remote_host("gitlab.com", &[]), Some(Provider::GitLab));
+        assert_eq!(provider_for_remote_host("bitbucket.org", &[]), Some(Provider::Bitbucket));
+        // github.com → None (gh-default routing), even if it somehow appears in glab_hosts.
+        assert_eq!(provider_for_remote_host("github.com", &glab_hosts), None);
+        // A glab-known custom host is self-managed GitLab.
+        assert_eq!(provider_for_remote_host("gitlab.acme.com", &glab_hosts), Some(Provider::GitLab));
+        // An unknown host (GHE or otherwise) → None.
+        assert_eq!(provider_for_remote_host("github.example.com", &glab_hosts), None);
+    }
+
+    #[test]
+    fn only_canonical_hosts_route_away_from_github() {
+        assert_eq!(provider_for_host("gitlab.com"), Some(Provider::GitLab));
+        assert_eq!(provider_for_host("bitbucket.org"), Some(Provider::Bitbucket));
+        // GitHub.com + Enterprise + self-managed GitLab → None: gh's own detection stays
+        // authoritative for GitHub; self-managed GitLab resolves later in `detect_non_github`.
+        assert_eq!(provider_for_host("github.com"), None);
+        assert_eq!(provider_for_host("github.acme.com"), None);
+        assert_eq!(provider_for_host("gitlab.acme.com"), None);
+    }
+
+    #[test]
+    fn remote_path_extracts_project_path() {
+        // https, with and without .git, default and custom port.
+        assert_eq!(remote_path("https://gitlab.com/group/repo.git").as_deref(), Some("group/repo"));
+        assert_eq!(remote_path("https://gitlab.com/group/repo").as_deref(), Some("group/repo"));
+        assert_eq!(
+            remote_path("https://gitlab.acme.com:8443/g/sub/repo.git").as_deref(),
+            Some("g/sub/repo"),
+        );
+        // scp form keeps the nested group path.
+        assert_eq!(remote_path("git@gitlab.com:group/sub/repo.git").as_deref(), Some("group/sub/repo"));
+        assert_eq!(remote_path("ssh://git@gitlab.com/group/repo.git").as_deref(), Some("group/repo"));
+        // GitHub `owner/repo` slug (what `gh_origin_slug` passes to `gh -R`),
+        // in https and scp forms with and without `.git`.
+        assert_eq!(remote_path("https://github.com/theBGuy/biome.git").as_deref(), Some("theBGuy/biome"));
+        assert_eq!(remote_path("git@github.com:theBGuy/biome.git").as_deref(), Some("theBGuy/biome"));
+        assert_eq!(remote_path("https://github.com/theBGuy/biome").as_deref(), Some("theBGuy/biome"));
+        // host only → no path.
+        assert_eq!(remote_path("https://gitlab.com"), None);
+        assert_eq!(remote_path("/local/path"), None);
+    }
+
+    #[test]
+    fn remote_path_parses_bracketed_hosts_and_refuses_malformed_ones() {
+        assert_eq!(
+            remote_path("git@[2001:db8::1]:group/sub/repo.git").as_deref(),
+            Some("group/sub/repo"),
+        );
+        assert_eq!(
+            remote_path("https://[2001:db8::1]:8443/g/r.git").as_deref(),
+            Some("g/r"),
+        );
+        // Host and separator but no path.
+        assert_eq!(remote_path("git@[::1]:"), None);
+        // The scp arm's own fail-closed refusals: an unterminated bracket, and a `/`
+        // inside the span (no IPv6 literal has one — remote_authority refuses it too,
+        // so the pair can't disagree and feed fork_url_from_origin a half-parse).
+        assert_eq!(remote_path("git@[::1:o/r"), None);
+        assert_eq!(remote_path("git@[2001:db8::1/path]:group/repo"), None);
+        // The remote_authority gate: URLs it refuses yield no path from either arm,
+        // so fork_url_from_origin can't splice onto a malformed origin.
+        assert_eq!(remote_path("https://[2001:db8::1/path]:8443/group/repo"), None);
+        assert_eq!(remote_path("git@[::1]junk:group/repo"), None);
+        // The gate also refuses an EMPTY authority, so a file:// remote no longer
+        // yields its filesystem path as a bogus owner/repo slug.
+        assert_eq!(remote_path("file:///srv/repos/x"), None);
+    }
+
+    #[test]
+    fn web_repo_url_derives_a_browser_link_from_any_remote_form() {
+        // https, with and without `.git`.
+        assert_eq!(
+            web_repo_url("https://github.com/theBGuy/biome.git").as_deref(),
+            Some("https://github.com/theBGuy/biome"),
+        );
+        assert_eq!(
+            web_repo_url("https://github.com/theBGuy/biome").as_deref(),
+            Some("https://github.com/theBGuy/biome"),
+        );
+        // scp-style ssh.
+        assert_eq!(
+            web_repo_url("git@github.com:theBGuy/biome.git").as_deref(),
+            Some("https://github.com/theBGuy/biome"),
+        );
+        // `ssh://` scheme.
+        assert_eq!(
+            web_repo_url("ssh://git@gitlab.com/group/repo.git").as_deref(),
+            Some("https://gitlab.com/group/repo"),
+        );
+        // GitLab subgroup — no per-provider path knowledge needed, `remote_path`
+        // already keeps the whole nested path.
+        assert_eq!(
+            web_repo_url("https://gitlab.com/group/sub/repo.git").as_deref(),
+            Some("https://gitlab.com/group/sub/repo"),
+        );
+        // Self-managed host with a port, both https and scp form.
+        assert_eq!(
+            web_repo_url("https://gitlab.acme.com:8443/g/r.git").as_deref(),
+            Some("https://gitlab.acme.com:8443/g/r"),
+        );
+        assert_eq!(
+            web_repo_url("git@git.corp.internal:team/svc.git").as_deref(),
+            Some("https://git.corp.internal/team/svc"),
+        );
+        // Host-only (no path) → nothing to open.
+        assert_eq!(web_repo_url("https://github.com"), None);
+        // A host string carrying config/shell-injection characters is refused by
+        // the safety gate rather than handed to the OS URL opener.
+        assert_eq!(web_repo_url("https://evil.com;rm -rf /path"), None);
+        // `ssh://` on a NON-default port is a transport port, not a web port — a
+        // self-managed host commonly runs git-over-SSH on 2222 (the standard move
+        // when the OS already owns 22) while the web UI stays on 443. Keeping the
+        // port here would send "View on Host" to the SSH listener.
+        assert_eq!(
+            web_repo_url("ssh://git@gitlab.acme.com:2222/group/repo.git").as_deref(),
+            Some("https://gitlab.acme.com/group/repo"),
+        );
+        // The https-scheme sibling of the same host+port DOES keep the port: a
+        // self-managed instance conventionally serves git-over-https and the web UI
+        // on the same port, unlike SSH.
+        assert_eq!(
+            web_repo_url("https://gitlab.acme.com:2222/group/repo.git").as_deref(),
+            Some("https://gitlab.acme.com:2222/group/repo"),
+        );
+        // An explicit `http://` origin (a self-managed instance with no TLS
+        // termination, the plain-HTTP Gitea shape) keeps its scheme — forcing
+        // `https` would point the browser at a listener that never answers there.
+        assert_eq!(
+            web_repo_url("http://gitea.internal:3000/group/repo.git").as_deref(),
+            Some("http://gitea.internal:3000/group/repo"),
+        );
+        // `ssh://` still defaults to `https` (no web-scheme information in an SSH
+        // transport URL) even though it's checked in the same branch as `http://`.
+        assert_eq!(
+            web_repo_url("ssh://git@gitea.internal/group/repo.git").as_deref(),
+            Some("https://gitea.internal/group/repo"),
+        );
+        // The port-dropping branch is keyed on "any non-http(s) scheme", not on a
+        // literal `ssh://` allowlist — `git+ssh://` and ported `git://`
+        // (git-daemon's default 9418) are transport ports too, and must drop them
+        // the same way `ssh://` does.
+        assert_eq!(
+            web_repo_url("git+ssh://git@gitea.internal:2222/group/repo.git").as_deref(),
+            Some("https://gitea.internal/group/repo"),
+        );
+        assert_eq!(
+            web_repo_url("git://gitea.internal:9418/group/repo.git").as_deref(),
+            Some("https://gitea.internal/group/repo"),
+        );
+        // Userinfo never reaches the OS URL opener — this app's own Bitbucket
+        // remotes embed a username (`strip_https_userinfo`'s reason for
+        // existing), and a GitLab PAT-in-URL remote is a real shape too. Both
+        // rely on `remote_authority`/`remote_path`'s own `rsplit_once('@')`
+        // stripping userinfo before the authority is read; pinned here since
+        // this is the one consumer that hands the result to a browser.
+        assert_eq!(
+            web_repo_url("https://user@bitbucket.org/ws/repo.git").as_deref(),
+            Some("https://bitbucket.org/ws/repo"),
+        );
+        assert_eq!(
+            web_repo_url("https://oauth2:glpat-fake@gitlab.com/g/r.git").as_deref(),
+            Some("https://gitlab.com/g/r"),
+        );
+    }
+
+    #[test]
+    fn fork_totals_stay_absent_when_the_repo_read_fails() {
+        // Both providers spell the repo object's keys the same way.
+        let meta = serde_json::json!({ "forks_count": 137, "default_branch": "main" });
+        assert_eq!(
+            fork_totals_from_meta(Some(&meta)),
+            (Some(137), Some("main".to_string()))
+        );
+        // The degrade path: no repo object at all (a failed or unparsed read).
+        assert_eq!(fork_totals_from_meta(None), (None, None));
+        // A repo object missing either field reports that field absent, not zero
+        // and not an empty branch name.
+        let sparse = serde_json::json!({ "name": "hello" });
+        assert_eq!(fork_totals_from_meta(Some(&sparse)), (None, None));
+        // A zero total is a real measurement and must survive as Some(0).
+        let unforked = serde_json::json!({ "forks_count": 0, "default_branch": "trunk" });
+        assert_eq!(
+            fork_totals_from_meta(Some(&unforked)),
+            (Some(0), Some("trunk".to_string()))
+        );
+    }
+
+    #[test]
+    fn fork_owner_requires_exactly_two_safe_segments() {
+        assert_eq!(
+            fork_owner_from_full_name("octocat/hello").unwrap(),
+            "octocat"
+        );
+        // A leading dot/underscore repo is legitimate and still passes the grammar.
+        assert_eq!(fork_owner_from_full_name("octocat/.github").unwrap(), "octocat");
+        // A space, a traversal segment, or a flag-leading segment is refused.
+        assert!(fork_owner_from_full_name("bad owner/x").is_err());
+        assert!(fork_owner_from_full_name("../x").is_err());
+        assert!(fork_owner_from_full_name("-flag/x").is_err());
+        assert!(fork_owner_from_full_name("owner/-flag").is_err());
+        // Not exactly two segments: a bare name, a nested path, an empty segment.
+        assert!(fork_owner_from_full_name("octocat").is_err());
+        assert!(fork_owner_from_full_name("group/sub/name").is_err());
+        assert!(fork_owner_from_full_name("octocat/").is_err());
+        assert!(fork_owner_from_full_name("").is_err());
+    }
+
+    #[test]
+    fn compare_branch_admits_slashes_and_refuses_separator_breakers() {
+        assert!(validate_compare_branch("main").is_ok());
+        // Slashes are ordinary in ref names and must not be rejected.
+        assert!(validate_compare_branch("feature/slashed-branch").is_ok());
+        // `..` would make the `...` basehead separator ambiguous.
+        assert!(validate_compare_branch("a/b..c").is_err());
+        assert!(validate_compare_branch("..").is_err());
+        assert!(validate_compare_branch("").is_err());
+        assert!(validate_compare_branch("-flag").is_err());
+        assert!(validate_compare_branch("has space").is_err());
+        assert!(validate_compare_branch("has\ttab").is_err());
+        assert!(validate_compare_branch("has\nnewline").is_err());
+        assert!(validate_compare_branch("has\u{0}null").is_err());
+        // `gh api` expands `{…}` placeholders to local repo values (probed live
+        // 2026-08-26: `branches/{branch}` resolved to the current branch).
+        assert!(validate_compare_branch("{branch}").is_err());
+        assert!(validate_compare_branch("a{b").is_err());
+        assert!(validate_compare_branch("a}b").is_err());
+        // URL-parser hazards: `#` truncates at the fragment and `?` at the query, so
+        // the compare would silently answer for a DIFFERENT ref; `%` decodes into one.
+        assert!(validate_compare_branch("feat#1").is_err());
+        assert!(validate_compare_branch("a?b").is_err());
+        assert!(validate_compare_branch("feat%2Fx").is_err());
+    }
+
+    #[test]
+    fn visibility_normalizes_case_insensitively_and_rejects_garbage() {
+        // gh's uppercase, GitLab's lowercase, and mixed case all canonicalize.
+        assert_eq!(normalize_visibility("PUBLIC"), Some("public"));
+        assert_eq!(normalize_visibility("public"), Some("public"));
+        assert_eq!(normalize_visibility("Private"), Some("private"));
+        assert_eq!(normalize_visibility("INTERNAL"), Some("internal"));
+        // Surrounding whitespace (e.g. a trailing newline from a CLI) is tolerated.
+        assert_eq!(normalize_visibility(" public\n"), Some("public"));
+        // Anything else → None so the caller errors rather than guessing.
+        assert_eq!(normalize_visibility("garbage"), None);
+        assert_eq!(normalize_visibility(""), None);
+    }
+
+    #[test]
+    fn repo_name_grammar_accepts_safe_names_and_rejects_injection() {
+        // Ordinary and punctuated names.
+        assert!(validate_repo_name("rust-lang").is_ok());
+        assert!(validate_repo_name("a.b_c-d").is_ok());
+        assert!(validate_repo_name("Repo123").is_ok());
+        // Legitimate dot/underscore-leading config repos (`.github`, `.gitlab`) and
+        // underscore-leading names are accepted.
+        assert!(validate_repo_name(".github").is_ok());
+        assert!(validate_repo_name(".gitlab").is_ok());
+        assert!(validate_repo_name("_name").is_ok());
+        // Leading `-` would be read as a flag by gh/glab.
+        assert!(validate_repo_name("-evil").is_err());
+        // A `;` (or any shell/query metachar) is rejected.
+        assert!(validate_repo_name("foo;bar").is_err());
+        // The two pure-traversal segments and empties are rejected.
+        assert!(validate_repo_name(".").is_err());
+        assert!(validate_repo_name("..").is_err());
+        assert!(validate_repo_name("").is_err());
+        // A name is a single segment — a slash is never allowed.
+        assert!(validate_repo_name("owner/name").is_err());
+    }
+
+    #[test]
+    fn owner_grammar_allows_nested_groups_but_validates_each_segment() {
+        // Single owner and a GitLab nested group path.
+        assert!(validate_owner("rust-lang").is_ok());
+        assert!(validate_owner("group/subgroup").is_ok());
+        assert!(validate_owner("a/b/c").is_ok());
+        // A bad segment anywhere in the path fails the whole owner.
+        assert!(validate_owner("group/-evil").is_err());
+        assert!(validate_owner("-evil/group").is_err());
+        assert!(validate_owner("group/..").is_err());
+        // Empty owner and empty segments (leading/trailing/double slash) are rejected.
+        assert!(validate_owner("").is_err());
+        assert!(validate_owner("/group").is_err());
+        assert!(validate_owner("group/").is_err());
+        assert!(validate_owner("a//b").is_err());
+    }
+
+    #[tokio::test]
+    async fn search_rejects_bad_sort_and_zero_page_before_dispatch() {
+        // Both guards fire before any provider dispatch (no CLI / network needed).
+        let bad_sort =
+            forge_search_repos(Provider::GitHub, "rust".into(), "nonsense".into(), 1).await;
+        assert!(matches!(bad_sort, Err(AppError::InvalidArgument(_))));
+        // page is 1-based; 0 is rejected.
+        let zero_page =
+            forge_search_repos(Provider::GitHub, "rust".into(), "best".into(), 0).await;
+        assert!(matches!(zero_page, Err(AppError::InvalidArgument(_))));
+    }
+
+    /// The one dispatch outcome reachable without a CLI or network: the Bitbucket
+    /// arm with no repos to ask answers a benign empty page rather than erroring
+    /// or spending a credential read. The GitHub and GitLab arms shell out, so
+    /// their dispatch is covered by their own modules' tests, not here.
+    #[tokio::test]
+    async fn my_work_bitbucket_with_no_repos_is_a_benign_empty_page() {
+        let empty = forge_my_work(Provider::Bitbucket, None).await;
+        let page = empty.expect("no repo paths is a benign empty page, not an error");
+        assert!(page.items.is_empty());
+        assert!(!page.truncated);
+        assert!(
+            forge_my_work(Provider::Bitbucket, Some(Vec::new()))
+                .await
+                .is_ok(),
+            "an explicitly empty repo list is the same benign case",
+        );
+    }
+
+    /// `futures_join_all`'s ORDER contract. Both `my_work` folds report the LAST
+    /// error of a set of concurrent fetches, so input order is what makes that
+    /// error deterministic rather than a race — and the primitive has five call
+    /// sites, so the contract is pinned here rather than at each of them.
+    #[tokio::test]
+    async fn futures_join_all_returns_input_order_not_completion_order() {
+        use std::cell::RefCell;
+
+        // Ready after `yields` re-polls, recording the order the futures ACTUALLY
+        // finish in. `yield_now` wakes the task itself, so that order is
+        // deterministic without betting on a timer.
+        async fn ready_after(yields: usize, value: usize, done: &RefCell<Vec<usize>>) -> usize {
+            for _ in 0..yields {
+                tokio::task::yield_now().await;
+            }
+            done.borrow_mut().push(value);
+            value
+        }
+
+        let done = RefCell::new(Vec::new());
+        let out = futures_join_all([
+            ready_after(4, 0, &done),
+            ready_after(0, 1, &done),
+            ready_after(2, 2, &done),
+        ])
+        .await;
+        // Recorded first, so the assertion below can't pass vacuously: the two
+        // orders provably differ, and only one of them is the contract.
+        assert_eq!(
+            done.into_inner(),
+            [1, 2, 0],
+            "the futures really do finish out of order"
+        );
+        assert_eq!(out, [0, 1, 2], "yet results must follow INPUT order");
+
+        // A future that is already ready must not cause a slower sibling to be
+        // dropped — every input produces exactly one output.
+        let done = RefCell::new(Vec::new());
+        let out = futures_join_all([ready_after(0, 10, &done), ready_after(3, 11, &done)]).await;
+        assert_eq!(out, [10, 11]);
+        assert_eq!(done.into_inner().len(), 2, "both futures ran to completion");
+
+        // Empty input yields empty output rather than tripping the
+        // `expect("all futures ready")` arm.
+        let done = RefCell::new(Vec::new());
+        let none: Vec<_> = (0..0).map(|i| ready_after(0, i, &done)).collect();
+        assert!(futures_join_all(none).await.is_empty());
+    }
+
+    /// The picker keys each source by name, so the wire shape is pinned here
+    /// rather than trusted to the `rename_all` attribute. (The command itself
+    /// probes gh, glab and the keyring — machine state, not a unit test.)
+    #[test]
+    fn my_work_sources_serializes_one_flag_per_provider() {
+        let wire = serde_json::to_value(MyWorkSources {
+            github: true,
+            gitlab: false,
+            bitbucket: true,
+        })
+        .unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"github": true, "gitlab": false, "bitbucket": true})
+        );
+    }
+
+    #[test]
+    fn cap_readme_leaves_small_bodies_and_truncates_on_char_boundary() {
+        // A short body is returned unchanged.
+        assert_eq!(cap_readme("hello"), "hello");
+        // Pad so the cap lands two bytes into a trailing 4-byte emoji — a naive byte
+        // slice would split the code point.
+        let pad_len = README_CAP - 2;
+        let mut body = "a".repeat(pad_len);
+        body.push('😀'); // 4 bytes; the cap at README_CAP falls inside it
+        let capped = cap_readme(&body);
+        // Never longer than the cap, and always valid UTF-8 ending on a boundary
+        // (the partial emoji is dropped, so the result is all the `a`s).
+        assert!(capped.len() <= README_CAP);
+        assert_eq!(capped.len(), pad_len);
+        assert!(capped.chars().all(|c| c == 'a'));
+    }
+
+    /// `forge_ensure_fork_remote_core` against a real repo (temp_dir, git on PATH):
+    /// it must be idempotent, must build the fork URL in origin's own scheme, and
+    /// must prefer an EXISTING remote whose URL already points at the fork over
+    /// minting an owner-named one.
+    #[tokio::test]
+    async fn ensure_fork_remote_is_idempotent_and_prefers_a_url_match() {
+        use crate::git::runner::{run_git, DEFAULT_TIMEOUT};
+
+        async fn run(repo: &str, args: &[&str]) -> String {
+            run_git(Some(repo), args, DEFAULT_TIMEOUT)
+                .await
+                .unwrap()
+                .stdout_lossy()
+        }
+        async fn remotes(repo: &str) -> Vec<String> {
+            run(repo, &["remote"])
+                .await
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        }
+
+        let dir = tempfile::Builder::new()
+            .prefix("gd-forge-fork-remote-")
+            .tempdir()
+            .expect("create temp dir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        run(&repo_s, &["init", "-q"]).await;
+        run(
+            &repo_s,
+            &["remote", "add", "origin", "https://github.com/base/proj.git"],
+        )
+        .await;
+
+        let state = crate::state::AppState::default();
+        let first = forge_ensure_fork_remote_core(
+            &state,
+            repo_s.clone(),
+            "contrib".into(),
+            "proj".into(),
+        )
+        .await
+        .expect("first call adds the remote");
+        assert_eq!(first, "contrib");
+        assert_eq!(
+            run(&repo_s, &["remote", "get-url", "contrib"]).await.trim(),
+            "https://github.com/contrib/proj.git",
+            "the fork URL follows origin's https scheme"
+        );
+
+        let second = forge_ensure_fork_remote_core(
+            &state,
+            repo_s.clone(),
+            "contrib".into(),
+            "proj".into(),
+        )
+        .await
+        .expect("second call is a no-op");
+        assert_eq!(second, "contrib");
+        assert_eq!(
+            remotes(&repo_s).await,
+            vec!["contrib".to_string(), "origin".to_string()],
+            "no duplicate remote on the second call"
+        );
+
+        // A user's own remote already pointing at another fork wins over the
+        // owner-derived name — matched despite the missing `.git` and cased host.
+        run(
+            &repo_s,
+            &["remote", "add", "mine", "https://GitHub.com/other/proj"],
+        )
+        .await;
+        let matched =
+            forge_ensure_fork_remote_core(&state, repo_s.clone(), "other".into(), "proj".into())
+                .await
+                .expect("url match wins");
+        assert_eq!(matched, "mine");
+        assert!(
+            !remotes(&repo_s).await.iter().any(|n| n == "other"),
+            "a URL match must not mint an owner-named remote"
+        );
+
+        // Origin's own URL shape is spliced, not rebuilt from a bare host: scheme,
+        // userinfo and PORT must survive, or the remote git happily adds is one it
+        // can never reach.
+        for (tag, origin, expected) in [
+            ("scp", "git@github.com:base/proj.git", "git@github.com:contrib/proj.git"),
+            (
+                "ssh-port",
+                "ssh://git@ghe.acme.com:2222/base/proj.git",
+                "ssh://git@ghe.acme.com:2222/contrib/proj.git",
+            ),
+            (
+                "https-port",
+                "https://ghe.acme.com:8443/base/proj.git",
+                "https://ghe.acme.com:8443/contrib/proj.git",
+            ),
+            // No `.git` on origin ⇒ none on the fork URL either.
+            ("no-suffix", "https://ghe.acme.com:8443/base/proj", "https://ghe.acme.com:8443/contrib/proj"),
+        ] {
+            let sub = dir.path().join(tag);
+            std::fs::create_dir_all(&sub).unwrap();
+            let sub_s = sub.to_string_lossy().into_owned();
+            run(&sub_s, &["init", "-q"]).await;
+            run(&sub_s, &["remote", "add", "origin", origin]).await;
+            forge_ensure_fork_remote_core(&state, sub_s.clone(), "contrib".into(), "proj".into())
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: {e:?}"));
+            assert_eq!(
+                run(&sub_s, &["remote", "get-url", "contrib"]).await.trim(),
+                expected,
+                "origin {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_url_splices_the_path_and_keeps_scheme_userinfo_and_port() {
+        let f = |url: &str| fork_url_from_origin(url, "contrib", "proj");
+        assert_eq!(
+            f("https://ghe.acme.com:8443/base/proj.git").as_deref(),
+            Some("https://ghe.acme.com:8443/contrib/proj.git")
+        );
+        assert_eq!(
+            f("ssh://git@ghe.acme.com:2222/base/proj.git").as_deref(),
+            Some("ssh://git@ghe.acme.com:2222/contrib/proj.git")
+        );
+        assert_eq!(
+            f("git@github.com:base/proj.git").as_deref(),
+            Some("git@github.com:contrib/proj.git")
+        );
+        // A GitLab subgroup path is replaced whole — the fork lives at the top level.
+        assert_eq!(
+            f("https://gitlab.com/group/sub/proj.git").as_deref(),
+            Some("https://gitlab.com/contrib/proj.git")
+        );
+        // `.git` and a trailing slash ride only when origin carried them.
+        assert_eq!(
+            f("https://github.com/base/proj").as_deref(),
+            Some("https://github.com/contrib/proj")
+        );
+        assert_eq!(
+            f("https://github.com/base/proj.git/").as_deref(),
+            Some("https://github.com/contrib/proj.git")
+        );
+        // No repo path to splice → None, so the caller errors instead of guessing.
+        assert_eq!(f("https://github.com"), None);
+        assert_eq!(f(""), None);
+    }
+
+    #[test]
+    fn fork_url_splices_a_bracketed_ipv6_origin() {
+        assert_eq!(
+            fork_url_from_origin("https://[2001:db8::1]:8443/old/repo.git", "owner", "repo")
+                .as_deref(),
+            Some("https://[2001:db8::1]:8443/owner/repo.git"),
+        );
+    }
+
+    /// The frontend keys off these exact names, and an unknown probe must travel
+    /// as a JSON `null` (not an omitted field) so it reads as "fails open".
+    #[test]
+    fn write_access_serializes_camel_case_wire_keys() {
+        let known = serde_json::to_value(ForgeRepoWriteAccess {
+            can_push: Some(false),
+            can_triage: Some(true),
+            role: Some("triage".into()),
+            repo: Some("o/r".into()),
+            unknown_reason: None,
+        })
+        .unwrap();
+        assert_eq!(
+            known,
+            serde_json::json!({
+                "canPush": false,
+                "canTriage": true,
+                "role": "triage",
+                "repo": "o/r",
+                "unknownReason": null,
+            })
+        );
+
+        let unknown = serde_json::to_value(ForgeRepoWriteAccess {
+            can_push: None,
+            can_triage: None,
+            role: None,
+            repo: Some("o/r".into()),
+            unknown_reason: Some("HTTP 404".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            unknown,
+            serde_json::json!({
+                "canPush": null,
+                "canTriage": null,
+                "role": null,
+                "repo": "o/r",
+                "unknownReason": "HTTP 404",
+            })
+        );
+    }
+
+    #[test]
+    fn parse_ci_id_pins_the_observable_error_text() {
+        // These strings cross the IPC boundary to the UI, so they are behavior, not
+        // diagnostics: the eight CI command sites — `forge_ci_*` plus
+        // `forge_gl_ci_play_job` — must keep emitting them verbatim.
+        let msg = |kind, raw| match parse_ci_id(kind, raw).unwrap_err() {
+            AppError::InvalidArgument(s) => s,
+            other => panic!("expected InvalidArgument, got {other}"),
+        };
+        assert_eq!(msg("run", "abc"), "Invalid run id: abc");
+        assert_eq!(msg("job", "not-a-number"), "Invalid job id: not-a-number");
+        // Empty and negative both fail the u64 parse, and the raw input echoes back as-is.
+        assert_eq!(msg("run", ""), "Invalid run id: ");
+        assert_eq!(msg("job", "-1"), "Invalid job id: -1");
+        // 2^53 + 1 — not representable as an f64, so a JSON-number param would round it
+        // to 2^53. Surviving intact is the reason the params ride the wire as strings.
+        assert_eq!(
+            parse_ci_id("run", "9007199254740993").unwrap(),
+            9_007_199_254_740_993
+        );
+    }
+}

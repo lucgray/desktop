@@ -1,0 +1,451 @@
+import {
+  ArrowLeftIcon,
+  ArrowSquareOutIcon,
+  GearSixIcon,
+  GithubLogoIcon,
+  TerminalIcon,
+} from "@phosphor-icons/react";
+import { useQueryClient } from "@tanstack/react-query";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { useEffect, useRef } from "react";
+import { PathText } from "@/components/path-text";
+import { useRelativeNow } from "@/components/relative-time";
+import { Button } from "@/components/ui/button";
+import { openInTerminal } from "@/lib/git/api";
+import {
+  useForgeSessionHealth,
+  useForgeStatus,
+  usePathPresent,
+  useRemotes,
+} from "@/lib/git/queries";
+import { providerLabel, rateLimitResetTime } from "@/lib/git/types";
+import { useSettings } from "@/lib/settings/queries";
+import { useUiStore } from "@/lib/stores/ui";
+import { toastError } from "@/lib/toast";
+import { useTranslation } from "@/lib/i18n";
+import { PublishRepoControl, usePublishProviders } from "./PublishRepoControl";
+
+/** Where a Bitbucket / Atlassian API token is created. */
+const ATLASSIAN_TOKEN_URL =
+  "https://id.atlassian.com/manage-profile/security/api-tokens";
+
+/**
+ * Shared "this hosted feature isn't available" empty state for the Pull
+ * Requests, Issues, Discussions, Actions, and Findings tabs. Names the actual
+ * blocker and pairs it with the one action that resolves it, so the tab is a
+ * path forward instead of a dead end. `feature` is the noun the message reads
+ * with ("pull requests", "workflow runs").
+ *
+ * A missing checkout folder outranks every provider arm: a repo-scoped read on a
+ * deleted path fails exactly like a signed-out CLI, so without this arm the panel
+ * would send the user to `gh auth status` for a folder that simply isn't there.
+ *
+ * Provider-aware, with the publish path taking precedence: when this repo has
+ * no origin and ≥1 provider can publish it, the panel offers the shared
+ * "Publish repository…" control (a menu when 2+ are ready) instead of the gh
+ * setup ladder. Otherwise GitHub walks the gh setup ladder (install → sign in
+ * → publish, or — if gh is ready but the repo isn't resolvable — a `gh auth
+ * status` diagnostic); GitLab walks the analogous glab ladder (install → sign
+ * in), then — if glab is ready but the repo still isn't resolvable to a GitLab
+ * project — points at `glab auth status`; Bitbucket walks the connect-account
+ * ladder — no saved Atlassian API token → connect one, a saved token that won't
+ * authenticate → update it — both deep-linking to Settings → Accounts. A
+ * rate-limited GitHub or GitLab session outranks each ladder's sign-in arms,
+ * which a rate limit would otherwise trip, and a GitHub repo lookup refused by a
+ * rate limit outranks the `gh auth status` diagnostic.
+ */
+export function ForgeNotReady({
+  repoPath,
+  feature,
+}: {
+  repoPath: string;
+  feature: string;
+}) {
+  const { t } = useTranslation();
+  const forge = useForgeStatus(repoPath);
+  const settings = useSettings();
+  const openSettings = useUiStore((s) => s.openSettings);
+  const openReconnect = useUiStore((s) => s.openReconnect);
+  const closeRepo = useUiStore((s) => s.closeRepo);
+  const queryClient = useQueryClient();
+  // Render precedence only — `useForgeStatus` and the panels' own reads stay
+  // ungated, so a pending probe changes nothing and only a measured `false`
+  // takes over the panel.
+  const present = usePathPresent(repoPath);
+  const prevPresent = useRef<{ repo: string; missing: boolean } | null>(null);
+  // A restored folder recovers without a restart: forge-status carries a 60s
+  // staleTime and remotes was read against the dead path, so this repo's own
+  // false → true transition re-reads both. The first resolve and a repo switch
+  // are not transitions — there is nothing poisoned to replace.
+  useEffect(() => {
+    if (present.data === undefined) return;
+    const prev = prevPresent.current;
+    prevPresent.current = { repo: repoPath, missing: !present.data };
+    if (!prev || prev.repo !== repoPath || !prev.missing || !present.data) {
+      return;
+    }
+    queryClient.invalidateQueries({
+      queryKey: ["repo", repoPath, "forge-status"],
+    });
+    queryClient.invalidateQueries({ queryKey: ["repo", repoPath, "remotes"] });
+  }, [present.data, repoPath, queryClient]);
+  // A dead session shows as `broken`; "offline" (inconclusive probe) reads like
+  // any non-broken state and changes nothing here, so a network blip never flips
+  // the copy or the button mode (anti-flap).
+  const health = useForgeSessionHealth(repoPath);
+  const sessionBroken = health.data?.state === "broken";
+  const healthLogin = health.data?.login ?? null;
+  // Health outranks forge-status here: a rate-limited host reads as signed out (the
+  // per-host probe authenticates only Healthy; old gh's global exit code agrees), so
+  // the sign-in arms would misdirect.
+  const rateLimitedProvider =
+    health.data?.state === "rateLimited" ? health.data.provider : null;
+
+  const provider = forge.data?.provider;
+  const installed = Boolean(forge.data?.installed);
+  const authed = Boolean(forge.data?.authenticated);
+  const remotes = useRemotes(repoPath);
+  const noOrigin = remotes.isSuccess && !remotes.data.includes("origin");
+  // A repo with no hosted remote has nothing to detect a provider from, so
+  // publish targets are probed explicitly (which CLIs are installed + signed
+  // in), yielding the ready providers in a stable order. This is what lets a
+  // glab-only machine publish to GitLab even while the gh ladder below is still
+  // asking for the GitHub CLI. Gated on the repo actually having NO origin:
+  // provider is ALSO null for repos whose remote gh simply can't identify (gh
+  // signed out, an unrecognized host) — publishing those would create an orphan
+  // project and then fail adding `origin`.
+  const providers = usePublishProviders(
+    repoPath,
+    provider == null && Boolean(forge.data) && noOrigin,
+  );
+
+  // The folder is gone: name that and offer the one way out. Nothing about the
+  // forge is knowable from a dead path, so no provider copy runs. While the probe
+  // is pending the arms below render unchanged.
+  if (present.data === false) {
+    return (
+      <div className="space-y-2.5 px-3 py-4 text-xs text-muted-foreground">
+                    <p>{t("forgeNotReady.folderMissing")}</p>
+        <PathText path={repoPath} className="font-mono text-foreground" />
+        <Button
+          variant="outline"
+          size="sm"
+          className="cursor-pointer"
+          onClick={closeRepo}
+        >
+          <ArrowLeftIcon data-icon="inline-start" />
+          {t("forgeNotReady.backToRepositories")}
+        </Button>
+      </div>
+    );
+  }
+
+  // GitLab: `glab` is wired (status detects install + sign-in) — walk the glab
+  // setup ladder (install → sign in). If glab is already ready, this repo just
+  // couldn't be resolved to a GitLab project; point at `glab auth status`. (A
+  // not-ready GitHub repo has provider `null`, so it skips this and falls through
+  // to the gh ladder below, unchanged.)
+  if (provider === "gitlab") {
+    if (!forge.data?.installed) {
+      return (
+        <div className="space-y-2.5 px-3 py-4 text-xs text-muted-foreground">
+          <p>
+            {t("forgeNotReady.gitlabCliMissingPrefix")} <span className="font-mono">glab</span>{t("forgeNotReady.gitlabCliMissingSuffix", { feature })}
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() =>
+              openUrl("https://gitlab.com/gitlab-org/cli#installation")
+            }
+            className="cursor-pointer"
+          >
+            <ArrowSquareOutIcon data-icon="inline-start" />
+            {t("forgeNotReady.installGitlabCli")}
+          </Button>
+        </div>
+      );
+    }
+    if (rateLimitedProvider === "gitlab") {
+      return (
+        <RateLimitedNotice
+          repoPath={repoPath}
+          provider="gitlab"
+          feature={feature}
+          resetAt={health.data?.resetAt}
+          checkedAt={health.dataUpdatedAt}
+        />
+      );
+    }
+    if (!forge.data?.authenticated) {
+      const host = forge.data?.host ?? health.data?.host ?? "gitlab.com";
+      return (
+        <div className="space-y-2.5 px-3 py-4 text-xs text-muted-foreground">
+          <p>
+            {sessionBroken
+              ? t("forgeNotReady.sessionExpired", { provider: "GitLab", login: healthLogin ? ` @${healthLogin}` : "", feature })
+              : t("forgeNotReady.signIn", { provider: "GitLab", feature })}
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              className="cursor-pointer"
+              onClick={() =>
+                openReconnect({
+                  provider: "gitlab",
+                  host,
+                  mode: sessionBroken ? "refresh" : "login",
+                })
+              }
+            >
+              {sessionBroken ? t("forgeNotReady.reconnect", { provider: "GitLab" }) : t("forgeNotReady.signInButton", { provider: "GitLab" })}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() =>
+                openInTerminal(
+                  repoPath,
+                  settings.data?.terminal,
+                  settings.data?.terminalPath,
+                  settings.data?.terminalCommand,
+                ).catch(toastError)
+              }
+            >
+              <TerminalIcon data-icon="inline-start" />
+              {t("forgeNotReady.openTerminalToSignIn")}
+            </Button>
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            {t("forgeNotReady.oauthTip")}
+          </p>
+        </div>
+      );
+    }
+    return (
+      <div className="px-3 py-4 text-xs text-muted-foreground">
+        <p>
+          {t("forgeNotReady.couldNotConnect", { provider: "GitLab", feature })}{" "}
+          {t("forgeNotReady.connectionCheckCommand", { command: "glab auth status" })}
+        </p>
+      </div>
+    );
+  }
+
+  // Bitbucket: read integration via an Atlassian API token. Walk the connect
+  // ladder — no token saved → connect; a saved token that won't authenticate →
+  // update it. Both deep-link to Settings → Accounts in one atomic navigation.
+  if (provider === "bitbucket") {
+    return (
+      <div className="space-y-2.5 px-3 py-4 text-xs text-muted-foreground">
+        {!installed ? (
+          <p>
+            {t("forgeNotReady.connectBitbucket", { feature })}
+          </p>
+        ) : (
+          <p>
+            {t("forgeNotReady.bitbucketTokenInvalid")}
+          </p>
+        )}
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => openSettings("accounts")}
+          >
+            <GearSixIcon data-icon="inline-start" />
+            {t("forgeNotReady.openAccounts")}
+          </Button>
+          {!installed && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="cursor-pointer"
+              onClick={() => openUrl(ATLASSIAN_TOKEN_URL)}
+            >
+              <ArrowSquareOutIcon data-icon="inline-start" />
+              {t("forgeNotReady.createApiToken")}
+            </Button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Publish takes precedence: a no-origin repo that any signed-in provider can
+  // take is offered the shared Publish control (a menu when 2+ are ready)
+  // instead of the gh setup ladder.
+  if (providers.length > 0) {
+    return (
+      <div className="space-y-2.5 px-3 py-4 text-xs text-muted-foreground">
+        <p>
+          {t("forgeNotReady.notPublished", { feature })}
+        </p>
+        <PublishRepoControl repoPath={repoPath} providers={providers} />
+      </div>
+    );
+  }
+
+  if (rateLimitedProvider === "github") {
+    return (
+      <RateLimitedNotice
+        repoPath={repoPath}
+        provider="github"
+        feature={feature}
+        resetAt={health.data?.resetAt}
+        checkedAt={health.dataUpdatedAt}
+      />
+    );
+  }
+
+  // A limit that refused only the repo lookup reaches forge-status while auth
+  // reads healthy, so the "couldn't connect" arm below would misdirect. Health
+  // carries no reset here; the recheck keys on the forge-status read instead.
+  if (
+    (provider == null || provider === "github") &&
+    forge.data?.probeError === "rateLimited" &&
+    authed
+  ) {
+    return (
+      <RateLimitedNotice
+        repoPath={repoPath}
+        provider="github"
+        feature={feature}
+        resetAt={null}
+        checkedAt={forge.dataUpdatedAt}
+      />
+    );
+  }
+
+  // GitHub: nothing can publish this repo, so walk the gh setup ladder
+  // (install → sign in), then — if gh is ready but the repo still isn't
+  // resolvable (an origin gh can't identify, or the targets probe found
+  // nothing) — point at `gh auth status`.
+  return (
+    <div className="space-y-2.5 px-3 py-4 text-xs text-muted-foreground">
+      {!installed ? (
+        <>
+          <p>
+            {t("forgeNotReady.githubCliMissingPrefix")} <span className="font-mono">gh</span>{t("forgeNotReady.githubCliMissingSuffix", { feature })}
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => openUrl("https://cli.github.com")}
+            className="cursor-pointer"
+          >
+            <GithubLogoIcon data-icon="inline-start" />
+            {t("forgeNotReady.installGithubCli")}
+          </Button>
+        </>
+      ) : !authed ? (
+        <>
+          <p>
+            {sessionBroken
+              ? t("forgeNotReady.sessionExpired", { provider: "GitHub", login: healthLogin ? ` @${healthLogin}` : "", feature })
+              : t("forgeNotReady.signIn", { provider: "GitHub", feature })}
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              className="cursor-pointer"
+              onClick={() =>
+                openReconnect({
+                  provider: "github",
+                  host: forge.data?.host ?? health.data?.host ?? "github.com",
+                  mode: sessionBroken ? "refresh" : "login",
+                })
+              }
+            >
+              {sessionBroken ? t("forgeNotReady.reconnect", { provider: "GitHub" }) : t("forgeNotReady.signInButton", { provider: "GitHub" })}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() =>
+                openInTerminal(
+                  repoPath,
+                  settings.data?.terminal,
+                  settings.data?.terminalPath,
+                  settings.data?.terminalCommand,
+                ).catch(toastError)
+              }
+            >
+              <TerminalIcon data-icon="inline-start" />
+              {t("forgeNotReady.openTerminalToSignIn")}
+            </Button>
+          </div>
+        </>
+      ) : (
+        <p>
+          {t("forgeNotReady.couldNotConnect", { provider: "GitHub", feature })}{" "}
+          {t("forgeNotReady.connectionCheckCommand", { command: "gh auth status" })}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Slack past the reset second, so the re-read doesn't land a hair early. */
+const RESET_GRACE_MS = 5_000;
+/** The longest a rate-limited panel waits after the driving read before
+ *  checking again, whatever the reset says (null, past, or far out). */
+const RATE_LIMIT_RECHECK_MS = 2 * 60_000;
+
+/** The rate-limited arm. Deliberately no Reconnect: the credential is fine, and a
+ *  fresh sign-in draws on the same exhausted quota. */
+function RateLimitedNotice({
+  repoPath,
+  provider,
+  feature,
+  resetAt,
+  checkedAt,
+}: {
+  repoPath: string;
+  provider: "github" | "gitlab";
+  feature: string;
+  resetAt: number | null | undefined;
+  /** When the driving query (health, or forge-status) was last read (`dataUpdatedAt`, epoch ms). */
+  checkedAt: number;
+}) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const now = useRelativeNow();
+  const label = providerLabel(provider);
+  const resumesAt = rateLimitResetTime(resetAt, now);
+  // Re-read this repo's forge status and session health, plus the accounts list
+  // behind Settings' "rate limited" badge, so no surface stays stuck without a
+  // restart. The timer fires at whichever comes first: just past a known future
+  // reset, or RATE_LIMIT_RECHECK_MS after the driving read. A stale
+  // `checkedAt` fires at once, which stays bounded: each re-arm needs a fresh
+  // successful read to move `checkedAt`, never a tight loop.
+  useEffect(() => {
+    const nowMs = Date.now();
+    const recheck = Math.max(0, checkedAt + RATE_LIMIT_RECHECK_MS - nowMs);
+    const resetMs = typeof resetAt === "number" ? resetAt * 1000 : null;
+    const delay =
+      resetMs !== null && resetMs > nowMs
+        ? Math.min(resetMs - nowMs + RESET_GRACE_MS, recheck)
+        : recheck;
+    const timer = setTimeout(() => {
+      queryClient.invalidateQueries({
+        queryKey: ["repo", repoPath, "forge-status"],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["repo", repoPath, "forge-session-health"],
+      });
+      queryClient.invalidateQueries({ queryKey: ["accounts-health"] });
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [resetAt, checkedAt, repoPath, queryClient]);
+  return (
+    <div className="space-y-1.5 px-3 py-4 text-xs text-muted-foreground">
+      <p className="font-medium text-foreground">
+        {t("forgeNotReady.rateLimitTitle", { provider: label })}
+      </p>
+      <p>
+        {t("forgeNotReady.rateLimitBody", { provider: label, resumesAt: resumesAt ? ` — ${t("forgeNotReady.accessResumes", { time: resumesAt })}` : "", feature })}
+      </p>
+    </div>
+  );
+}

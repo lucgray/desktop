@@ -1,0 +1,880 @@
+import {
+  ArrowSquareOutIcon,
+  BellIcon,
+  ChartBarIcon,
+  ClockCounterClockwiseIcon,
+  CodeIcon,
+  CopyIcon,
+  CubeIcon,
+  DotsThreeVerticalIcon,
+  FilesIcon,
+  FolderOpenIcon,
+  GearSixIcon,
+  GitForkIcon,
+  KanbanIcon,
+  LightningIcon,
+  LinkIcon,
+  PencilSimpleIcon,
+  ShieldCheckIcon,
+  StarIcon,
+  TagSimpleIcon,
+  TerminalIcon,
+  TrashIcon,
+  TreeStructureIcon,
+  WarningCircleIcon,
+} from "@phosphor-icons/react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { lazy, Suspense, useEffect, useEffectEvent, useState } from "react";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Radio, RadioGroup } from "@/components/ui/radio-group";
+import { Spinner } from "@/components/ui/spinner";
+import { useAutomationHistoryDialog } from "@/features/automations/AutomationHistoryDialog";
+import { RepoAutomationsDialog } from "@/features/automations/RepoAutomationsDialog";
+import { BranchRulesDialog } from "@/features/branch-rules/BranchRulesDialog";
+import { HooksDialog } from "@/features/hooks/HooksDialog";
+import { RepoJiraDialog } from "@/features/issues/RepoJiraDialog";
+// Type-only, so the chunk stays split; `typeof` queries on these bindings are
+// type-space only and legal — value-position use is what `import type` forbids.
+import type {
+  RepoSettingsDialog as RepoSettingsDialogComponent,
+  SectionId,
+} from "@/features/repo-settings/RepoSettingsDialog";
+import { useAutomations } from "@/lib/automations/queries";
+import { runAutomationNow } from "@/lib/automations/runner";
+import {
+  repoEntry as automationRepoEntry,
+  effectiveActions,
+} from "@/lib/automations/types";
+import { copyText } from "@/lib/clipboard";
+import {
+  forgeRepoUrl,
+  openInTerminal,
+  openWithDefault,
+  openWithProgram,
+} from "@/lib/git/api";
+import { normPath } from "@/lib/git/path";
+import {
+  EMPTY_NAMESPACES,
+  forgeFeatureReady,
+  forgeSupports,
+  useForgeOwnedNamespaces,
+  useForgeStatus,
+  useForkRepo,
+  useRepoAdmin,
+  useRepoIdentity,
+  useRepoStarStatus,
+  useRepoStatus,
+  useSetRepoStar,
+} from "@/lib/git/queries";
+import { providerLabel } from "@/lib/git/types";
+import { useHotkeyAction } from "@/lib/hotkeys/hotkeys";
+import { useJiraLink } from "@/lib/jira/queries";
+import { useRepoNotificationsDialog } from "@/lib/notifications/matrix";
+import { useRepoLens } from "@/lib/repo-lens/queries";
+import type { RecentRepo } from "@/lib/settings/api";
+import { useAiEnabled, useSettings } from "@/lib/settings/queries";
+import { useUiStore } from "@/lib/stores/ui";
+import { toastError } from "@/lib/toast";
+import { useTranslation } from "@/lib/i18n";
+import { RemoteUrlDialog } from "./RemoteUrlDialog";
+import { RemoveRepoDialog, RepoAliasDialog } from "./RepoDialogs";
+import { RepoSettingsDialogFallback } from "./RepoSettingsDialogFallback";
+import {
+  RepositoryFilesDialog,
+  type RepositoryFilesTab,
+} from "./RepositoryFilesDialog";
+import { SubmodulesDialog } from "./SubmodulesDialog";
+import { WorktreesDialog } from "./WorktreesDialog";
+
+// Named so the menu can warm the chunk while the dropdown is up: the warm call
+// and the lazy mount go through the same dynamic import, so they share one fetch.
+const loadRepoSettingsDialog = () =>
+  import("@/features/repo-settings/RepoSettingsDialog");
+
+/** Resolve the chunk and hand the component back, so an open that follows can
+ *  render it directly instead of suspending. Best-effort: a failed warm stays
+ *  silent and the lazy path still surfaces the import error. */
+const warmRepoSettingsDialog = (
+  onReady: (dialog: typeof RepoSettingsDialogComponent) => void,
+) => {
+  loadRepoSettingsDialog()
+    .then((m) => onReady(m.RepoSettingsDialog))
+    .catch(() => undefined);
+};
+
+// RepoSettingsDialog's tree pulls in the Shiki highlighter (via parts.tsx →
+// shiki-highlighter's highlightJson), which is heavy and only needed once an
+// admin opens repository settings. Loading it lazily keeps that chunk off the
+// boot path. The dialog is rendered ONLY while open (not always-mounted like
+// the sibling dialogs): a lazy component that is always rendered loads its
+// chunk immediately, defeating the split — the open-gate is what keeps the
+// import on demand. Trade-off: the dialog no longer stays mounted across
+// close/reopen, so its remembered rail section resets to "general" each open
+// (see the state note at its render site).
+const RepoSettingsDialog = lazy(() =>
+  loadRepoSettingsDialog().then((m) => ({ default: m.RepoSettingsDialog })),
+);
+
+export function RepositoryMenu({ repoPath }: { repoPath: string }) {
+  const { t } = useTranslation();
+  const gh = useForgeStatus(repoPath);
+  const settings = useSettings();
+  // Automations are paused while AI features are hidden, so every way into the
+  // per-repo grid goes with them — an editable rule that can't run misleads.
+  const aiEnabled = useAiEnabled();
+  const repoName = useUiStore((s) => s.repoName);
+  const setRepoTab = useUiStore((s) => s.setRepoTab);
+  const repoTab = useUiStore((s) => s.repoTab);
+  const selectedPr = useUiStore((s) => s.selectedPr);
+  const fork = useForkRepo(repoPath);
+  // The Fork item's verdict, sampled when the dropdown opens (see `canForkHere`).
+  const [forkWhileOpen, setForkWhileOpen] = useState(false);
+  const [automationsOpen, setAutomationsOpen] = useState(false);
+  // The history dialog is mounted once at the app root and opened by store flag,
+  // so it survives this menu closing under it.
+  const openAutomationHistory = useAutomationHistoryDialog((s) => s.open);
+  // Same store the settings footer and the palette action drive, so all three
+  // routes land on the ONE dialog mounted at the app root (App.tsx's
+  // RepoNotificationsDialogHost) rather than a second copy under this menu.
+  // No draft guard here, unlike the palette's twin: that action fires from
+  // anywhere, while this menu lives under RepositoryView, which App renders only
+  // for `view === "repo"` — the notifications form belongs to SettingsScreen, on
+  // the mutually exclusive `view === "settings"` arm, so no live draft can exist
+  // while this item is on screen.
+  const openRepoNotifications = useRepoNotificationsDialog((s) => s.open);
+  const automationsConfig = useAutomations().data;
+  const repoIdentity = useRepoIdentity(repoPath).data;
+  // Automations are origin-pinned end to end, so Run-now must not exist for a
+  // REMOTE selection under the upstream lens — a fork's two lenses share PR
+  // numbers, and an origin-resolved run against an upstream selection would
+  // review the wrong pull request. Local PRs never touch the forge, so they
+  // stay runnable under either lens.
+  const repoLens = useRepoLens(repoPath);
+  // Whether this repo's EFFECTIVE config enables any PR-lifecycle action — the
+  // same union Run-now executes, so the palette entry exists exactly when the
+  // action could start something.
+  const prAutomationConfigured =
+    automationsConfig !== undefined &&
+    (["pr-open", "pr-sync"] as const).some(
+      (lifecycle) =>
+        effectiveActions(
+          automationsConfig,
+          automationRepoEntry(
+            automationsConfig,
+            repoIdentity ?? repoPath,
+            repoPath,
+          ),
+          lifecycle,
+        ).length > 0,
+    );
+  const [jiraOpen, setJiraOpen] = useState(false);
+  const [repoSettingsOpen, setRepoSettingsOpen] = useState(false);
+  // React's `lazy` suspends on its first element render even when the shared
+  // import has already resolved, so a warmed open would still flash the
+  // fallback for a commit. Holding the resolved component lets a warmed open
+  // render it directly; only the two warm triggers below ever fill this, so the
+  // chunk still stays off the boot path.
+  const [ReadyDialog, setReadyDialog] = useState<
+    typeof RepoSettingsDialogComponent | null
+  >(null);
+  // Which tree an open renders, fixed at the moment it opens: swapping trees
+  // mid-open would unmount one Dialog root and mount another, which is the
+  // doubled entrance this avoids.
+  const [openPath, setOpenPath] = useState<"direct" | "lazy" | null>(null);
+  const [repoSettingsSection, setRepoSettingsSection] =
+    useState<SectionId | null>(null);
+  const repoSettingsRequest = useUiStore((s) => s.repoSettingsRequest);
+  const clearRepoSettingsRequest = useUiStore(
+    (s) => s.clearRepoSettingsRequest,
+  );
+  const [branchRulesOpen, setBranchRulesOpen] = useState(false);
+  const [hooksOpen, setHooksOpen] = useState(false);
+  // null = closed; the mode doubles as the open flag so the palette's add action
+  // can land on the form even while the manager is already open.
+  const [submodulesMode, setSubmodulesMode] = useState<"list" | "add" | null>(
+    null,
+  );
+  const [worktreesOpen, setWorktreesOpen] = useState(false);
+  const [forkOpen, setForkOpen] = useState(false);
+  const [forkIntent, setForkIntent] = useState<"contribute" | "own">(
+    "contribute",
+  );
+  const [remoteUrlOpen, setRemoteUrlOpen] = useState(false);
+  const [filesOpen, setFilesOpen] = useState(false);
+  // Which list the files dialog opens on; read at the open transition, so it is
+  // set before the flag rather than after.
+  const [filesTab, setFilesTab] = useState<RepositoryFilesTab>("tracked");
+  const [aliasTarget, setAliasTarget] = useState<RecentRepo | null>(null);
+  const [removeTarget, setRemoveTarget] = useState<RecentRepo | null>(null);
+
+  // This repo's recents entry (carries the alias); synthesized if missing.
+  const repoEntry: RecentRepo = settings.data?.recentRepos.find(
+    (r) => r.path === repoPath,
+  ) ?? {
+    path: repoPath,
+    name: repoName ?? repoPath,
+    lastOpenedAt: "",
+  };
+
+  // View-on-host works for GitHub, GitLab, and Bitbucket (forge_repo_url is
+  // implemented everywhere); the other host actions gate on capability. Forking
+  // on GitLab/Bitbucket is a web link-out (the fork dialog's remote-rewiring
+  // flow is GitHub-only); starring and creating issues on the host are hidden
+  // where the platform lacks them (Bitbucket has no stars and its issue tracker
+  // is retired).
+  const provider = gh.data?.provider;
+  const canGh = forgeFeatureReady(gh.data, "repoActions");
+  const isGitLab = provider === "gitlab";
+  const isBitbucket = provider === "bitbucket";
+  const remoteLabel = providerLabel(provider);
+  // The forge probe ends in a network call, so a repo open leaves the view item
+  // missing for its first seconds; until the probe answers, the recents entry's
+  // last-known provider stands in. Membership-narrowed rather than cast: it is a
+  // stored plain string, and providerLabel reads an unrecognized one as "GitHub".
+  const persistedProvider =
+    repoEntry.provider === "github" ||
+    repoEntry.provider === "gitlab" ||
+    repoEntry.provider === "bitbucket"
+      ? repoEntry.provider
+      : undefined;
+  // Star, fork, and create-issue deliberately stay on `canGh` — they need the
+  // authenticated probe, and offering them before auth is known would be worse.
+  // View-on-host needs neither for GitLab, Bitbucket, or a `github.com` origin:
+  // `forgeRepoUrl` shells no CLI for those. GitHub Enterprise and a non-canonical
+  // GitHub host (an SSH-config alias, an `insteadOf` rewrite) still round-trip
+  // through `gh repo view` — but neither ever persists a provider
+  // (`provider_tag_for_host` returns `None` for them) and their live probe needs
+  // auth, so the item stays hidden rather than offering a click that would fail.
+  // `Boolean` rather than an undefined check because `provider` is `T | null`,
+  // and a repo with no hosted remote at all settles to `null` too (never widen
+  // this to "any settled probe"). GitLab/Bitbucket's `provider` resolves from the
+  // origin remote regardless of auth; GitHub's live probe (`gh.data.provider`)
+  // still needs an authenticated `gh repo view` round-trip, but `persistedProvider`
+  // covers it anyway — `useRepoVisibilityProbe` persists `RecentRepo.provider`
+  // from a PURE LOCAL remote-host parse (`git_repo_owners`/`provider_tag_for_host`,
+  // no CLI) on every repo open, GitHub included, so a signed-out `github.com`
+  // repo shows the item too once it's been opened at least once. Only a
+  // never-before-opened signed-out repo (nothing persisted yet) still waits on
+  // that ambient probe to land.
+  const canViewOnHost = Boolean(provider) || persistedProvider !== undefined;
+  const viewLabel = providerLabel(provider ?? persistedProvider);
+  const canStar = canGh && forgeSupports(gh.data, "stars");
+  const canCreateHostIssue = canGh && forgeSupports(gh.data, "issues");
+  const owner = gh.data?.repo?.split("/")[0];
+  const ownRepo = !!owner && !!gh.data?.login && owner === gh.data.login;
+  // Bitbucket's `login` is a /user username (a display name where that's absent) and
+  // never matches the workspace slug a repo carries, so its ownership answer can only
+  // come from the workspaces you belong to — read here as the namespaces alone, no
+  // repositories. Fetched for every Bitbucket repo rather than on menu-open, because
+  // the palette twin below reads the verdict with no menu to trigger one. Unresolved
+  // (empty) falls open.
+  const ownedNamespaces =
+    useForgeOwnedNamespaces("bitbucket", canGh && isBitbucket).data ??
+    EMPTY_NAMESPACES;
+  // GitHub: the in-app dialog always forks under your own account, so a repo you own
+  // personally is never a target (org repos stay forkable). GitLab: its fork page picks
+  // the destination namespace, and forking your own project into a group you own is
+  // supported, so the web arm stays offered on everything.
+  // Case-folded: the API's slugs are canonical lowercase, while `owner` is whatever
+  // the origin remote spells (`workspace_slug` hands back the URL segment verbatim).
+  const ownerKey = owner?.toLowerCase();
+  const ownedHere = isBitbucket
+    ? ownedNamespaces.some((n) => n.toLowerCase() === ownerKey)
+    : ownRepo && !isGitLab;
+  // One predicate for the menu item and its palette twin, so the two can't drift.
+  const canForkHere = canGh && !ownedHere;
+  const starStatus = useRepoStarStatus(repoPath, canStar);
+  const setStar = useSetRepoStar(repoPath);
+  const starred = starStatus.data ?? false;
+  // Repo settings are admin-only, on both providers (GitHub admin / GitLab
+  // Maintainer+ — the probe dispatches per provider); the menu item hides for
+  // everyone else.
+  const settingsReady = forgeFeatureReady(gh.data, "repoSettings");
+  const admin = useRepoAdmin(repoPath, settingsReady);
+  const canOpenRepoSettings = settingsReady && Boolean(admin.data?.admin);
+  const editor = (settings.data?.externalEditor ?? "").trim();
+  const editorName =
+    (settings.data?.externalEditorName ?? "").trim() || "editor";
+
+  // Current branch name + HEAD OID, for the copy actions. The two go null
+  // independently: a detached HEAD nulls only `name` (the OID is still a real
+  // SHA), and an unborn/empty repo nulls only `oid` (the branch name is still
+  // present). Each item disables on its own value, and the palette handlers
+  // explain why rather than copying "null".
+  const status = useRepoStatus(repoPath);
+  const branchName = status.data?.branch.name ?? null;
+  const headOid = status.data?.branch.oid ?? null;
+
+  // The repo's Jira link (if any), so the menu item reads "Change…" vs "Link…"
+  // and the dialog opens in edit mode.
+  const jiraLink = useJiraLink(repoPath);
+
+  // Every route opens through here, so the render path is captured once per
+  // open and holds for that whole open.
+  const openRepoSettings = () => {
+    setOpenPath(ReadyDialog ? "direct" : "lazy");
+    setRepoSettingsOpen(true);
+  };
+
+  // A request that arrives while the dialog is already open is dropped, not
+  // queued: the section is seeded at mount, so it couldn't be applied, and
+  // deferring it would reopen the dialog the moment the user closed it.
+  const openRepoSettingsAt = useEffectEvent((section: SectionId) => {
+    if (repoSettingsOpen) return;
+    setRepoSettingsSection(section);
+    openRepoSettings();
+  });
+
+  // Whether the admin gate has an answer yet — settled either way, error
+  // included, so a failed probe releases the request instead of pinning it.
+  const settingsGateResolved =
+    !gh.isPending && (!settingsReady || !admin.isPending);
+
+  // A one-shot deep link raised by another surface (the Findings tab's "turn on
+  // Dependabot" card). Not keyed on the dialog's open state, so re-opening the
+  // dialog can never re-fire it.
+  useEffect(() => {
+    if (!repoSettingsRequest) return;
+    // The request names the repo it was raised for. CROSS_REPO_RESET already
+    // nulls it on every repo switch, so this drop is the backstop for a route
+    // that ever sets repoPath without the reset — never fire it cross-repo.
+    if (repoSettingsRequest.repo !== normPath(repoPath)) {
+      clearRepoSettingsRequest();
+      return;
+    }
+    // Same admin gate as the menu item: the dialog is admin-only. An unresolved
+    // gate HOLDS the request — clearing mid-probe drops a deep link whose toast
+    // is already gone — and a resolved refusal drops it rather than letting it
+    // fire later.
+    if (!settingsGateResolved) return;
+    if (canOpenRepoSettings) openRepoSettingsAt(repoSettingsRequest.section);
+    clearRepoSettingsRequest();
+  }, [
+    repoSettingsRequest,
+    clearRepoSettingsRequest,
+    canOpenRepoSettings,
+    settingsGateResolved,
+    repoPath,
+  ]);
+
+  // The palette and the Findings deep link have no menu to warm on, so the open
+  // itself warms too; the shared import means this and the menu preload resolve
+  // from one fetch. Gated on the dialog being open, so it can only run after a
+  // route the admin gate already guards has opened it.
+  useEffect(() => {
+    if (repoSettingsOpen) {
+      warmRepoSettingsDialog((dialog) => setReadyDialog(() => dialog));
+    }
+  }, [repoSettingsOpen]);
+
+  // Shared by the loading frame and the loaded dialog, so Esc or the backdrop
+  // cancels an open that is still fetching its chunk. Closing drops the
+  // deep-linked section so a later plain open starts at "general".
+  const closeRepoSettings = (open: boolean) => {
+    setRepoSettingsOpen(open);
+    if (!open) {
+      setRepoSettingsSection(null);
+      setOpenPath(null);
+    }
+  };
+
+  const onError = (e: unknown) => toastError(e);
+
+  // The tab is seeded in the same batch as the open flag, so the dialog reads it
+  // on the render where `open` turns true.
+  const openFiles = (tab: RepositoryFilesTab) => {
+    setFilesTab(tab);
+    setFilesOpen(true);
+  };
+
+  async function openWeb(suffix = "") {
+    try {
+      const url = await forgeRepoUrl(repoPath);
+      await openUrl(`${url}${suffix}`);
+    } catch (e) {
+      onError(e);
+    }
+  }
+
+  // Fork: GitHub uses the remote-rewiring dialog; GitLab and Bitbucket fork from
+  // their web page (the dialog's flow is GitHub-only). Bitbucket's fork URL is
+  // <repo>/fork; GitLab's is <repo>/-/forks/new.
+  const forkAction = () => {
+    if (isGitLab) return openWeb("/-/forks/new");
+    if (isBitbucket) return openWeb("/fork");
+    return setForkOpen(true);
+  };
+
+  // Awaited, not per-call callbacks: leaving the repository view (closing the
+  // repo, or moving to Explore/Settings/Help) unmounts this menu while the fork
+  // still polls for readiness, and react-query then drops per-call callbacks —
+  // origin is rewired either way, so the outcome must not depend on the menu.
+  async function doFork() {
+    try {
+      const url = await fork.mutateAsync(forkIntent === "contribute");
+      setForkOpen(false);
+      toast.success(
+        url
+          ? t("repositoryMenu.forkedNowOrigin")
+          : t("repositoryMenu.forkAlreadyExisted"),
+        { description: url || undefined },
+      );
+    } catch (e) {
+      onError(e);
+    }
+  }
+
+  // Shared by the menu item and the hotkey so the two can't diverge, and awaited
+  // for the same reason as the fork above.
+  async function doStar() {
+    try {
+      await setStar.mutateAsync(!starred);
+      toast.success(
+        starred
+          ? t("repositoryMenu.starRemoved")
+          : t("repositoryMenu.starred", { repository: gh.data?.repo ?? t("repositoryMenu.repositoryFallback") }),
+      );
+    } catch (e) {
+      onError(e);
+    }
+  }
+
+  // Every menu entry doubles as a hotkey/palette action with the same gates.
+  useHotkeyAction("view-on-github", () => openWeb(), canViewOnHost);
+  // create-issue is the in-app dialog (registered in RepositoryView + IssuesPanel);
+  // the "Create issue on {host}" menu item below still opens the web page.
+  useHotkeyAction("fork-repository", forkAction, canForkHere);
+  useHotkeyAction("open-in-terminal", () =>
+    openInTerminal(
+      repoPath,
+      settings.data?.terminal,
+      settings.data?.terminalPath,
+      settings.data?.terminalCommand,
+    ).catch(onError),
+  );
+  useHotkeyAction("show-in-explorer", () =>
+    openWithDefault(repoPath).catch(onError),
+  );
+  useHotkeyAction(
+    "open-in-editor",
+    () => openWithProgram(editor, repoPath).catch(onError),
+    Boolean(editor),
+  );
+  useHotkeyAction("repository-statistics", () => setRepoTab("insights"));
+  useHotkeyAction("manage-files", () => openFiles("tracked"));
+  useHotkeyAction("ai-excluded-files", () => openFiles("ai"), aiEnabled);
+  useHotkeyAction("automations", () => setAutomationsOpen(true), aiEnabled);
+  useHotkeyAction(
+    "automation-history",
+    () => openAutomationHistory(repoPath),
+    aiEnabled,
+  );
+  // Run-now targets the PR open in the pulls tab, and only when this repo's
+  // effective config enables a PR-lifecycle action — a palette entry whose only
+  // possible outcome is a "nothing configured" toast would be worse than none.
+  useHotkeyAction(
+    "run-pr-automations",
+    () => {
+      // Fire-time re-read: the palette closes before dispatching, so the
+      // selection gating this render may have moved by the time this runs.
+      const pr = useUiStore.getState().selectedPr;
+      if (!pr) return;
+      runAutomationNow(
+        repoPath,
+        pr.kind === "remote"
+          ? { kind: "remote", number: Number(pr.id) }
+          : { kind: "local", id: pr.id },
+      );
+    },
+    aiEnabled &&
+      repoTab === "pulls" &&
+      selectedPr !== null &&
+      (selectedPr.kind === "local" || repoLens === "origin") &&
+      prAutomationConfigured,
+  );
+  useHotkeyAction("link-jira-project", () => setJiraOpen(true));
+  useHotkeyAction("repository-settings", openRepoSettings, canOpenRepoSettings);
+  useHotkeyAction("branch-rules", () => setBranchRulesOpen(true));
+  useHotkeyAction("git-hooks", () => setHooksOpen(true));
+  useHotkeyAction("submodules", () => setSubmodulesMode("list"));
+  useHotkeyAction("add-submodule", () => setSubmodulesMode("add"));
+  useHotkeyAction("worktrees", () => setWorktreesOpen(true));
+  useHotkeyAction("star-repository", doStar, canStar && !setStar.isPending);
+  useHotkeyAction("change-remote-url", () => setRemoteUrlOpen(true));
+  useHotkeyAction("repo-alias", () => setAliasTarget(repoEntry));
+  useHotkeyAction("copy-repo-path", () =>
+    copyText(repoPath, t("repositoryMenu.repositoryPathCopied")),
+  );
+  useHotkeyAction("copy-branch-name", () =>
+    branchName
+      ? copyText(branchName, t("repositoryMenu.branchNameCopied"))
+      : toast.error(t("repositoryMenu.detachedHeadNoBranch")),
+  );
+  useHotkeyAction("copy-head-sha", () =>
+    headOid
+      ? copyText(headOid, t("repositoryMenu.headShaCopied"))
+      : toast.error(t("repositoryMenu.noCommitsToCopy")),
+  );
+  useHotkeyAction("remove-repository", () => setRemoveTarget(repoEntry));
+
+  return (
+    <DropdownMenu
+      onOpenChange={(open) => {
+        // Two sampling points, one predicate: the palette reads `canForkHere` live,
+        // while the menu renders the value it opened with, so a Bitbucket workspace
+        // read landing mid-open can't drop an item out from under the cursor (and out
+        // from under the arrow-key index).
+        setForkWhileOpen(open && canForkHere);
+        // Warm the repo-settings chunk while the menu is up, so the click that
+        // opens the dialog renders it directly instead of suspending on it.
+        // Gated like the item itself: a non-admin has nothing to open.
+        if (open && canOpenRepoSettings) {
+          warmRepoSettingsDialog((dialog) => setReadyDialog(() => dialog));
+        }
+      }}
+    >
+      <DropdownMenuTrigger
+        render={
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={t("repositoryMenu.actions")}
+          />
+        }
+      >
+        <DotsThreeVerticalIcon />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent className="w-60">
+        {canViewOnHost && (
+          <DropdownMenuItem onClick={() => openWeb()}>
+            <ArrowSquareOutIcon />
+            {t("repositoryMenu.viewOn", { provider: viewLabel })}
+          </DropdownMenuItem>
+        )}
+        {canGh && (
+          <>
+            {canStar && (
+              <DropdownMenuItem disabled={setStar.isPending} onClick={doStar}>
+                <StarIcon weight={starred ? "fill" : "regular"} />
+                {starred ? t("repositoryMenu.unstarRepository") : t("repositoryMenu.starRepository")}
+              </DropdownMenuItem>
+            )}
+            {canCreateHostIssue && (
+              <DropdownMenuItem
+                onClick={() =>
+                  openWeb(isGitLab ? "/-/issues/new" : "/issues/new")
+                }
+              >
+                <WarningCircleIcon />
+                {t("repositoryMenu.createIssueOn", { provider: remoteLabel })}
+              </DropdownMenuItem>
+            )}
+            {forkWhileOpen &&
+              (isGitLab || isBitbucket ? (
+                // The fork dialog's flow (fork + rewire remotes + set-default) is
+                // GitHub-only; GitLab/Bitbucket fork from their web page instead of
+                // hiding the affordance.
+                <DropdownMenuItem onClick={forkAction}>
+                  <GitForkIcon />
+                  {t("repositoryMenu.forkOn", { provider: remoteLabel })}
+                </DropdownMenuItem>
+              ) : (
+                <DropdownMenuItem onClick={() => setForkOpen(true)}>
+                  <GitForkIcon />
+                  {t("repositoryMenu.forkRepository")}
+                </DropdownMenuItem>
+              ))}
+          </>
+        )}
+        {/* Closes the host group whenever it rendered anything — the view item's
+            gate subsumes `canGh`, so this can't outlive an empty group. */}
+        {canViewOnHost && <DropdownMenuSeparator />}
+        <DropdownMenuItem
+          onClick={() =>
+            openInTerminal(
+              repoPath,
+              settings.data?.terminal,
+              settings.data?.terminalPath,
+              settings.data?.terminalCommand,
+            ).catch(onError)
+          }
+        >
+          <TerminalIcon />
+          {t("repositoryMenu.openInTerminal")}
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onClick={() => openWithDefault(repoPath).catch(onError)}
+        >
+          <FolderOpenIcon />
+          {t("repositoryMenu.showInExplorer")}
+        </DropdownMenuItem>
+        {editor && (
+          <DropdownMenuItem
+            onClick={() => openWithProgram(editor, repoPath).catch(onError)}
+          >
+            <PencilSimpleIcon />
+            {t("repositoryMenu.openInEditor", { editor: editorName })}
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={() => setRepoTab("insights")}>
+          <ChartBarIcon />
+          {t("repositoryMenu.insights")}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={() => openFiles("tracked")}>
+          <FilesIcon />
+          {t("repositoryMenu.manageFiles")}
+        </DropdownMenuItem>
+        {aiEnabled && (
+          <DropdownMenuItem onClick={() => setAutomationsOpen(true)}>
+            <LightningIcon />
+            {t("repositoryMenu.automations")}
+          </DropdownMenuItem>
+        )}
+        {aiEnabled && (
+          <DropdownMenuItem onClick={() => openAutomationHistory(repoPath)}>
+            <ClockCounterClockwiseIcon />
+            {t("repositoryMenu.automationHistory")}
+          </DropdownMenuItem>
+        )}
+        {/* Deliberately OUTSIDE the aiEnabled gate above: notifications are not
+            an AI feature, so this repo's overrides stay reachable while the AI
+            surfaces are hidden. */}
+        <DropdownMenuItem onClick={() => openRepoNotifications(repoPath)}>
+          <BellIcon />
+          {t("repositoryMenu.notifications")}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={() => setJiraOpen(true)}>
+          <KanbanIcon />
+          {jiraLink.data ? t("repositoryMenu.changeJiraProject") : t("repositoryMenu.linkJiraProject")}
+        </DropdownMenuItem>
+        {canOpenRepoSettings && (
+          <DropdownMenuItem onClick={openRepoSettings}>
+            <GearSixIcon />
+            {t("repositoryMenu.repositorySettings")}
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem onClick={() => setBranchRulesOpen(true)}>
+          <ShieldCheckIcon />
+          {t("repositoryMenu.branchRules")}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={() => setHooksOpen(true)}>
+          <CodeIcon />
+          {t("repositoryMenu.gitHooks")}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={() => setSubmodulesMode("list")}>
+          <CubeIcon />
+          {t("repositoryMenu.submodules")}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={() => setWorktreesOpen(true)}>
+          <TreeStructureIcon />
+          {t("repositoryMenu.worktrees")}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={() => setRemoteUrlOpen(true)}>
+          <LinkIcon />
+          {t("repositoryMenu.changeRemoteUrl")}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={() => setAliasTarget(repoEntry)}>
+          <TagSimpleIcon />
+          {repoEntry.alias ? t("repositoryMenu.changeAlias") : t("repositoryMenu.createAlias")}
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onClick={() => copyText(repoPath, t("repositoryMenu.repositoryPathCopied"))}
+        >
+          <CopyIcon />
+          {t("repositoryMenu.copyRepositoryPath")}
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          disabled={!branchName}
+          title={branchName ? undefined : t("repositoryMenu.detachedHeadNoBranch")}
+          onClick={() =>
+            branchName && copyText(branchName, t("repositoryMenu.branchNameCopied"))
+          }
+        >
+          <CopyIcon />
+          {t("repositoryMenu.copyBranchName")}
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          disabled={!headOid}
+          title={headOid ? undefined : t("repositoryMenu.noCommitsToCopy")}
+          onClick={() => headOid && copyText(headOid, t("repositoryMenu.headShaCopied"))}
+        >
+          <CopyIcon />
+          {t("repositoryMenu.copyHeadSha")}
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          variant="destructive"
+          onClick={() => setRemoveTarget(repoEntry)}
+        >
+          <TrashIcon />
+          {t("repositoryMenu.removeRepository")}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+      <RepoAutomationsDialog
+        repoPath={repoPath}
+        open={automationsOpen}
+        onOpenChange={setAutomationsOpen}
+      />
+      <RepoJiraDialog
+        repoPath={repoPath}
+        open={jiraOpen}
+        onOpenChange={setJiraOpen}
+        existingLink={jiraLink.data ?? null}
+      />
+      {/* Open-gated (unlike the always-mounted siblings above) so its lazy
+          chunk loads on demand, not on boot. `open` stays true while
+          mounted; `onOpenChange(false)` flips the gate, unmounting the subtree
+          — the same immediate-unmount-on-close idiom the other open-gated
+          dialogs in this app use (e.g. ImportMcpDialog). The dialog's remembered
+          rail section (its internal `section` state) no longer persists across
+          close/reopen and resets to "general" each open.
+          Two shapes of the same dialog: a warmed open renders the resolved
+          component straight (one mount, one entrance), while a cold one
+          suspends behind the loading frame and skips the entrance the frame
+          already played. */}
+      {repoSettingsOpen &&
+        (openPath === "direct" && ReadyDialog ? (
+          <ReadyDialog
+            repoPath={repoPath}
+            open={repoSettingsOpen}
+            onOpenChange={closeRepoSettings}
+            initialSection={repoSettingsSection ?? undefined}
+          />
+        ) : (
+          <Suspense
+            fallback={
+              <RepoSettingsDialogFallback
+                repoPath={repoPath}
+                onOpenChange={closeRepoSettings}
+              />
+            }
+          >
+            <RepoSettingsDialog
+              repoPath={repoPath}
+              open={repoSettingsOpen}
+              onOpenChange={closeRepoSettings}
+              initialSection={repoSettingsSection ?? undefined}
+              subdueEntrance
+            />
+          </Suspense>
+        ))}
+      <BranchRulesDialog
+        repoPath={repoPath}
+        open={branchRulesOpen}
+        onOpenChange={setBranchRulesOpen}
+      />
+      <HooksDialog
+        repoPath={repoPath}
+        open={hooksOpen}
+        onOpenChange={setHooksOpen}
+      />
+      <SubmodulesDialog
+        repoPath={repoPath}
+        open={submodulesMode !== null}
+        initialMode={submodulesMode ?? "list"}
+        // Tracked, not just seeded: without it, re-firing the action for the
+        // mode already requested changes nothing and the dialog wouldn't move.
+        onModeChange={setSubmodulesMode}
+        onOpenChange={(o) => {
+          if (!o) setSubmodulesMode(null);
+        }}
+      />
+      <WorktreesDialog
+        repoPath={repoPath}
+        open={worktreesOpen}
+        onOpenChange={setWorktreesOpen}
+      />
+      <RemoteUrlDialog
+        repoPath={repoPath}
+        open={remoteUrlOpen}
+        onOpenChange={setRemoteUrlOpen}
+      />
+      <RepositoryFilesDialog
+        repoPath={repoPath}
+        open={filesOpen}
+        onOpenChange={setFilesOpen}
+        initialTab={filesTab}
+      />
+      <RepoAliasDialog
+        key={
+          aliasTarget
+            ? `${aliasTarget.path}:${aliasTarget.alias ?? ""}`
+            : "none"
+        }
+        repo={aliasTarget}
+        onClose={() => setAliasTarget(null)}
+      />
+      <RemoveRepoDialog
+        repo={removeTarget}
+        onClose={() => setRemoveTarget(null)}
+      />
+      <Dialog open={forkOpen} onOpenChange={setForkOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("repositoryMenu.forkQuestion")}</DialogTitle>
+            <DialogDescription>
+              {t("repositoryMenu.forkDescription", { repository: gh.data?.repo ?? t("repositoryMenu.repositoryFallback") })}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <p className="text-xs font-medium">{t("repositoryMenu.forkIntentQuestion")}</p>
+            <RadioGroup
+              value={forkIntent}
+              onValueChange={(v) => setForkIntent(v as "contribute" | "own")}
+            >
+              <label className="flex cursor-pointer items-start gap-2 text-xs">
+                <Radio value="contribute" className="mt-0.5" />
+                <span>
+                  <span className="font-medium">
+                    {t("repositoryMenu.contributeToParent")}
+                  </span>
+                  <span className="mt-0.5 block text-muted-foreground">
+                    {t("repositoryMenu.forkTargetsParent", { repository: gh.data?.repo ?? t("repositoryMenu.originalRepositoryFallback") })}
+                  </span>
+                </span>
+              </label>
+              <label className="flex cursor-pointer items-start gap-2 text-xs">
+                <Radio value="own" className="mt-0.5" />
+                <span>
+                  <span className="font-medium">{t("repositoryMenu.forMyOwnPurposes")}</span>
+                  <span className="mt-0.5 block text-muted-foreground">
+                    {t("repositoryMenu.forkTargetsOwn")}
+                  </span>
+                </span>
+              </label>
+            </RadioGroup>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setForkOpen(false)}
+              disabled={fork.isPending}
+            >
+              {t("repositoryMenu.cancel")}
+            </Button>
+            <Button disabled={fork.isPending} onClick={doFork}>
+              {fork.isPending && <Spinner data-icon="inline-start" />}
+              {t("repositoryMenu.fork")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </DropdownMenu>
+  );
+}

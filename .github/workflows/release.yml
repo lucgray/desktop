@@ -1,0 +1,144 @@
+name: release
+
+# Cut a release by pushing a version tag. The easiest path is the interactive driver:
+#   pnpm release                   (picks the bump, previews fragments, prepares, commits, tags, pushes)
+# Or the manual path:
+#   pnpm release:prepare 0.2.0     (assembles changelog.d/ fragments, bumps package.json + Cargo.toml)
+#   review the diff, then:
+#   git commit -am "chore(release): v0.2.0" && git tag v0.2.0 && git push origin master v0.2.0
+#   (push the tag explicitly — release tags are lightweight, and --follow-tags skips lightweight tags)
+# CI builds + signs each platform, creates a DRAFT GitHub Release, uploads the
+# installers, and attaches the `latest.json` the installed app polls. Publish the
+# draft once every platform leg is green — that flips the
+# `releases/latest/download/latest.json` redirect over to the new version.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Needed for tauri-action to create the release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  # Extract this tag's CHANGELOG.md section once, to use as the release body —
+  # which also becomes the auto-updater's "what's new" notes. Falls back to a
+  # pointer if the section is missing (rename "Unreleased" → the version first).
+  notes:
+    runs-on: ubuntu-latest
+    outputs:
+      body: ${{ steps.extract.outputs.body }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Extract release notes from CHANGELOG
+        id: extract
+        shell: bash
+        run: |
+          {
+            echo 'body<<__NOTES_EOF__'
+            node scripts/changelog-extract.mjs "${{ github.ref_name }}"
+            echo '__NOTES_EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: notes
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: ""
+          - platform: ubuntu-24.04
+            args: ""
+          # macOS: a universal binary (Intel + Apple Silicon), signed with a
+          # Developer ID cert and notarized via the APPLE_* secrets below.
+          - platform: macos-latest
+            args: "--target universal-apple-darwin"
+            rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6.1.0
+
+      - name: Install Node
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Empty on Windows/Linux; the macOS leg adds both arches for the
+          # universal build.
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            libssl-dev \
+            file
+
+      - name: Pin newer linuxdeploy for AppImage bundling
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/pin-linuxdeploy
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build, sign, and publish
+        uses: tauri-apps/tauri-action@v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Tauri updater signing (generate with `pnpm tauri signer generate`):
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Production PostHog analytics — .env is gitignored, so the build
+          # (pnpm build → vite) reads these from the env. Without the key,
+          # analytics is silently disabled (the app logs a one-line note).
+          VITE_POSTHOG_KEY: ${{ secrets.VITE_POSTHOG_KEY }}
+          VITE_POSTHOG_HOST: https://eu.i.posthog.com
+          # macOS code signing + notarization (Developer ID Application). Only
+          # consumed on the macOS leg; unused/empty on Windows + Linux.
+          # Only set Apple secrets on macOS
+          APPLE_CERTIFICATE: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_ID: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ matrix.platform == 'macos-latest' && secrets.APPLE_TEAM_ID || '' }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "GitDesktop ${{ github.ref_name }}"
+          releaseBody: ${{ needs.notes.outputs.body }}
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+          # uploadUpdaterJson defaults to true → generates & attaches latest.json.
+          updaterJsonPreferNsis: true
+
+      # Runs after the asset upload, but the release stays a draft until every
+      # leg is green, so a red guard still blocks publishing.
+      - name: Guard the AppImage bundle and its startup env
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash .github/scripts/appimage-guard.sh

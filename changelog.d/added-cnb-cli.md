@@ -1,0 +1,1 @@
+- Add a standalone Windows `cnb` CLI for CNB repository and pull request workflows, with tokens stored in Windows Credential Manager.

@@ -1,0 +1,189 @@
+import { toast } from "sonner";
+import { create } from "zustand";
+import type { ReviewMode } from "@/lib/ai/types";
+import {
+  identityKeyFor,
+  mergeById,
+  repoIdentity,
+} from "@/lib/git/repo-identity";
+import {
+  memoizedStoreLoader,
+  reloadToleratingEmptyStore,
+} from "@/lib/plugin-store";
+import { isStoredResult, pruneByCreatedAt } from "./pure";
+import { translateCurrent } from "@/lib/i18n";
+
+/**
+ * A finished automated COMMIT review — the one review target with no comment
+ * surface to deliver into, so this store is the output's only home. Persisted so
+ * the text survives a restart and its notification stays clickable.
+ */
+export interface AutomationRunResult {
+  schemaVersion: 1;
+  id: string;
+  repoPath: string;
+  /** What was reviewed: the commit's subject. */
+  subject: string;
+  mode: ReviewMode;
+  text: string;
+  createdAt: string;
+  /** Commit sha the review covered; "" when unknown. */
+  hash: string;
+  /** Present only on a kept PARTIAL run (mirrors PersistedReview's vocabulary). */
+  phase?: "error";
+  error?: string;
+  timedOut?: boolean;
+}
+
+/** Records kept per repo, pruned on every write so the file stays bounded.
+ *  Completed reviews and kept partials share the cap — commit-review traffic is
+ *  low, so a split (as the PR history store has) would buy nothing. */
+const MAX_PER_REPO = 20;
+
+/** In-session rows, across all repos — the toast's View button reads this list. */
+const MAX_IN_SESSION = 20;
+
+// Personal app-data, keyed by the repo's worktree-stable identity — never written
+// into the repo itself (the text quotes user source + may contain AI false
+// positives). Routed through storeName() so cold-start/test mode never pollutes
+// real results.
+const getStore = memoizedStoreLoader("automation-results.json");
+
+// Serialize every read-modify-write through one in-process queue: autoSave persists
+// on a ~100ms debounce, so two overlapping writes would both reload the same
+// pre-flush disk snapshot and the later would drop the earlier's record (two review
+// modes of the same commit settle back to back). With the force-save in `persist`,
+// each reload sees fresh state. Cross-INSTANCE overlap (two app instances delivering
+// different runs) still races last-writer-wins like the sibling plugin stores — the
+// automation claim only keeps instances off the SAME run; cross-process locking for
+// this store class is a recorded deferral.
+let opChain: Promise<unknown> = Promise.resolve();
+function serialize<T>(op: () => Promise<T>): Promise<T> {
+  const run = opChain.then(op, op);
+  // Keep the queue alive whether `op` fulfilled or rejected; callers still get `run`.
+  opChain = run.catch(() => undefined);
+  return run;
+}
+
+async function reloadRaw(): Promise<void> {
+  await reloadToleratingEmptyStore(await getStore());
+}
+
+async function readByKey(key: string): Promise<AutomationRunResult[]> {
+  const store = await getStore();
+  const raw = await store.get<unknown>(key);
+  return Array.isArray(raw) ? raw.filter(isStoredResult) : [];
+}
+
+/** Reads a repo's records, merging in any still under a legacy checkout-path key
+ *  (folded onto the identity by the next write via `keyFor`). `knownId` is an
+ *  identity key the caller already holds: pass it whenever `repo` may no longer
+ *  exist, since resolving it here would answer the raw path and read as pruned. */
+async function readMerged(
+  repo: string,
+  knownId?: string,
+): Promise<AutomationRunResult[]> {
+  const id = knownId ?? (await repoIdentity(repo));
+  const primary = await readByKey(id);
+  const legacy = id === repo ? [] : await readByKey(repo);
+  return mergeById(primary, legacy);
+}
+
+/** The identity store key for `repo`, folding any legacy checkout-path-keyed records
+ *  onto it once. Called inside the serialized queue (after `reloadRaw`) so the fold
+ *  is ordered with the write. */
+async function keyFor(repo: string): Promise<string> {
+  const store = await getStore();
+  return identityKeyFor<AutomationRunResult[]>(
+    store,
+    "automation-results",
+    repo,
+    mergeById,
+  );
+}
+
+/** Upserts a record by id under its repo's identity key, then prunes. */
+async function persist(result: AutomationRunResult): Promise<void> {
+  return serialize(async () => {
+    await reloadRaw();
+    const store = await getStore();
+    const key = await keyFor(result.repoPath);
+    const all = await readByKey(key);
+    const without = all.filter((r) => r.id !== result.id);
+    await store.set(key, pruneByCreatedAt([result, ...without], MAX_PER_REPO));
+    // Flush now instead of on autoSave's debounce, so the next serialized reload
+    // can't re-read a pre-write disk snapshot and drop this record.
+    await store.save();
+  });
+}
+
+interface AutomationResultsState {
+  /** Newest first, capped — this session's results; the durable copy is the store
+   *  file, which {@link openAutomationResult} reads on a miss. */
+  results: AutomationRunResult[];
+  /** Result shown in the viewer dialog, if any. */
+  openId: string | null;
+  /** Inserts synchronously (so the completion toast's View button works at once);
+   *  the returned promise settles with the DURABLE write — it rejects when the
+   *  record didn't reach disk, so a caller can tell the user what was kept. */
+  add: (result: AutomationRunResult) => Promise<void>;
+  /** Puts a record read back from disk into the session list WITHOUT re-persisting
+   *  it. Internal to {@link openAutomationResult}; a re-persist would rewrite the
+   *  file on every restored open. */
+  hydrate: (result: AutomationRunResult) => void;
+  setOpen: (id: string | null) => void;
+}
+
+export const useAutomationResults = create<AutomationResultsState>()((set) => ({
+  results: [],
+  openId: null,
+  add: (result) => {
+    set((s) => ({ results: [result, ...s.results].slice(0, MAX_IN_SESSION) }));
+    return persist(result);
+  },
+  hydrate: (result) =>
+    set((s) => ({
+      results: [result, ...s.results.filter((r) => r.id !== result.id)].slice(
+        0,
+        MAX_IN_SESSION,
+      ),
+    })),
+  setOpen: (id) => set({ openId: id }),
+}));
+
+/**
+ * Opens a stored automation result in the viewer dialog — the click-through of an
+ * automated commit review's notification, which outlives the session that produced
+ * it. Reads the persisted copy when the session list doesn't hold the record, and
+ * says so when it's gone (pruned, or cleared with the repo's app data) rather than
+ * leaving a dead click.
+ *
+ * `repoId` is the repo's identity key when the caller carries one (a notification
+ * stamps it at emit time): `repoPath` is a single checkout, so a removed worktree
+ * can no longer answer its own key and the records would read as pruned.
+ */
+export async function openAutomationResult(
+  repoPath: string,
+  id: string,
+  repoId?: string,
+): Promise<void> {
+  const state = useAutomationResults.getState();
+  if (state.results.some((r) => r.id === id)) {
+    state.setOpen(id);
+    return;
+  }
+  // Read through the write queue after a fresh reload: `getStore()` memoizes the
+  // first `load()`, so a record another instance wrote since then is absent from
+  // the cached snapshot and would read as pruned.
+  const stored = await serialize(async () => {
+    await reloadRaw();
+    return readMerged(repoPath, repoId);
+  }).catch((): AutomationRunResult[] => []);
+  const found = stored.find((r) => r.id === id);
+  if (!found) {
+    toast.info(translateCurrent("asyncUi.reviewResultUnavailable"));
+    return;
+  }
+  useAutomationResults.getState().hydrate(found);
+  useAutomationResults.getState().setOpen(id);
+}

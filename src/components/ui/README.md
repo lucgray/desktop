@@ -1,0 +1,157 @@
+# Vendored primitives: local modifications
+
+These are shadcn / Base UI primitives, normally regenerated rather than
+edited. Nine of them carry a sanctioned local delta for one cross-file
+contract: **panel-scoped portals plus activity-aware modality**. Repo tabs
+render inside `<Activity>` (`TabPanel` in `RepositoryView.tsx`), which
+conceals a hidden tab and keeps its subtree mounted. Through react-dom 19.2 a
+popup that portalled to `<body>` sat outside that conceal and stayed on screen
+over whichever tab the user switched to; 19.3 reaches portal hosts and conceals
+it as well (measured; see *Check before re-applying*). The files below portal
+into the surrounding panel instead, which now buys containment rather than
+visibility, and the two dialog-shaped ones also stand their modal state down
+while concealed.
+
+## Detecting a lost customization
+
+Regenerating any file here (`shadcn add`, a registry refresh) silently
+reverts its delta. After regenerating, grep the file:
+
+```sh
+grep -l "@/components/panel-portal" src/components/ui/<file>.tsx
+```
+
+No match means the customization is gone. Restore it from git history
+rather than rewriting it from scratch. The marker imports are
+`usePanelPortalContainer`, `usePanelActive`, `isUserDismissal`, and
+`PanelPortalReset`.
+
+Coverage is partial and indirect. `pnpm run checks` runs
+`lone-activity-boundary`, which pins the `<Activity>` side of the contract
+(exactly one JSX `<Activity`, in `RepositoryView.tsx`) but cannot see a
+missing `container` prop here. Nothing else guards this folder, so a live
+smoke is the remaining check. Two things decide whether one tests anything:
+
+- **Switch tabs by hotkey, not by clicking a tab.** An outside click
+  dismisses an open modal before it is ever concealed, so the click path
+  never reaches the behavior under test.
+- **Pick a trigger that sits inside a panel.** Several obvious ones do not:
+  `CommitDialog`, the commit box and its Co-authors popover all render above
+  `TabPanel`, so they never enter a concealed subtree. A changed-file row's
+  context menu does.
+
+Since 19.3 conceals body-level portals on its own, visibility no longer tells
+these deltas apart from their absence. What still does is containment: open a
+popup from a panel row, put text in a draft, round-trip the tabs, and confirm
+the draft and focus come back. For `dialog.tsx` / `sheet.tsx`, also confirm a
+concealed modal has released the document scroll lock and that Escape reaches
+the tab the user can see.
+
+## The modifications
+
+- **`popover.tsx`**, **`select.tsx`**, **`combobox.tsx`**,
+  **`hover-card.tsx`** — the `*Content` component reads
+  `usePanelPortalContainer()` and passes it to its `Portal` as `container`.
+  Without it the popup renders at `<body>`, outside its panel's own DOM.
+- **`tooltip.tsx`** — same container read on `TooltipContent`'s inline
+  portal. This one has no exported portal wrapper.
+- **`dropdown-menu.tsx`**, **`context-menu.tsx`** — the same container read
+  on `*Content`, plus the exported `*Portal` wrapper defaulting `container`
+  to the panel when the caller passes none. The default tests
+  `container === undefined`, never `??`: Base UI reads an explicit `null` as
+  "a container is coming" and renders nothing, so `null` has to survive.
+- **`sheet.tsx`** — portal wrapper container default as above;
+  `SheetContent` wraps children in `PanelPortalReset` so floating UI inside
+  the sheet does not portal into a panel the sheet covers; the root `Sheet`
+  derives `modal` from panel visibility and cancels user-initiated
+  dismissals while concealed. A concealed modal would otherwise keep the
+  document scroll-locked, keep everything outside it `aria-hidden`, and take
+  the Escape key from the tab the user can see.
+- **`dialog.tsx`** — every delta `sheet.tsx` carries (both are Base UI
+  `Dialog.Root` underneath), plus `DialogContent` re-homing focus into the
+  popup when its panel returns to view, and composing the caller's `ref`
+  with its own rather than replacing it. It also takes an `overlayClassName`
+  prop forwarded to the backdrop it renders internally, so a caller can style
+  a backdrop it has no other handle on. That one carries no panel-portal
+  marker, so the grep above misses it — check it separately with
+  `grep -n overlayClassName src/components/ui/dialog.tsx`, which must show
+  the prop, its type, and its forward to `<DialogOverlay/>`.
+
+Deliberately unmodified: `menubar.tsx` inherits the container default by
+delegating to `DropdownMenuPortal`, so regenerating it into a direct
+`Menu.Portal` call would break it silently. `drawer.tsx` is vaul and has no
+container prop, so its popups are not panel-scoped.
+
+## Narrow-window width deltas
+
+A second, unrelated pair of sanctioned deltas keeps popups and scroll
+regions usable when the window is narrow. They share no code with the
+panel-portal contract above, so they are lost and restored separately.
+
+- **`scroll-area.tsx`** — `ScrollArea` renders a horizontal `ScrollBar`
+  alongside the vertical one. Base UI's viewport is `overflow: scroll` with
+  the native scrollbars suppressed, so without it horizontal overflow is
+  scrollable but shows no affordance anywhere in the app.
+- **`popover.tsx`** — `PopoverContent`'s class list caps the popup at
+  `max-w-(--available-width)`, the viewport-space variable Base UI's
+  positioner publishes. Uncapped, a popup wider than the space beside its
+  trigger hangs off-screen: the positioner is `position: fixed` and floating
+  UI's shift pins the near edge, leaving the overflow unreachable.
+
+Grep each file after regenerating it:
+
+```sh
+grep -n 'orientation="horizontal"' src/components/ui/scroll-area.tsx
+grep -n 'available-width' src/components/ui/popover.tsx
+```
+
+No match means that file's width delta is gone. `popover.tsx` carries the
+panel-portal delta too, so check both of its markers.
+
+## Anchor forwarding
+
+A third delta, again sharing no code with the two above. Base UI positions a
+popup against its `*Trigger`; a caller whose trigger is not the element the
+popup should line up with hands the positioner an element itself, through the
+`anchor` prop the wrapper otherwise swallows.
+
+- **`combobox.tsx`** — `ComboboxContent`'s `Pick` from its `Positioner.Props`
+  includes `anchor`, forwards it to the `Positioner`, and stamps the popup's
+  `data-chips={!!anchor}`. A chips-shaped combobox types into a small input
+  inside the chip row, so its list belongs against the whole field, not that
+  input; the `data-chips` flag is what then drops the popup's `--anchor-width`
+  plus `--spacing(7)` floor so it can match that field exactly. No call site
+  passes `anchor` today, so the app demonstrates neither half — weigh that
+  under *Check before re-applying* below.
+
+Grep the file after regenerating it:
+
+```sh
+grep -n '"anchor"' src/components/ui/combobox.tsx
+```
+
+No match means the anchor delta is gone. That file carries the panel-portal
+delta too, so check both of its markers.
+
+## Check before re-applying
+
+If one of these has to be re-created, confirm it is still needed. Verify
+first, then decide. Suspicion alone is not grounds for dropping one.
+
+1. **React's Activity visibility walk.** react-dom 19.3 reaches portal hosts
+   (a hidden `<Activity>` now conceals body-level portal contents itself), so
+   visibility is no longer what these deltas buy. Draft preservation and
+   stacking still are — judge a re-apply against those two grounds alone.
+   Measured on the same probe against both versions: a node portalled to
+   `<body>` from inside a hidden `<Activity>` keeps `display: block` on
+   19.2.8 and gets `display: none !important` on 19.3.0. If you re-run that
+   probe, keep a host element between the `<Activity>` and the portal, as a
+   real panel has. With the portal as a direct child of `<Activity>` the walk
+   reaches its fiber directly and 19.2.8 conceals it too, so the comparison
+   stops discriminating and reports the same verdict for the wrong reason.
+2. **Base UI gaining container-scoped modality**, or a modal that tracks
+   visibility. That would subsume the `modal` flip and the dismissal
+   suppression in `dialog.tsx` and `sheet.tsx`, though not the container
+   reads.
+3. **The app no longer rendering tabs through `<Activity>` / `TabPanel`.**
+   That removes the premise for all of it.

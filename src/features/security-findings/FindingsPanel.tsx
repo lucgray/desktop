@@ -1,0 +1,2703 @@
+import {
+  ArrowClockwiseIcon,
+  ArrowSquareOutIcon,
+  CheckCircleIcon,
+  CircleIcon,
+  ClockIcon,
+  GearSixIcon,
+  InfoIcon,
+  LockKeyIcon,
+  QuestionIcon,
+  ShieldCheckIcon,
+  ShieldSlashIcon,
+  WarningCircleIcon,
+  XCircleIcon,
+} from "@phosphor-icons/react";
+import { useQueryClient } from "@tanstack/react-query";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { type ReactNode, useRef, useState } from "react";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { ListRowSkeletons } from "@/components/list-row-skeleton";
+import { PathText } from "@/components/path-text";
+import { RelativeTime } from "@/components/relative-time";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Empty,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty";
+import { Input } from "@/components/ui/input";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { LoadMoreRow, PAGE_SIZE } from "@/features/conversations/LoadMoreRow";
+import { ForgeNotReady } from "@/features/repository/ForgeNotReady";
+import type {
+  BbAnnotationOut,
+  BbFindingsAvailability,
+  BbFindingsOut,
+  BbReportDataOut,
+  BbReportOut,
+  BbResultLevel,
+} from "@/lib/bitbucket/security-findings";
+import {
+  bbAnnotationTypeLabel,
+  bbReportLabel,
+  bbReportTypeLabel,
+  bbResultLabel,
+  bbResultLevel,
+  linkOutLabel,
+  useBitbucketFindings,
+} from "@/lib/bitbucket/security-findings";
+import {
+  forgeFeatureReady,
+  forgeReady,
+  forgeSupports,
+  useForgeStatus,
+  useRepoAdmin,
+} from "@/lib/git/queries";
+import type { ForgeProvider } from "@/lib/git/types";
+import { providerLabel } from "@/lib/git/types";
+import type {
+  CodeScanningAlertOut,
+  DependabotAlertOut,
+  FindingAvailability,
+  RepoAdvisoryOut,
+  SecretScanningAlertOut,
+} from "@/lib/github/security-findings";
+import {
+  useCodeScanningAlerts,
+  useDependabotAlerts,
+  useRepoAdvisories,
+  useSecretScanningAlerts,
+} from "@/lib/github/security-findings";
+import type {
+  GlCodeQualityFindingOut,
+  GlFindingAvailability,
+  GlFindingsOut,
+  GlPipelineState,
+  GlSecureFindingOut,
+} from "@/lib/gitlab/security-findings";
+import {
+  codeQualityFindingId,
+  secureFindingId,
+  useGitLabFindings,
+} from "@/lib/gitlab/security-findings";
+import { useHotkeyAction } from "@/lib/hotkeys/hotkeys";
+import { listKeyboardNav } from "@/lib/list-keyboard-nav";
+import {
+  type FindingsLimits,
+  type SelectedFinding,
+  useUiStore,
+} from "@/lib/stores/ui";
+import { formatDuration, parseableDate, validEpochMs } from "@/lib/time";
+import { cn } from "@/lib/utils";
+import { type TranslationKey, useTranslation } from "@/lib/i18n";
+import {
+  CodeScanningChip,
+  CqChip,
+  codeScanningRank,
+  cqRank,
+  SEVERITY_RANK,
+  SeverityChip,
+  severityLevel,
+  VALIDITY_RANK,
+  ValidityChip,
+  validityLevel,
+} from "./severity";
+
+/** Ceiling for a category's row limit. MUST stay in lockstep with `clamp_limit`
+ *  in ALL THREE of src-tauri/src/github/security_findings.rs,
+ *  src-tauri/src/forge/gitlab_findings.rs and
+ *  src-tauri/src/forge/bitbucket_findings.rs, which are the source of truth:
+ *  they clamp every fetch to 500, so growing the limit past this would re-read
+ *  the same 500 rows and leave "Load more" permanently offered. */
+const FINDINGS_LIMIT_CAP = 500;
+
+/** Each provider's filter cue names the fields its own rows actually carry — the
+ *  three read entirely different sources. The github entry doubles as the
+ *  fallback while the provider is still undefined. */
+const FILTER_PLACEHOLDERS: Record<ForgeProvider, TranslationKey> = {
+  github: "findingsUi.filterGitHub",
+  gitlab: "findingsUi.filterGitLab",
+  bitbucket: "findingsUi.filterBitbucket",
+  cnb: "findingsUi.findings",
+};
+
+interface AlertRow {
+  /** Unique per rendered row: the alert number, or an index fallback for a
+   *  tolerated alert whose number came through as 0 (duplicate React keys and
+   *  duplicate `data-row` values would misdirect the arrow-key focus). */
+  id: string;
+  alert: DependabotAlertOut;
+}
+
+interface AlertGroup {
+  key: string;
+  packageName: string;
+  ecosystem: string;
+  rows: AlertRow[];
+}
+
+interface CodeScanningRow {
+  id: string;
+  alert: CodeScanningAlertOut;
+}
+
+interface CodeScanningGroup {
+  key: string;
+  /** The rule's human name where it has one, else the raw id — never blank. */
+  label: string;
+  rows: CodeScanningRow[];
+}
+
+interface SecretRow {
+  id: string;
+  alert: SecretScanningAlertOut;
+}
+
+interface SecretGroup {
+  key: string;
+  label: string;
+  rows: SecretRow[];
+}
+
+/** Worst-first, for every finding category: both endpoints order by date, so the
+ *  severity ladder is applied here instead. Callers use `toSorted` so the sort
+ *  stays stable and server date order remains the tiebreak within a level; a null
+ *  or unrecognized severity ranks with `unknown`, i.e. last. */
+const bySeverity = (
+  a: { severity: string | null },
+  b: { severity: string | null },
+) =>
+  SEVERITY_RANK[severityLevel(a.severity)] -
+  SEVERITY_RANK[severityLevel(b.severity)];
+
+function buildAlertGroups(alerts: DependabotAlertOut[]): AlertGroup[] {
+  // Grouping preserves the sorted order, so the groups AND the rows inside each
+  // group both run worst-first.
+  const sorted = alerts.toSorted(bySeverity);
+  // Keyed by name AND ecosystem: the same package name exists in several
+  // ecosystems, and merging them would mislabel the group's ecosystem.
+  const groups = new Map<string, AlertGroup>();
+  sorted.forEach((alert, i) => {
+    const key = `${alert.ecosystem}/${alert.packageName}`;
+    const row: AlertRow = {
+      id: alert.number === 0 ? `alert-i${i}` : `alert-${alert.number}`,
+      alert,
+    };
+    const bucket = groups.get(key);
+    if (bucket) bucket.rows.push(row);
+    else {
+      groups.set(key, {
+        key,
+        packageName: alert.packageName,
+        ecosystem: alert.ecosystem,
+        rows: [row],
+      });
+    }
+  });
+  return [...groups.values()];
+}
+
+function buildCodeScanningGroups(
+  alerts: CodeScanningAlertOut[],
+  unidentifiedRule: string,
+): CodeScanningGroup[] {
+  // Sort first, group after: the groups AND the rows inside each group both run
+  // worst-first, and the server's date order stays the tiebreak within a rung.
+  const sorted = alerts.toSorted(
+    (a, b) => codeScanningRank(a) - codeScanningRank(b),
+  );
+  const groups = new Map<string, CodeScanningGroup>();
+  sorted.forEach((alert, i) => {
+    const row: CodeScanningRow = {
+      id: alert.number === 0 ? `cs-i${i}` : `cs-${alert.number}`,
+      alert,
+    };
+    const bucket = groups.get(alert.ruleId);
+    if (bucket) bucket.rows.push(row);
+    else {
+      groups.set(alert.ruleId, {
+        key: alert.ruleId,
+        // `||`, not `??`: the tolerant Raw parse degrades a missing field to an
+        // empty string, so an empty name must fall through the same as a null.
+        label: alert.ruleName || alert.ruleId || unidentifiedRule,
+        rows: [row],
+      });
+    }
+  });
+  return [...groups.values()];
+}
+
+/** Urgency order for leaked secrets: a credential that still works first, then
+ *  newest. `createdAt` is ISO-8601, so a string compare is a date compare. */
+const bySecretUrgency = (
+  a: SecretScanningAlertOut,
+  b: SecretScanningAlertOut,
+) =>
+  VALIDITY_RANK[validityLevel(a.validity)] -
+    VALIDITY_RANK[validityLevel(b.validity)] ||
+  b.createdAt.localeCompare(a.createdAt);
+
+/** A secret type's display name, falling back through the tolerated-empty fields
+ *  the Raw parse can leave behind. Shared by the group header and the row title
+ *  so the two can never disagree — and grouping on it keeps two differently-typed
+ *  secrets apart when both lost their display name. */
+const secretTypeLabel = (a: SecretScanningAlertOut, unknownType: string) =>
+  a.secretTypeDisplayName || a.secretType || unknownType;
+
+function buildSecretGroups(alerts: SecretScanningAlertOut[], unknownType: string): SecretGroup[] {
+  const sorted = alerts.toSorted(bySecretUrgency);
+  const groups = new Map<string, SecretGroup>();
+  sorted.forEach((alert, i) => {
+    const row: SecretRow = {
+      id: alert.number === 0 ? `secret-i${i}` : `secret-${alert.number}`,
+      alert,
+    };
+    const label = secretTypeLabel(alert, unknownType);
+    const bucket = groups.get(label);
+    if (bucket) bucket.rows.push(row);
+    else groups.set(label, { key: label, label, rows: [row] });
+  });
+  return [...groups.values()];
+}
+
+// ── GitLab pipeline findings ─────────────────────────────────────────────────
+
+interface GlSecureRow {
+  /** The rendered row's DOM id, built from the same `secureFindingId` the stored
+   *  selection uses — the two must agree or a click highlights another row. */
+  id: string;
+  finding: GlSecureFindingOut;
+}
+
+interface GlSecureGroup {
+  key: string;
+  label: string;
+  rows: GlSecureRow[];
+}
+
+interface GlQualityRow {
+  id: string;
+  finding: GlCodeQualityFindingOut;
+}
+
+interface GlQualityGroup {
+  key: string;
+  label: string;
+  rows: GlQualityRow[];
+}
+
+/** SAST and secret-detection findings, grouped by rule/secret type. Sort first,
+ *  group after: the groups AND the rows inside each group both run worst-first,
+ *  and the report's own order stays the tiebreak within a rung. */
+function buildGlSecureGroups(
+  findings: GlSecureFindingOut[],
+  prefix: "gl-sast" | "gl-secret",
+  fallbackLabel: string,
+): GlSecureGroup[] {
+  const sorted = findings.toSorted(
+    (a, b) =>
+      SEVERITY_RANK[severityLevel(a.severity)] -
+      SEVERITY_RANK[severityLevel(b.severity)],
+  );
+  const groups = new Map<string, GlSecureGroup>();
+  for (const finding of sorted) {
+    // `||`, not `??`: the tolerant parse degrades a missing field to an empty
+    // string, so an empty name must fall through the same as a null.
+    const label = finding.name || fallbackLabel;
+    const row: GlSecureRow = {
+      id: `${prefix}-${secureFindingId(finding)}`,
+      finding,
+    };
+    const bucket = groups.get(label);
+    if (bucket) bucket.rows.push(row);
+    else groups.set(label, { key: label, label, rows: [row] });
+  }
+  return [...groups.values()];
+}
+
+function buildGlQualityGroups(
+  findings: GlCodeQualityFindingOut[],
+): GlQualityGroup[] {
+  const sorted = findings.toSorted(
+    (a, b) => cqRank(a.severity) - cqRank(b.severity),
+  );
+  const groups = new Map<string, GlQualityGroup>();
+  for (const finding of sorted) {
+    const label = finding.checkName || "Unidentified check";
+    const row: GlQualityRow = {
+      id: `gl-cq-${codeQualityFindingId(finding)}`,
+      finding,
+    };
+    const bucket = groups.get(label);
+    if (bucket) bucket.rows.push(row);
+    else groups.set(label, { key: label, label, rows: [row] });
+  }
+  return [...groups.values()];
+}
+
+/** Whether two selections point at the same finding. The GitLab arms carry a
+ *  derived composite (`secureFindingId` / `codeQualityFindingId`) precisely so an
+ *  id-less finding is still distinguishable. The GitHub arms keep first-match-wins
+ *  for their degenerate identities (an alert numbered 0, an advisory with no GHSA
+ *  id) — a recorded deferral, not an oversight: the server always sends those, so
+ *  only a tolerated parse degradation can blank one. */
+function sameFinding(a: SelectedFinding, b: SelectedFinding): boolean {
+  if (a.type === "advisory")
+    return b.type === "advisory" && a.ghsaId === b.ghsaId;
+  // GitLab ids are unique only within their category — a secret and a SAST
+  // finding can share one — so the category is part of the comparison.
+  if (a.type === "glFinding")
+    return b.type === "glFinding" && b.category === a.category && b.id === a.id;
+  // A Bitbucket annotation's uuid is unique only within its report, so both
+  // halves of the pair have to match.
+  if (a.type === "bbFinding")
+    return (
+      b.type === "bbFinding" &&
+      b.reportUuid === a.reportUuid &&
+      b.annotationUuid === a.annotationUuid
+    );
+  // The three numbered categories keep separate number sequences, so the type
+  // tag has to match too — alert #4 is not code scanning alert #4.
+  return (
+    b.type !== "advisory" &&
+    b.type !== "glFinding" &&
+    b.type !== "bbFinding" &&
+    b.type === a.type &&
+    b.number === a.number
+  );
+}
+
+const matchesAlert = (a: DependabotAlertOut, q: string) =>
+  !q ||
+  a.packageName.toLowerCase().includes(q) ||
+  a.summary.toLowerCase().includes(q) ||
+  a.ghsaId.toLowerCase().includes(q) ||
+  (a.cveId?.toLowerCase().includes(q) ?? false);
+
+const matchesCodeScanning = (a: CodeScanningAlertOut, q: string) =>
+  !q ||
+  a.ruleId.toLowerCase().includes(q) ||
+  (a.ruleName?.toLowerCase().includes(q) ?? false) ||
+  a.message.toLowerCase().includes(q) ||
+  a.path.toLowerCase().includes(q) ||
+  a.toolName.toLowerCase().includes(q);
+
+const matchesSecret = (a: SecretScanningAlertOut, q: string) =>
+  !q ||
+  a.secretType.toLowerCase().includes(q) ||
+  a.secretTypeDisplayName.toLowerCase().includes(q);
+
+const matchesAdvisory = (adv: RepoAdvisoryOut, q: string) =>
+  !q ||
+  adv.summary.toLowerCase().includes(q) ||
+  adv.ghsaId.toLowerCase().includes(q) ||
+  (adv.cveId?.toLowerCase().includes(q) ?? false) ||
+  adv.vulnerabilities.some((v) => v.packageName.toLowerCase().includes(q));
+
+/** Identifiers match on BOTH name and value: reports spell a CWE as name
+ *  `CWE-79` with value `79`, so searching values alone would miss what the detail
+ *  pane actually shows — and the placeholder cues identifiers. */
+const matchesGlSecure = (f: GlSecureFindingOut, q: string) =>
+  !q ||
+  f.name.toLowerCase().includes(q) ||
+  f.description.toLowerCase().includes(q) ||
+  f.file.toLowerCase().includes(q) ||
+  f.severity.toLowerCase().includes(q) ||
+  f.scannerName.toLowerCase().includes(q) ||
+  f.identifiers.some(
+    (i) =>
+      i.name.toLowerCase().includes(q) || i.value.toLowerCase().includes(q),
+  );
+
+const matchesGlQuality = (f: GlCodeQualityFindingOut, q: string) =>
+  !q ||
+  f.checkName.toLowerCase().includes(q) ||
+  f.path.toLowerCase().includes(q) ||
+  f.description.toLowerCase().includes(q) ||
+  f.severity.toLowerCase().includes(q);
+
+function SectionHeader({ title }: { title: string }) {
+  return (
+    <h3 className="border-b bg-muted/40 px-3 py-1.5 text-[11px] font-semibold tracking-wide text-muted-foreground uppercase">
+      {title}
+    </h3>
+  );
+}
+
+/** `path:line`, right-aligned in the row, middle-truncated so the filename —
+ *  the part that identifies the finding — survives. */
+function PathLabel({ path, line }: { path: string; line: number | null }) {
+  const { t } = useTranslation();
+  // A tolerated alert can arrive with no path at all; a line number hung off the
+  // placeholder would read as a location, so it's dropped with the path.
+  if (!path) {
+    return (
+      <span className="ml-auto min-w-0 truncate font-mono">{t("findingsUi.noFilePath")}</span>
+    );
+  }
+  return <PathText path={path} line={line} className="ml-auto font-mono" />;
+}
+
+// `name` per call site: several sections load independently and can all be
+// pending at once, so one shared noun would announce the same region repeatedly.
+function RowSkeletons({ name }: { name: string }) {
+  return <ListRowSkeletons rows={2} lines={2} indent={false} name={name} />;
+}
+
+/** A full-width, in-flow explanation of why a category has no usable data, with
+ *  the one action that resolves it. Icon + text — never tone alone. */
+function ReasonCard({
+  icon: Icon,
+  message,
+  detail,
+  action,
+}: {
+  icon: typeof ShieldSlashIcon;
+  message: string;
+  detail?: string | null;
+  action?: ReactNode;
+}) {
+  return (
+    <div className="flex gap-2 border-b px-3 py-3">
+      <Icon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+      <div className="min-w-0 flex-1 space-y-2">
+        <p className="text-xs text-muted-foreground">{message}</p>
+        {detail ? (
+          <p className="text-[11px] wrap-break-word text-muted-foreground/80">
+            {detail}
+          </p>
+        ) : null}
+        {action}
+      </div>
+    </div>
+  );
+}
+
+function localizeFindingCategory(
+  category: string,
+  t: (key: TranslationKey, values?: Record<string, string | number>) => string,
+): string {
+  const keys: Record<string, TranslationKey> = {
+    findings: "findingsUi.findings",
+    SAST: "findingsUi.sast",
+    sast: "findingsUi.sast",
+    "secret detection": "findingsUi.secretDetection",
+    "secret finding": "findingsUi.secretFindings",
+    "secret findings": "findingsUi.secretFindings",
+    "code quality": "findingsUi.codeQuality",
+    "code quality findings": "findingsUi.codeQualityFindings",
+    "sast findings": "findingsUi.sastFindings",
+    annotations: "findingsUi.annotations",
+    "dependency alerts": "findingsUi.dependencyAlerts",
+    "code scanning alerts": "findingsUi.codeScanningAlerts",
+    "secret scanning alerts": "findingsUi.secretScanningAlerts",
+    "security advisories": "findingsUi.securityAdvisories",
+  };
+  const key = keys[category.toLowerCase()] ?? keys[category] ?? "findingsUi.findings";
+  return t(key);
+}
+
+/**
+ * The card for any envelope that isn't `"available"`. `notEnabledMessage` and
+ * `noResultsYetMessage` are the category's own copy for those two states;
+ * `onEnable` is passed on top of either only where the app can open the toggle.
+ * A category without them still reports the state the server named rather than
+ * falling through to "couldn't check". `Category` is the sentence-initial form
+ * of `category`.
+ */
+function UnavailableCard({
+  availability,
+  detail,
+  category,
+  Category,
+  notEnabledMessage,
+  noResultsYetMessage,
+  onRetry,
+  onEnable,
+}: {
+  availability: Exclude<FindingAvailability, "available">;
+  detail: string | null;
+  category: string;
+  Category: string;
+  notEnabledMessage?: string;
+  noResultsYetMessage?: string;
+  onRetry: () => void;
+  onEnable?: () => void;
+}) {
+  const { t } = useTranslation();
+  const categoryLabel = localizeFindingCategory(category, t);
+  const titleCategory = localizeFindingCategory(Category, t);
+  const enableAction = onEnable ? (
+    <Button variant="outline" size="sm" onClick={onEnable}>
+      <GearSixIcon data-icon="inline-start" />
+      {t("findingsUi.openSecuritySettings")}
+    </Button>
+  ) : undefined;
+  const retryAction = (
+    <Button variant="outline" size="sm" onClick={onRetry}>
+      <ArrowClockwiseIcon data-icon="inline-start" />
+      {t("common.retry")}
+    </Button>
+  );
+
+  if (availability === "notEnabled") {
+    // The category's own sentence is how a non-admin learns what to ask for, so
+    // it shows with or without the action. It already names the cause, so the
+    // server's detail would only restate it — detail is for the generic path.
+    return (
+      <ReasonCard
+        icon={ShieldSlashIcon}
+        message={
+          notEnabledMessage ?? t("findingsUi.categoryNotEnabled", { category: titleCategory })
+        }
+        detail={notEnabledMessage ? null : detail}
+        action={enableAction}
+      />
+    );
+  }
+  if (availability === "noResultsYet") {
+    // Deliberately not phrased as "turn it on": this state can't distinguish an
+    // unconfigured feature from one whose first analysis is still running, so
+    // both the copy and the actions cover each — settings for setup, Retry for
+    // a run that may since have finished. Retry is the non-admin's only path.
+    return (
+      <ReasonCard
+        icon={InfoIcon}
+        message={
+          noResultsYetMessage ?? t("findingsUi.noCategoryResultsYet", { category: categoryLabel })
+        }
+        detail={noResultsYetMessage ? null : detail}
+        action={
+          <div className="flex flex-wrap items-center gap-2">
+            {enableAction}
+            {retryAction}
+          </div>
+        }
+      />
+    );
+  }
+  if (availability === "forbidden") {
+    return (
+      <ReasonCard
+        icon={LockKeyIcon}
+        message={t("findingsUi.githubCannotReadCategory", { category: categoryLabel })}
+        detail={detail}
+      />
+    );
+  }
+  if (availability === "indeterminate") {
+    return (
+      <ReasonCard
+        icon={QuestionIcon}
+        message={t("findingsUi.couldNotCheckCategory", { category: categoryLabel })}
+        detail={detail}
+        action={retryAction}
+      />
+    );
+  }
+  // Every state is branched above, so this is unreachable — and the assignment
+  // is the point: a new FindingAvailability variant fails to compile here
+  // instead of silently rendering the "couldn't check" card.
+  const _exhaustive: never = availability;
+  return _exhaustive;
+}
+
+function LoadFailed({
+  category,
+  onRetry,
+}: {
+  category: string;
+  onRetry: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex flex-col items-start gap-2 border-b px-3 py-3">
+      <p className="text-xs text-muted-foreground">
+        {t("findingsUi.couldNotLoadCategory", { category: localizeFindingCategory(category, t) })}
+      </p>
+      <Button variant="outline" size="sm" onClick={onRetry}>
+        <ArrowClockwiseIcon data-icon="inline-start" />
+        {t("common.retry")}
+      </Button>
+    </div>
+  );
+}
+
+/** `"HEAD"` is the wire's sentinel for a ref we cannot name: a detached checkout,
+ *  and equally a branch read that failed or came back empty — both backends
+ *  degrade to it and never query under that name. No copy may therefore claim a
+ *  result *for* it; sentences name the ref actually listed instead. */
+const isUnnamedRef = (ref: string): boolean => ref === "HEAD";
+
+/** The refs that were looked at, for copy that would otherwise claim something
+ *  project-wide. Built from `requestedRef` + `defaultRef` — NOT `fallbackRef`,
+ *  which is set only when a default-branch result was actually used and so can
+ *  never name the second ref in the state this serves. The sentinel contributes
+ *  nothing (never queried under a name) and a branch that IS the default is named
+ *  once; null when neither can be named. Structural, so the GitLab and Bitbucket
+ *  envelopes — which spell these three fields identically — share one rule. */
+function checkedRefs(data: {
+  requestedRef: string;
+  defaultRef: string | null;
+}): string | null {
+  const names = [
+    isUnnamedRef(data.requestedRef) ? null : data.requestedRef,
+    data.defaultRef && data.defaultRef !== data.requestedRef
+      ? data.defaultRef
+      : null,
+  ].filter((name): name is string => name !== null);
+  if (names.length === 2) return `${names[0]} or ${names[1]}`;
+  return names[0] ?? null;
+}
+
+/** The project's scanning setup page, or null when the project URL is unknown —
+ *  derived in one place so the panel-level card and the per-category cards can't
+ *  drift apart on the path. */
+const glScanningSetupUrl = (data: GlFindingsOut): string | null =>
+  data.projectWebUrl ? `${data.projectWebUrl}/-/security/configuration` : null;
+
+/** A partial-read disclosure on a category that IS available: some report bodies
+ *  or items failed to parse, so the rows below are incomplete. Quiet by design —
+ *  the data is usable, just not whole. */
+function GlPartialDetail({ detail }: { detail: string | null }) {
+  if (!detail) return null;
+  return (
+    <p className="px-3 py-2 text-[11px] text-muted-foreground">{detail}</p>
+  );
+}
+
+/**
+ * Which pipeline these findings came from. GitLab's reports are artifacts of one
+ * commit's pipeline, not a repository-wide alert store, so the strip is what
+ * keeps the list honest about how current it is. In normal layout flow (never
+ * floating) so it can never cover a row.
+ */
+function PipelineProvenance({ data }: { data: GlFindingsOut }) {
+  const { t } = useTranslation();
+  const pipeline = data.pipeline;
+  if (!pipeline) return null;
+  // The finish time is what dates the findings; a still-listed pipeline that
+  // never finished falls back to when it started rather than showing nothing.
+  const when = pipeline.finishedAt ?? pipeline.createdAt;
+  // A failed pipeline still publishes artifacts and is deliberately accepted as
+  // a source, so its status is surfaced — otherwise a failed run reads as a
+  // healthy one above cards blaming setup. Success is the quiet default.
+  const degraded = pipeline.status !== "success";
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b bg-muted/20 px-3 py-2 text-[11px] text-muted-foreground">
+      {data.usedFallback ? (
+        <p className="w-full">
+          {isUnnamedRef(data.requestedRef)
+            ? t("findingsUi.noNamedBranchShowing", { branch: data.fallbackRef || t("findingsUi.defaultBranch") })
+            : t("findingsUi.noPipelinesOnBranchShowing", { requested: data.requestedRef, branch: data.fallbackRef || t("findingsUi.defaultBranch") })}
+        </p>
+      ) : null}
+      <p className="min-w-0 flex-1 truncate">
+        {t("findingsUi.fromPipeline", { id: pipeline.iid })}
+        {degraded && pipeline.status ? (
+          // Icon + the status word: the state is never carried by tone alone.
+          <span className="ml-1 inline-flex items-center gap-1 text-warning">
+            <WarningCircleIcon className="size-3" aria-hidden />
+            {pipeline.status}
+          </span>
+        ) : null}{" "}
+        · <span className="font-mono">{pipeline.ref}</span> @{" "}
+        <span className="font-mono">{pipeline.sha.slice(0, 8)}</span>
+        {parseableDate(when) && (
+          <>
+            {" · "}
+            <RelativeTime date={when} />
+          </>
+        )}
+      </p>
+      {pipeline.webUrl ? (
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => openUrl(pipeline.webUrl)}
+        >
+          <ArrowSquareOutIcon data-icon="inline-start" />
+          {t("findingsUi.viewPipeline")}
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The one panel-level card for a repo with no pipeline to read reports from —
+ * all three categories share the state, so three identical cards would only
+ * repeat it. `state` is passed separately from `data` so the exhaustiveness net
+ * below has a union without `"found"` to close over.
+ */
+function GlNoPipelineCard({
+  state,
+  data,
+  onRetry,
+}: {
+  state: Exclude<GlPipelineState, "found">;
+  data: GlFindingsOut;
+  onRetry: () => void;
+}) {
+  const { t } = useTranslation();
+  const retryAction = (
+    <Button variant="outline" size="sm" onClick={onRetry}>
+      <ArrowClockwiseIcon data-icon="inline-start" />
+      {t("common.retry")}
+    </Button>
+  );
+  const setupUrl = glScanningSetupUrl(data);
+
+  if (state === "none") {
+    // Only two refs were queried, so the sentence names them rather than
+    // clearing the whole project: pipelines can live on refs we never asked for
+    // (merge-request refs, tags, other branches).
+    const refs = checkedRefs(data);
+    return (
+      <ReasonCard
+        icon={ShieldSlashIcon}
+        message={t(refs ? "findingsUi.noPipelinesOnRefs" : "findingsUi.noPipelines", { refs: refs ?? "" })}
+        action={
+          <div className="flex flex-wrap items-center gap-2">
+            {setupUrl ? (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => openUrl(setupUrl)}
+              >
+                <GearSixIcon data-icon="inline-start" />
+                {t("findingsUi.openGitLabScanningSetup")}
+              </Button>
+            ) : null}
+            {retryAction}
+          </div>
+        }
+      />
+    );
+  }
+  if (state === "runningOnly") {
+    // Name only a ref whose pipelines were actually listed: on the "HEAD"
+    // sentinel that is the fallback branch, never the checkout itself.
+    const listed =
+      data.usedFallback || isUnnamedRef(data.requestedRef)
+        ? data.fallbackRef
+        : data.requestedRef;
+    return (
+      <ReasonCard
+        icon={ClockIcon}
+        // Canceled, skipped, manual and pending pipelines all land here, so this
+        // promises no finish — only that a completed one would be read.
+        message={
+          listed
+            ? t("findingsUi.pipelineNotFinishedOnBranch", { branch: listed })
+            : t("findingsUi.noPipelineFinished")
+        }
+        action={retryAction}
+      />
+    );
+  }
+  if (state === "unavailable") {
+    // Every category carries the same classified state here, so the SAST
+    // envelope speaks for the panel.
+    if (data.sast.availability === "forbidden") {
+      return (
+        <ReasonCard
+          icon={LockKeyIcon}
+          message={t("findingsUi.gitlabCannotReadPipelines")}
+          detail={data.sast.detail}
+        />
+      );
+    }
+    return (
+      <ReasonCard
+        icon={QuestionIcon}
+        message={t("findingsUi.couldNotCheckRepoFindings")}
+        detail={data.sast.detail}
+        action={retryAction}
+      />
+    );
+  }
+  // A new GlPipelineState fails to compile here instead of silently rendering
+  // nothing at all.
+  const _exhaustive: never = state;
+  return _exhaustive;
+}
+
+/**
+ * The card for a category whose envelope isn't `"available"`, on a pipeline we
+ * did find. `category` is the lowercase mid-sentence form, `Category` the
+ * sentence-initial one; `onSetup` is passed only where the project's web URL is
+ * known, so the setup link can't be a dead end.
+ */
+function GlUnavailableCard({
+  availability,
+  detail,
+  category,
+  Category,
+  notConfiguredMessage,
+  onRetry,
+  onSetup,
+}: {
+  availability: Exclude<GlFindingAvailability, "available">;
+  detail: string | null;
+  category: string;
+  Category: string;
+  /** Replaces the per-category sentence where the shared template reads badly —
+   *  the hoisted card speaks for all three at once. */
+  notConfiguredMessage?: string;
+  onRetry: () => void;
+  onSetup?: () => void;
+}) {
+  const { t } = useTranslation();
+  const categoryLabel = localizeFindingCategory(category, t);
+  const retryAction = (
+    <Button variant="outline" size="sm" onClick={onRetry}>
+      <ArrowClockwiseIcon data-icon="inline-start" />
+      {t("common.retry")}
+    </Button>
+  );
+
+  if (availability === "notConfigured") {
+    return (
+      <ReasonCard
+        icon={ShieldSlashIcon}
+        // Hedged deliberately: an analyzer job that ran and FAILED publishes no
+        // artifacts either, and the wire can't tell that from never-configured.
+        message={
+          notConfiguredMessage ??
+          t("findingsUi.pipelineNoCategoryReport", { category: categoryLabel })
+        }
+        action={
+          <div className="flex flex-wrap items-center gap-2">
+            {onSetup ? (
+              <Button variant="outline" size="sm" onClick={onSetup}>
+                <GearSixIcon data-icon="inline-start" />
+                {t("findingsUi.openGitLabScanningSetup")}
+              </Button>
+            ) : null}
+            {retryAction}
+          </div>
+        }
+      />
+    );
+  }
+  if (availability === "reportNotReadable") {
+    return (
+      <ReasonCard
+        icon={WarningCircleIcon}
+        // "the job that produces it" reads correctly whether this card speaks for
+        // one category or, hoisted, for all three (up to three jobs).
+        message={t("findingsUi.pipelineReportUnreadable", { category: categoryLabel })}
+        detail={detail}
+        action={retryAction}
+      />
+    );
+  }
+  if (availability === "expired") {
+    return (
+      <ReasonCard
+        icon={ClockIcon}
+        message={t("findingsUi.pipelineReportsExpired")}
+        detail={detail}
+        action={retryAction}
+      />
+    );
+  }
+  if (availability === "analysisPending") {
+    return (
+      <ReasonCard
+        icon={InfoIcon}
+        message={t("findingsUi.categoryStillRunning", { category: localizeFindingCategory(Category, t) })}
+        action={retryAction}
+      />
+    );
+  }
+  if (availability === "forbidden") {
+    return (
+      <ReasonCard
+        icon={LockKeyIcon}
+        message={t("findingsUi.gitlabCannotReadArtifacts")}
+        detail={detail}
+      />
+    );
+  }
+  if (availability === "indeterminate") {
+    return (
+      <ReasonCard
+        icon={QuestionIcon}
+        message={`Couldn't check ${category}.`}
+        detail={detail}
+        action={retryAction}
+      />
+    );
+  }
+  // A new GlFindingAvailability variant fails to compile here instead of
+  // silently rendering the "couldn't check" card.
+  const _exhaustive: never = availability;
+  return _exhaustive;
+}
+
+/** The empty state for an available category with no rows. A wholly-clean report
+ *  and one whose items partly failed to parse must never read the same, so the
+ *  reassuring shield is reserved for the case where nothing was lost. The lossy
+ *  wording claims only what was read: one analyzer's report can parse clean while
+ *  a sibling's is lost, so "nothing readable" would deny a read that happened. */
+function GlSectionEmpty({
+  category,
+  cleanTitle,
+  detail,
+}: {
+  category: string;
+  cleanTitle: string;
+  detail: string | null;
+}) {
+  const { t } = useTranslation();
+  return (
+    <Empty className="py-8">
+      <EmptyHeader>
+        <EmptyMedia variant="icon">
+          {detail ? <InfoIcon /> : <ShieldCheckIcon />}
+        </EmptyMedia>
+        <EmptyTitle>
+          {detail
+            ? t("findingsUi.noCategoryInReadableReports", { category })
+            : cleanTitle}
+        </EmptyTitle>
+      </EmptyHeader>
+    </Empty>
+  );
+}
+
+/** The grouped rows of SAST or secret detection. The group header carries the
+ *  rule/secret name, so each row leads with where it was found. */
+function GlSecureRows({
+  groups,
+  category,
+  selectedRowId,
+  onSelect,
+}: {
+  groups: GlSecureGroup[];
+  category: "sast" | "secretDetection";
+  selectedRowId: string | null;
+  onSelect: (finding: SelectedFinding) => void;
+}) {
+  return (
+    <>
+      {groups.map((group) => (
+        <div key={group.key}>
+          <div className="flex items-baseline gap-2 px-3 py-1 text-[11px] text-muted-foreground">
+            <span className="truncate text-foreground" title={group.label}>
+              {group.label}
+            </span>
+            <span className="ml-auto shrink-0 tabular-nums">
+              {group.rows.length}
+            </span>
+          </div>
+          {group.rows.map(({ id, finding: f }) => (
+            <button
+              type="button"
+              key={id}
+              data-row={id}
+              className={cn(
+                "block w-full border-b px-3 py-2 text-left",
+                selectedRowId === id
+                  ? "bg-accent text-accent-foreground"
+                  : "hover:bg-muted/60",
+              )}
+              onClick={() =>
+                onSelect({
+                  type: "glFinding",
+                  category,
+                  id: secureFindingId(f),
+                })
+              }
+            >
+              <p className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                <SeverityChip severity={f.severity} />
+                <PathLabel path={f.file} line={f.startLine} />
+              </p>
+              {f.scannerName ? (
+                <p
+                  className="mt-1 truncate text-[11px] text-muted-foreground"
+                  title={f.scannerName}
+                >
+                  {f.scannerName}
+                </p>
+              ) : null}
+            </button>
+          ))}
+        </div>
+      ))}
+    </>
+  );
+}
+
+function GlQualityRows({
+  groups,
+  selectedRowId,
+  onSelect,
+}: {
+  groups: GlQualityGroup[];
+  selectedRowId: string | null;
+  onSelect: (finding: SelectedFinding) => void;
+}) {
+  return (
+    <>
+      {groups.map((group) => (
+        <div key={group.key}>
+          <div className="flex items-baseline gap-2 px-3 py-1 text-[11px] text-muted-foreground">
+            <span className="truncate text-foreground" title={group.label}>
+              {group.label}
+            </span>
+            <span className="ml-auto shrink-0 tabular-nums">
+              {group.rows.length}
+            </span>
+          </div>
+          {group.rows.map(({ id, finding: f }) => (
+            <button
+              type="button"
+              key={id}
+              data-row={id}
+              className={cn(
+                "block w-full border-b px-3 py-2 text-left",
+                selectedRowId === id
+                  ? "bg-accent text-accent-foreground"
+                  : "hover:bg-muted/60",
+              )}
+              onClick={() =>
+                onSelect({
+                  type: "glFinding",
+                  category: "codeQuality",
+                  id: codeQualityFindingId(f),
+                })
+              }
+            >
+              <p className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                <CqChip severity={f.severity} />
+                <PathLabel path={f.path} line={f.line} />
+              </p>
+              {f.description ? (
+                <p
+                  className="mt-1 truncate text-xs font-medium"
+                  title={f.description}
+                >
+                  {f.description}
+                </p>
+              ) : null}
+            </button>
+          ))}
+        </div>
+      ))}
+    </>
+  );
+}
+
+/** The tail below a section's rows: at the row cap it states what is shown, and
+ *  below the cap it offers the next page. Callers render it outside their empty
+ *  branch, gated on `truncated` alone — filtering to zero matches must not strip
+ *  the only way to reach rows past the fetched window. `noun` words this
+ *  sentence only; a section's filter noun can differ ("No alerts match the
+ *  filter." over "dependency alerts"), so the two are never shared. */
+function FindingsTruncationTail({
+  truncated,
+  loaded,
+  noun,
+  limits,
+  limitKey,
+  setLimits,
+  loading,
+}: {
+  truncated: boolean;
+  /** Rows loaded so far — what the sentence counts, never the server total. */
+  loaded: number;
+  noun: string;
+  limits: FindingsLimits;
+  /** Which limit this section grows; GitLab's three categories share one, so it
+   *  can't be derived from the section. */
+  limitKey: keyof FindingsLimits;
+  setLimits: (limits: FindingsLimits) => void;
+  /** The owning query's `isFetching`, so only its own button spins. */
+  loading: boolean;
+}) {
+  const { t } = useTranslation();
+  if (!truncated) return null;
+  if (limits[limitKey] >= FINDINGS_LIMIT_CAP) {
+    return (
+      <p className="border-t px-3 py-3 text-xs text-muted-foreground">
+        {t("findingsUi.showingFirst", { count: loaded.toLocaleString(), category: localizeFindingCategory(noun, t) })}
+      </p>
+    );
+  }
+  return (
+    <LoadMoreRow
+      count={loaded}
+      loading={loading}
+      onLoadMore={() =>
+        setLimits({
+          ...limits,
+          [limitKey]: Math.min(
+            limits[limitKey] + PAGE_SIZE,
+            FINDINGS_LIMIT_CAP,
+          ),
+        })
+      }
+    />
+  );
+}
+
+/** One GitLab category's section: its header, then either the card explaining
+ *  why the category is unavailable or its body — partial-read notice, rows or an
+ *  empty state, truncation tail. Rows differ per category, so they arrive as
+ *  children rather than as a union of group types; `category`, `Category`,
+ *  `cleanTitle` and `noun` are independent wordings, none derivable from
+ *  another. */
+function GlFindingsSection({
+  title,
+  availability,
+  detail,
+  category,
+  Category,
+  cleanTitle,
+  noun,
+  hasGroups,
+  loaded,
+  truncated,
+  limits,
+  setLimits,
+  loading,
+  onRetry,
+  onSetup,
+  children,
+}: {
+  title: string;
+  availability: GlFindingAvailability;
+  detail: string | null;
+  category: string;
+  Category: string;
+  cleanTitle: string;
+  /** Names the rows in both the filter-empty line and the cap sentence — the two
+   *  agree for every GitLab category. */
+  noun: string;
+  hasGroups: boolean;
+  /** Rows loaded before filtering: what separates "nothing matched the filter"
+   *  from "nothing was found". */
+  loaded: number;
+  truncated: boolean;
+  limits: FindingsLimits;
+  setLimits: (limits: FindingsLimits) => void;
+  loading: boolean;
+  onRetry: () => void;
+  onSetup?: () => void;
+  children: ReactNode;
+}) {
+  const { t } = useTranslation();
+  return (
+    <>
+      <SectionHeader title={title} />
+      {availability !== "available" ? (
+        <GlUnavailableCard
+          availability={availability}
+          detail={detail}
+          category={category}
+          Category={Category}
+          onRetry={onRetry}
+          onSetup={onSetup}
+        />
+      ) : (
+        <>
+          <GlPartialDetail detail={detail} />
+          {hasGroups ? (
+            children
+          ) : loaded > 0 ? (
+            <p className="px-3 py-4 text-xs text-muted-foreground">
+              {t("findingsUi.noCategoryMatchesFilter", { category: localizeFindingCategory(noun, t) })}
+            </p>
+          ) : (
+            <GlSectionEmpty
+              category={category}
+              cleanTitle={cleanTitle}
+              detail={detail}
+            />
+          )}
+          {/* One limit key for all three categories: they come from a single
+              pipeline query, so growing any one grows all three. */}
+          <FindingsTruncationTail
+            truncated={truncated}
+            loaded={loaded}
+            noun={noun}
+            limits={limits}
+            limitKey="gitlab"
+            setLimits={setLimits}
+            loading={loading}
+          />
+        </>
+      )}
+    </>
+  );
+}
+
+// ── Bitbucket Code Insights ──────────────────────────────────────────────────
+
+interface BbAnnotationRow {
+  /** Unique per rendered row: an annotation uuid repeats across reports, so the
+   *  report's is part of it — duplicate `data-row` values would misdirect the
+   *  arrow-key focus. Matches the stored selection's identity pair. */
+  id: string;
+  annotation: BbAnnotationOut;
+}
+
+interface BbReportSection {
+  report: BbReportOut;
+  label: string;
+  /** Annotations that survived the filter, worst-first. */
+  rows: BbAnnotationRow[];
+}
+
+const bbRowId = (reportUuid: string, annotationUuid: string): string =>
+  `bb-${reportUuid}-${annotationUuid}`;
+
+/** Newest report first. Server order is unpinned, so the panel applies recency
+ *  itself; `createdOn` is ISO-8601, so a string compare is a date compare. An
+ *  undated report sinks below every dated one rather than jumping the list. */
+const byBbReportRecency = (a: BbReportOut, b: BbReportOut) =>
+  Number(!a.createdOn) - Number(!b.createdOn) ||
+  (b.createdOn ?? "").localeCompare(a.createdOn ?? "");
+
+/** Worst-first, then by location. A null severity ranks with `unknown`, i.e.
+ *  last, and a row with no path sinks below located ones on the same rung —
+ *  there is nothing to order it against. */
+const byBbAnnotation = (a: BbAnnotationOut, b: BbAnnotationOut) =>
+  SEVERITY_RANK[severityLevel(a.severity)] -
+    SEVERITY_RANK[severityLevel(b.severity)] ||
+  Number(!a.path) - Number(!b.path) ||
+  (a.path ?? "").localeCompare(b.path ?? "");
+
+/** The report's own name matches too, so filtering by it keeps that whole
+ *  section's rows rather than emptying a section the query named. `externalId`
+ *  is matched because it stands in as the row's visible label when the
+ *  annotation carries no summary — typing what you see has to find it. */
+const matchesBbAnnotation = (a: BbAnnotationOut, label: string, q: string) =>
+  !q ||
+  label.toLowerCase().includes(q) ||
+  (a.summary?.toLowerCase().includes(q) ?? false) ||
+  (a.externalId?.toLowerCase().includes(q) ?? false) ||
+  (a.path?.toLowerCase().includes(q) ?? false);
+
+function buildBbSections(
+  reports: BbReportOut[],
+  query: string,
+): BbReportSection[] {
+  return reports.toSorted(byBbReportRecency).map((report) => {
+    const label = bbReportLabel(report);
+    return {
+      report,
+      label,
+      rows: report.annotations
+        .filter((a) => matchesBbAnnotation(a, label, query))
+        .toSorted(byBbAnnotation)
+        .map((annotation) => ({
+          id: bbRowId(report.uuid, annotation.uuid),
+          annotation,
+        })),
+    };
+  });
+}
+
+/** A report's result tone and glyph. The label always rides alongside, so the
+ *  state never reaches the user by color or glyph alone. */
+const BB_RESULT_TONE: Record<BbResultLevel, string> = {
+  passed: "text-success",
+  failed: "text-destructive",
+  pending: "text-muted-foreground",
+  unknown: "text-muted-foreground",
+};
+
+const BB_RESULT_ICON: Record<BbResultLevel, typeof CheckCircleIcon> = {
+  passed: CheckCircleIcon,
+  failed: XCircleIcon,
+  pending: ClockIcon,
+  unknown: CircleIcon,
+};
+
+function BbResultChip({
+  result,
+  className,
+}: {
+  result: string | null;
+  className?: string;
+}) {
+  const level = bbResultLevel(result);
+  const Icon = BB_RESULT_ICON[level];
+  return (
+    <Badge
+      variant="outline"
+      className={cn("gap-1", BB_RESULT_TONE[level], className)}
+    >
+      <Icon weight={level === "failed" ? "fill" : "regular"} />
+      {bbResultLabel(result)}
+    </Badge>
+  );
+}
+
+/** One `data` item as display text, or null when it carries nothing readable.
+ *  The values are third-party JSON, so each type guards what it needs and an
+ *  unexpected shape degrades instead of throwing — one malformed item must not
+ *  blank the strip. Never rendered as a link: only the gated `link` fields are. */
+function bbDataText(item: BbReportDataOut): string | null {
+  const value = item.value;
+  const asNumber =
+    typeof value === "number" && Number.isFinite(value) ? value : null;
+  switch (item.type?.toUpperCase()) {
+    case "NUMBER":
+      return asNumber === null
+        ? bbPlainValue(value)
+        : asNumber.toLocaleString();
+    case "DURATION":
+      // Atlassian documents a DURATION value as a count of milliseconds.
+      return asNumber === null ? bbPlainValue(value) : formatDuration(asNumber);
+    case "BOOLEAN":
+      return typeof value === "boolean"
+        ? value
+          ? "✓"
+          : "✗"
+        : bbPlainValue(value);
+    case "PERCENTAGE":
+      return asNumber === null
+        ? bbPlainValue(value)
+        : `${asNumber.toLocaleString()}%`;
+    case "DATE":
+      // Atlassian documents a DATE value as epoch milliseconds; `validEpochMs`
+      // is what keeps an out-of-range number out of `new Date`.
+      return asNumber !== null && validEpochMs(asNumber)
+        ? new Date(asNumber).toLocaleDateString()
+        : bbPlainValue(value);
+    default:
+      return bbPlainValue(value);
+  }
+}
+
+/** A value with no type to format it by. Objects and arrays return null rather
+ *  than "[object Object]": a shape we can't read is dropped, never faked. */
+function bbPlainValue(value: unknown): string | null {
+  if (typeof value === "string") return value || null;
+  if (typeof value === "number")
+    return Number.isFinite(value) ? String(value) : null;
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  return null;
+}
+
+/** A report's metrics, under its header. Each item is title + formatted value;
+ *  the ones that carry no readable value drop out rather than showing a blank. */
+function BbDataStrip({ data }: { data: BbReportDataOut[] }) {
+  const items = data
+    .map((item, i) => ({
+      key: `${item.title ?? ""}-${i}`,
+      title: item.title,
+      text: bbDataText(item),
+    }))
+    .filter((item) => item.text !== null);
+  if (items.length === 0) return null;
+  return (
+    <p className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 px-3 py-1 text-[11px] text-muted-foreground">
+      {items.map((item) => (
+        <span
+          key={item.key}
+          className="inline-flex min-w-0 items-baseline gap-1"
+        >
+          {item.title ? (
+            <span className="shrink-0 text-foreground">{item.title}</span>
+          ) : null}
+          <span className="min-w-0 truncate tabular-nums">{item.text}</span>
+        </span>
+      ))}
+    </p>
+  );
+}
+
+/**
+ * Which commit these reports came from. Code Insights hangs off one commit, not
+ * a repository-wide store, so the strip is what keeps the list honest about how
+ * current it is. In normal layout flow (never floating) so it can't cover a row.
+ */
+function BbCommitProvenance({
+  data,
+  reportsShown = true,
+}: {
+  data: BbFindingsOut;
+  /** False where the strip sits above a card saying nothing was published:
+   *  the fallback ref was read, but none of its reports are on screen. */
+  reportsShown?: boolean;
+}) {
+  const { t } = useTranslation();
+  const sha = data.commitSha;
+  if (!sha) return null;
+  const commitUrl = data.commitWebUrl;
+  // Name only a ref that was actually consulted: on the "HEAD" sentinel and on
+  // a fallback, that is the default branch rather than the checkout itself.
+  const shownRef =
+    data.usedFallback || isUnnamedRef(data.requestedRef)
+      ? data.fallbackRef
+      : data.requestedRef;
+  const name = data.fallbackRef || t("findingsUi.defaultBranch");
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b bg-muted/20 px-3 py-2 text-[11px] text-muted-foreground">
+      {data.usedFallback ? (
+        <p className="w-full">
+          {isUnnamedRef(data.requestedRef)
+            ? t(reportsShown ? "findingsUi.noNamedBranchShowing" : "findingsUi.noNamedBranchRead", reportsShown ? { branch: name } : { name })
+            : // Covers BOTH fallback causes (branch unresolved remotely, or its
+              // tip has no reports) — the wire doesn't say which, so the copy
+              // must not claim the commit was missing.
+              t(reportsShown ? "findingsUi.noReportsOnBranchShowing" : "findingsUi.noReportsOnBranchRead", { branch: data.requestedRef, name })}
+        </p>
+      ) : null}
+      <p className="min-w-0 flex-1 truncate">
+        {t("findingsUi.commit")}{" "}
+        {commitUrl ? (
+          <button
+            type="button"
+            onClick={() => openUrl(commitUrl)}
+            className="cursor-pointer font-mono hover:underline"
+          >
+            {sha.slice(0, 7)}
+          </button>
+        ) : (
+          <span className="font-mono">{sha.slice(0, 7)}</span>
+        )}
+        {shownRef ? (
+          <>
+            {" · "}
+            <span className="font-mono">{shownRef}</span>
+          </>
+        ) : null}
+      </p>
+    </div>
+  );
+}
+
+/** A partial-read disclosure on a commit whose reports ARE available: part of
+ *  the walk failed, so the sections below are incomplete. Quiet by design — the
+ *  data is usable, just not whole. */
+function BbPartialDetail({ detail }: { detail: string | null }) {
+  if (!detail) return null;
+  return (
+    // wrap-break-word matches ReasonCard's detail: the string can carry up to
+    // 300 chars of raw API body, which may be one unbroken token.
+    <p className="wrap-break-word px-3 py-2 text-[11px] text-muted-foreground">
+      {detail}
+    </p>
+  );
+}
+
+/**
+ * The card for any envelope that isn't `"available"`. `data` rides along so the
+ * ref-not-found copy can name the refs that were actually looked at; `state` is
+ * passed separately so the exhaustiveness net below has a union without
+ * `"available"` to close over.
+ */
+function BbUnavailableCard({
+  state,
+  data,
+  onRetry,
+}: {
+  state: Exclude<BbFindingsAvailability, "available">;
+  data: BbFindingsOut;
+  onRetry: () => void;
+}) {
+  const { t } = useTranslation();
+  const retryAction = (
+    <Button variant="outline" size="sm" onClick={onRetry}>
+      <ArrowClockwiseIcon data-icon="inline-start" />
+      {t("common.retry")}
+    </Button>
+  );
+
+  if (state === "noReports") {
+    // No settings deep link: Bitbucket has no Code Insights toggle to open —
+    // publishing reports means adding a pipe to the pipelines file. Hedged
+    // deliberately: a scanner that ran and failed publishes nothing either, and
+    // the wire can't tell that from never-configured.
+    return (
+      <>
+        {/* This state resolved a commit, so the strip names which one was read
+            and which ref it came from. The other three states have no commit,
+            and the strip renders nothing for them. `reportsShown={false}` is
+            what keeps a fallback from promising rows the card then denies. */}
+        <BbCommitProvenance data={data} reportsShown={false} />
+        <ReasonCard
+          icon={ShieldSlashIcon}
+          message={t("findingsUi.noCodeInsightsReports")}
+          detail={data.detail}
+          action={retryAction}
+        />
+      </>
+    );
+  }
+  if (state === "refNotFound") {
+    const refs = checkedRefs(data);
+    return (
+      <ReasonCard
+        icon={WarningCircleIcon}
+        message={
+          refs
+            ? t("findingsUi.couldNotFindCommitOnRefs", { refs })
+            : t("findingsUi.couldNotFindCommit")
+        }
+        detail={data.detail}
+        action={retryAction}
+      />
+    );
+  }
+  if (state === "forbidden") {
+    return (
+      <ReasonCard
+        icon={LockKeyIcon}
+        message={t("findingsUi.bitbucketCannotReadReports")}
+        detail={data.detail}
+      />
+    );
+  }
+  if (state === "indeterminate") {
+    return (
+      <ReasonCard
+        icon={QuestionIcon}
+        message={t("findingsUi.couldNotCheckRepoFindings")}
+        detail={data.detail}
+        action={retryAction}
+      />
+    );
+  }
+  // A new BbFindingsAvailability variant fails to compile here instead of
+  // silently rendering nothing at all.
+  const _exhaustive: never = state;
+  return _exhaustive;
+}
+
+/** One report's annotations. The section header carries the report, so each row
+ *  leads with what the annotation itself says. */
+function BbAnnotationRows({
+  section,
+  selectedRowId,
+  onSelect,
+}: {
+  section: BbReportSection;
+  selectedRowId: string | null;
+  onSelect: (finding: SelectedFinding) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <>
+      {section.rows.map(({ id, annotation: a }) => {
+        // Never invented prose: an annotation with neither stays identifiable by
+        // its section header, and the button takes an accessible name instead.
+        const label = a.summary || a.externalId || "";
+        return (
+          <button
+            type="button"
+            key={id}
+            data-row={id}
+            aria-label={label ? undefined : t("findingsUi.annotationNoSummary")}
+            className={cn(
+              "block w-full border-b px-3 py-2 text-left",
+              selectedRowId === id
+                ? "bg-accent text-accent-foreground"
+                : "hover:bg-muted/60",
+            )}
+            onClick={() =>
+              onSelect({
+                type: "bbFinding",
+                reportUuid: section.report.uuid,
+                annotationUuid: a.uuid,
+              })
+            }
+          >
+            <p className="flex items-center gap-2 text-[11px] text-muted-foreground">
+              {/* Omitted outright when the report stated no severity — a chip
+                  would have to name a rung, and every rung would be a claim. */}
+              {a.severity ? <SeverityChip severity={a.severity} /> : null}
+              {a.annotationType ? (
+                <span className="shrink-0">
+                  {bbAnnotationTypeLabel(a.annotationType)}
+                </span>
+              ) : null}
+              {a.path ? <PathLabel path={a.path} line={a.line} /> : null}
+            </p>
+            {label ? (
+              <p className="mt-1 truncate text-xs font-medium" title={label}>
+                {label}
+              </p>
+            ) : null}
+          </button>
+        );
+      })}
+    </>
+  );
+}
+
+/** One report's section: its header, metrics strip, and annotations. A report
+ *  with no annotations (a coverage or test report, typically) is not an empty
+ *  state — the header and strip are its content, so it says so quietly. */
+function BbReportSectionView({
+  section,
+  limits,
+  setLimits,
+  loading,
+  selectedRowId,
+  onSelect,
+}: {
+  section: BbReportSection;
+  limits: FindingsLimits;
+  setLimits: (limits: FindingsLimits) => void;
+  loading: boolean;
+  selectedRowId: string | null;
+  onSelect: (finding: SelectedFinding) => void;
+}) {
+  const { t } = useTranslation();
+  const { report, label, rows } = section;
+  const loaded = report.annotations.length;
+  const reportLink = report.link;
+  const typeLabel = report.reportType
+    ? bbReportTypeLabel(report.reportType)
+    : null;
+  return (
+    <>
+      <div className="flex flex-wrap items-center gap-2 border-b bg-muted/40 px-3 py-1.5">
+        {/* A heading, matching the <h3> every GitHub/GitLab category header
+            uses, so screen-reader heading navigation reaches each report. */}
+        <h3
+          className="min-w-0 flex-1 truncate text-xs font-semibold"
+          title={label}
+        >
+          {label}
+        </h3>
+        <BbResultChip className="shrink-0" result={report.result} />
+        {/* What the report covers — a COVERAGE section reads as one rather than
+            as a security report that found nothing. Wears SectionHeader's quiet
+            uppercase so it reads as a category, not as another name field
+            running on from the reporter beside it. */}
+        {typeLabel ? (
+          <span
+            className="min-w-0 max-w-[20%] shrink truncate text-[10px] tracking-wide text-muted-foreground uppercase"
+            title={typeLabel}
+          >
+            {typeLabel}
+          </span>
+        ) : null}
+        {/* Suppressed when the label already fell back to it — one string, said
+            once. The width cap is what gives the title priority: `flex-1` bases
+            the title at zero, so without it a long reporter holds its full
+            content width and the report name truncates first. */}
+        {report.reporter && report.reporter !== label ? (
+          <span
+            className="min-w-0 max-w-[30%] shrink truncate text-[11px] text-muted-foreground"
+            title={report.reporter}
+          >
+            {report.reporter}
+          </span>
+        ) : null}
+        {reportLink ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            // The label names only the host; the full URL is what says where
+            // this actually lands, so it previews on hover.
+            title={reportLink}
+            onClick={() => openUrl(reportLink)}
+          >
+            <ArrowSquareOutIcon data-icon="inline-start" />
+            {linkOutLabel(reportLink)}
+          </Button>
+        ) : null}
+      </div>
+      <BbDataStrip data={report.data} />
+      {/* The report's own description renders at the section, not only in an
+          annotation's detail — a zero-annotation report has no row to select,
+          and its details are often the whole explanation. */}
+      {report.details ? (
+        <p
+          className="truncate border-b px-3 py-1.5 text-[11px] text-muted-foreground"
+          title={report.details}
+        >
+          {report.details}
+        </p>
+      ) : null}
+      {rows.length > 0 ? (
+        <BbAnnotationRows
+          section={section}
+          selectedRowId={selectedRowId}
+          onSelect={onSelect}
+        />
+      ) : loaded > 0 ? (
+        <p className="px-3 py-4 text-xs text-muted-foreground">
+          {t("findingsUi.noAnnotationsMatch")}
+        </p>
+      ) : report.annotationsUnreadable ? null : (
+        <p className="px-3 py-2 text-xs text-muted-foreground">
+          {t("findingsUi.noAnnotations")}
+        </p>
+      )}
+      {/* A failed annotation walk must never read as a clean report, so it says
+          what was lost whether or not any rows came through. */}
+      {report.annotationsUnreadable ? (
+        <p className="px-3 py-2 text-[11px] text-muted-foreground">
+          {loaded > 0
+            ? t("findingsUi.someAnnotationsUnreadable")
+            : t("findingsUi.annotationsUnreadable")}
+        </p>
+      ) : null}
+      {/* Outside the empty branch, gated on truncation alone: filtering to zero
+          matches must not strip the only way to reach rows past the window. */}
+      <FindingsTruncationTail
+        truncated={report.annotationsTruncated}
+        loaded={loaded}
+        noun="annotations"
+        limits={limits}
+        limitKey="bitbucket"
+        setLimits={setLimits}
+        loading={loading}
+      />
+    </>
+  );
+}
+
+export function FindingsPanel({
+  repoPath,
+  active,
+}: {
+  repoPath: string;
+  active: boolean;
+}) {
+  const { t } = useTranslation();
+  const forge = useForgeStatus(repoPath);
+  // Three different findings models behind one capability: GitHub's four
+  // repository-wide alert stores, GitLab's per-pipeline report artifacts, and
+  // Bitbucket's Code Insights reports published against one commit. The
+  // capability gates whether the tab has anything at all; the provider picks
+  // which set of queries runs, so the other providers' fire not at all.
+  const provider = forge.data?.provider;
+  const ready = forgeReady(forge.data);
+  const supported = forgeSupports(forge.data, "securityFindings");
+  const enabled = ready && supported;
+  // Mirrors RepositoryMenu's gate on the "Repository settings…" item: the deep
+  // link opens that same admin-only dialog, so offering it to a non-admin would
+  // land them on a permissions error. Same query key, so no extra fetch.
+  const settingsReady = forgeFeatureReady(forge.data, "repoSettings");
+  const admin = useRepoAdmin(repoPath, settingsReady);
+  const canOpenRepoSettings = settingsReady && Boolean(admin.data?.admin);
+
+  const limits = useUiStore((s) => s.findingsLimits);
+  const setFindingsLimits = useUiStore((s) => s.setFindingsLimits);
+  const selectedFinding = useUiStore((s) => s.selectedFinding);
+  const selectFinding = useUiStore((s) => s.selectFinding);
+  const requestRepoSettings = useUiStore((s) => s.requestRepoSettings);
+
+  const onGitHub = enabled && provider === "github";
+  const alerts = useDependabotAlerts(repoPath, onGitHub, active, limits.alerts);
+  const codeScanning = useCodeScanningAlerts(
+    repoPath,
+    onGitHub,
+    active,
+    limits.codeScanning,
+  );
+  const secrets = useSecretScanningAlerts(
+    repoPath,
+    onGitHub,
+    active,
+    limits.secretScanning,
+  );
+  const advisories = useRepoAdvisories(
+    repoPath,
+    onGitHub,
+    active,
+    limits.advisories,
+  );
+  const gl = useGitLabFindings(
+    repoPath,
+    enabled && provider === "gitlab",
+    active,
+    limits.gitlab,
+  );
+  const bb = useBitbucketFindings(
+    repoPath,
+    enabled && provider === "bitbucket",
+    active,
+    limits.bitbucket,
+  );
+
+  const [filterText, setFilterText] = useState("");
+  const filterRef = useRef<HTMLInputElement>(null);
+  const queryClient = useQueryClient();
+
+  useHotkeyAction("focus-filter", () => filterRef.current?.focus());
+
+  const query = filterText.trim().toLowerCase();
+  const alertsOut = alerts.data;
+  const codeScanningOut = codeScanning.data;
+  const secretsOut = secrets.data;
+  const advisoriesOut = advisories.data;
+  const allAlerts = alertsOut?.alerts ?? [];
+  const allCodeScanning = codeScanningOut?.alerts ?? [];
+  const allSecrets = secretsOut?.alerts ?? [];
+  const allAdvisories = advisoriesOut?.advisories ?? [];
+  const alertGroups = buildAlertGroups(
+    allAlerts.filter((a) => matchesAlert(a, query)),
+  );
+  const codeScanningGroups = buildCodeScanningGroups(
+    allCodeScanning.filter((a) => matchesCodeScanning(a, query)),
+    t("findingsUi.unidentifiedRule"),
+  );
+  const secretGroups = buildSecretGroups(
+    allSecrets.filter((a) => matchesSecret(a, query)),
+    t("findingsUi.unknownSecretType"),
+  );
+  const advisoryRows = allAdvisories
+    .filter((a) => matchesAdvisory(a, query))
+    .toSorted(bySeverity)
+    .map((advisory, i) => ({
+      // Index fallback for a tolerated advisory with no GHSA id (see AlertRow).
+      id: advisory.ghsaId ? `advisory-${advisory.ghsaId}` : `advisory-i${i}`,
+      advisory,
+    }));
+
+  const glOut = gl.data;
+  const glSetupUrl = glOut ? glScanningSetupUrl(glOut) : null;
+  const allGlSast = glOut?.sast.findings ?? [];
+  const allGlSecrets = glOut?.secretDetection.findings ?? [];
+  const allGlQuality = glOut?.codeQuality.findings ?? [];
+  const glSastGroups = buildGlSecureGroups(
+    allGlSast.filter((f) => matchesGlSecure(f, query)),
+    "gl-sast",
+    t("findingsUi.unidentifiedRule"),
+  );
+  const glSecretGroups = buildGlSecureGroups(
+    allGlSecrets.filter((f) => matchesGlSecure(f, query)),
+    "gl-secret",
+    t("findingsUi.unknownSecretType"),
+  );
+  const glQualityGroups = buildGlQualityGroups(
+    allGlQuality.filter((f) => matchesGlQuality(f, query)),
+  );
+
+  const bbOut = bb.data;
+  const bbSections = buildBbSections(bbOut?.reports ?? [], query);
+
+  const alertsShown =
+    !alerts.isError && alertsOut?.availability === "available";
+  const codeScanningShown =
+    !codeScanning.isError && codeScanningOut?.availability === "available";
+  const secretsShown =
+    !secrets.isError && secretsOut?.availability === "available";
+  const advisoriesShown =
+    !advisories.isError && advisoriesOut?.availability === "available";
+  // Equal availability AND equal detail across all three — what a pipeline-wide
+  // cause (a jobs-fetch failure, a pipeline with no scanning jobs) produces.
+  const glUniformState =
+    !!glOut &&
+    glOut.sast.availability === glOut.secretDetection.availability &&
+    glOut.sast.availability === glOut.codeQuality.availability &&
+    glOut.sast.detail === glOut.secretDetection.detail &&
+    glOut.sast.detail === glOut.codeQuality.detail;
+  // Every GitLab category hangs off one pipeline, so a state other than "found"
+  // hides all three at once.
+  const glFound = !gl.isError && glOut?.pipelineState === "found";
+  const glSastShown = glFound && glOut?.sast.availability === "available";
+  const glSecretsShown =
+    glFound && glOut?.secretDetection.availability === "available";
+  const glQualityShown =
+    glFound && glOut?.codeQuality.availability === "available";
+  const bbShown = !bb.isError && bbOut?.availability === "available";
+
+  // Flat, document-order nav list: the grouped rows of each section in the order
+  // the sections render. Group headers and the Load-more buttons are skipped.
+  const navRows: { id: string; finding: SelectedFinding }[] = [];
+  if (alertsShown) {
+    for (const group of alertGroups) {
+      for (const row of group.rows) {
+        navRows.push({
+          id: row.id,
+          finding: { type: "alert", number: row.alert.number },
+        });
+      }
+    }
+  }
+  if (codeScanningShown) {
+    for (const group of codeScanningGroups) {
+      for (const row of group.rows) {
+        navRows.push({
+          id: row.id,
+          finding: { type: "codeScanning", number: row.alert.number },
+        });
+      }
+    }
+  }
+  if (secretsShown) {
+    for (const group of secretGroups) {
+      for (const row of group.rows) {
+        navRows.push({
+          id: row.id,
+          finding: { type: "secretScanning", number: row.alert.number },
+        });
+      }
+    }
+  }
+  if (advisoriesShown) {
+    for (const row of advisoryRows) {
+      navRows.push({
+        id: row.id,
+        finding: { type: "advisory", ghsaId: row.advisory.ghsaId },
+      });
+    }
+  }
+  if (glSastShown) {
+    for (const group of glSastGroups) {
+      for (const row of group.rows) {
+        navRows.push({
+          id: row.id,
+          finding: {
+            type: "glFinding",
+            category: "sast",
+            id: secureFindingId(row.finding),
+          },
+        });
+      }
+    }
+  }
+  if (glSecretsShown) {
+    for (const group of glSecretGroups) {
+      for (const row of group.rows) {
+        navRows.push({
+          id: row.id,
+          finding: {
+            type: "glFinding",
+            category: "secretDetection",
+            id: secureFindingId(row.finding),
+          },
+        });
+      }
+    }
+  }
+  if (glQualityShown) {
+    for (const group of glQualityGroups) {
+      for (const row of group.rows) {
+        navRows.push({
+          id: row.id,
+          finding: {
+            type: "glFinding",
+            category: "codeQuality",
+            id: codeQualityFindingId(row.finding),
+          },
+        });
+      }
+    }
+  }
+  // Section order, so arrows cross from one report into the next exactly as they
+  // cross GitHub's package groups.
+  if (bbShown) {
+    for (const section of bbSections) {
+      for (const row of section.rows) {
+        navRows.push({
+          id: row.id,
+          finding: {
+            type: "bbFinding",
+            reportUuid: section.report.uuid,
+            annotationUuid: row.annotation.uuid,
+          },
+        });
+      }
+    }
+  }
+
+  // Resolved against the rendered rows (not rebuilt from the selection) so the
+  // highlight uses the same identity the nav list and `data-row` do.
+  const selectedRowId = selectedFinding
+    ? (navRows.find((r) => sameFinding(r.finding, selectedFinding))?.id ?? null)
+    : null;
+
+  const onListKeyDown = listKeyboardNav({
+    items: navRows,
+    activeIndex: navRows.findIndex((r) => r.id === selectedRowId),
+    onActivate: (row) => selectFinding(row.finding),
+    rowKey: (row) => row.id,
+  });
+
+  const refreshing =
+    alerts.isFetching ||
+    codeScanning.isFetching ||
+    secrets.isFetching ||
+    advisories.isFetching ||
+    gl.isFetching ||
+    bb.isFetching;
+  const refreshReason = enabled
+    ? t("findingsUi.refreshFindings")
+    : !supported && ready
+      ? t("findingsUi.securityFindingsUnavailableHost")
+      : // Names the host the remote actually points at; a repo with no
+        // recognized remote gets the neutral wording rather than a guess
+        // (`providerLabel` alone would name GitHub for an unknown provider).
+        provider
+        ? t("findingsUi.connectRepoProvider", { provider: providerLabel(provider) })
+        : t("findingsUi.connectSupportedHost");
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex items-center gap-1 border-b p-2">
+        <p className="text-xs text-muted-foreground">{t("findingsUi.securityFindingsTitle")}</p>
+        <div className="ml-auto flex items-center gap-1">
+          <DisabledReasonButton
+            variant="outline"
+            size="icon-sm"
+            aria-label={t("findingsUi.refreshFindings")}
+            disabled={!enabled || refreshing}
+            // `refreshReason` doubles as the enabled-state hint ("Refresh findings").
+            reason={enabled ? null : refreshReason}
+            title={refreshReason}
+            onClick={() =>
+              queryClient.invalidateQueries({
+                queryKey: ["repo", repoPath, "findings"],
+              })
+            }
+          >
+            <ArrowClockwiseIcon className={cn(refreshing && "animate-spin")} />
+          </DisabledReasonButton>
+        </div>
+      </div>
+      <div className="border-b p-2">
+        <Input
+          ref={filterRef}
+          value={filterText}
+          onChange={(e) => setFilterText(e.target.value)}
+          placeholder={
+            provider
+              ? t(FILTER_PLACEHOLDERS[provider])
+              : t(FILTER_PLACEHOLDERS.github)
+          }
+          className="h-7"
+          autoComplete="off"
+        />
+      </div>
+
+      {/* overflow-hidden: the vendored ScrollArea Root is `relative`-only, so
+          without containment a long list leaks a window scrollbar. */}
+      <ScrollArea className="min-h-0 flex-1 overflow-hidden">
+        {forge.isPending ? (
+          <RowSkeletons name={t("findingsUi.securityFindingsTitle")} />
+        ) : !ready ? (
+          <ForgeNotReady repoPath={repoPath} feature={t("findingsUi.securityFindingsTitle")} />
+        ) : !supported ? (
+          <p className="px-3 py-6 text-center text-xs text-muted-foreground">
+            {t("findingsUi.securityFindingsUnavailableHost")}
+          </p>
+        ) : provider === "bitbucket" ? (
+          bb.isError ? (
+            <LoadFailed category="findings" onRetry={() => bb.refetch()} />
+          ) : !bbOut ? (
+            <RowSkeletons name={t("findingsUi.securityFindingsTitle")} />
+          ) : bbOut.availability !== "available" ||
+            bbOut.reports.length === 0 ? (
+            /* Zero reports is `noReports` on the wire, so the second arm only
+               catches a backend that ever sends "available" with none — a blank
+               region would be the one reading of an empty list that claims the
+               commit is clean. */
+            <BbUnavailableCard
+              state={
+                bbOut.availability === "available"
+                  ? "noReports"
+                  : bbOut.availability
+              }
+              data={bbOut}
+              onRetry={() => bb.refetch()}
+            />
+          ) : (
+            <div onKeyDown={onListKeyDown}>
+              <BbCommitProvenance data={bbOut} />
+              <BbPartialDetail detail={bbOut.detail} />
+              {bbSections.map((section) => (
+                <BbReportSectionView
+                  key={section.report.uuid}
+                  section={section}
+                  limits={limits}
+                  setLimits={setFindingsLimits}
+                  loading={bb.isFetching}
+                  selectedRowId={selectedRowId}
+                  onSelect={selectFinding}
+                />
+              ))}
+              {/* States the cap without offering to lift it: the report walk is
+                  bounded server-side independently of `limit`, so a Load-more
+                  here would refetch the same reports. Each report's annotation
+                  tail below does grow — those limits are real. */}
+              {bbOut.truncated ? (
+                <p className="border-t px-3 py-3 text-xs text-muted-foreground">
+                  {t("findingsUi.showingFirst", { count: bbOut.reports.length.toLocaleString(), category: t("findingsUi.reports") })}
+                </p>
+              ) : null}
+            </div>
+          )
+        ) : provider === "gitlab" ? (
+          gl.isError ? (
+            <LoadFailed category="findings" onRetry={() => gl.refetch()} />
+          ) : !glOut ? (
+            <RowSkeletons name={t("findingsUi.securityFindingsTitle")} />
+          ) : glOut.pipelineState !== "found" ? (
+            <GlNoPipelineCard
+              state={glOut.pipelineState}
+              data={glOut}
+              onRetry={() => gl.refetch()}
+            />
+          ) : (
+            <div onKeyDown={onListKeyDown}>
+              <PipelineProvenance data={glOut} />
+              {glUniformState && glOut.sast.availability !== "available" ? (
+                /* One cause, one card — and no section headers, since naming
+                   three empty sections would only restate it. */
+                <GlUnavailableCard
+                  availability={glOut.sast.availability}
+                  detail={glOut.sast.detail}
+                  category="findings"
+                  Category={t("findingsUi.scanning")}
+                  notConfiguredMessage={t("findingsUi.pipelineNoCategoryReport", { category: t("findingsUi.scanning") })}
+                  onRetry={() => gl.refetch()}
+                  onSetup={glSetupUrl ? () => openUrl(glSetupUrl) : undefined}
+                />
+              ) : (
+                <>
+                  <GlFindingsSection
+                    title={t("findingsUi.sast")}
+                    availability={glOut.sast.availability}
+                    detail={glOut.sast.detail}
+                    category={t("findingsUi.sast")}
+                    Category={t("findingsUi.sast")}
+                    cleanTitle={t("findingsUi.noSastInPipeline")}
+                    noun={t("findingsUi.sastFindings")}
+                    hasGroups={glSastGroups.length > 0}
+                    loaded={allGlSast.length}
+                    truncated={glOut.sast.truncated}
+                    limits={limits}
+                    setLimits={setFindingsLimits}
+                    loading={gl.isFetching}
+                    onRetry={() => gl.refetch()}
+                    onSetup={glSetupUrl ? () => openUrl(glSetupUrl) : undefined}
+                  >
+                    <GlSecureRows
+                      groups={glSastGroups}
+                      category="sast"
+                      selectedRowId={selectedRowId}
+                      onSelect={selectFinding}
+                    />
+                  </GlFindingsSection>
+
+                  <GlFindingsSection
+                    title={t("findingsUi.secretDetection")}
+                    availability={glOut.secretDetection.availability}
+                    detail={glOut.secretDetection.detail}
+                    category={t("findingsUi.secretDetection")}
+                    Category={t("findingsUi.secretDetection")}
+                    cleanTitle={t("findingsUi.noSecretsDetected")}
+                    noun={t("findingsUi.secretFindings")}
+                    hasGroups={glSecretGroups.length > 0}
+                    loaded={allGlSecrets.length}
+                    truncated={glOut.secretDetection.truncated}
+                    limits={limits}
+                    setLimits={setFindingsLimits}
+                    loading={gl.isFetching}
+                    onRetry={() => gl.refetch()}
+                    onSetup={glSetupUrl ? () => openUrl(glSetupUrl) : undefined}
+                  >
+                    <GlSecureRows
+                      groups={glSecretGroups}
+                      category="secretDetection"
+                      selectedRowId={selectedRowId}
+                      onSelect={selectFinding}
+                    />
+                  </GlFindingsSection>
+
+                  <GlFindingsSection
+                    title={t("findingsUi.codeQuality")}
+                    availability={glOut.codeQuality.availability}
+                    detail={glOut.codeQuality.detail}
+                    category={t("findingsUi.codeQuality")}
+                    Category={t("findingsUi.codeQuality")}
+                    cleanTitle={t("findingsUi.noCodeQualityInPipeline")}
+                    noun={t("findingsUi.codeQualityFindings")}
+                    hasGroups={glQualityGroups.length > 0}
+                    loaded={allGlQuality.length}
+                    truncated={glOut.codeQuality.truncated}
+                    limits={limits}
+                    setLimits={setFindingsLimits}
+                    loading={gl.isFetching}
+                    onRetry={() => gl.refetch()}
+                    onSetup={glSetupUrl ? () => openUrl(glSetupUrl) : undefined}
+                  >
+                    <GlQualityRows
+                      groups={glQualityGroups}
+                      selectedRowId={selectedRowId}
+                      onSelect={selectFinding}
+                    />
+                  </GlFindingsSection>
+                </>
+              )}
+            </div>
+          )
+        ) : (
+          <div onKeyDown={onListKeyDown}>
+            <SectionHeader title={t("findingsUi.dependencyAlerts")} />
+            {alerts.isError ? (
+              <LoadFailed
+                category={t("findingsUi.dependencyAlerts")}
+                onRetry={() => alerts.refetch()}
+              />
+            ) : !alertsOut ? (
+              <RowSkeletons name="dependency alerts" />
+            ) : alertsOut.availability !== "available" ? (
+              <UnavailableCard
+                availability={alertsOut.availability}
+                detail={alertsOut.detail}
+                category={t("findingsUi.dependencyAlerts")}
+                Category={t("findingsUi.dependencyAlerts")}
+                notEnabledMessage={t("findingsUi.dependabotDisabled")}
+                onRetry={() => alerts.refetch()}
+                onEnable={
+                  canOpenRepoSettings
+                    ? () => requestRepoSettings("security", repoPath)
+                    : undefined
+                }
+              />
+            ) : (
+              <>
+                {alertGroups.length === 0 ? (
+                  allAlerts.length > 0 ? (
+                    <p className="px-3 py-4 text-xs text-muted-foreground">
+                      {t("findingsUi.noAlertMatchesFilter")}
+                    </p>
+                  ) : (
+                    <Empty className="py-8">
+                      <EmptyHeader>
+                        <EmptyMedia variant="icon">
+                          <ShieldCheckIcon />
+                        </EmptyMedia>
+                        <EmptyTitle>{t("findingsUi.noOpenDependabotAlerts")}</EmptyTitle>
+                      </EmptyHeader>
+                    </Empty>
+                  )
+                ) : (
+                  alertGroups.map((group) => (
+                    <div key={group.key}>
+                      <div className="flex items-baseline gap-2 px-3 py-1 text-[11px] text-muted-foreground">
+                        <span
+                          className="truncate font-mono text-foreground"
+                          title={group.packageName || "Unknown package"}
+                        >
+                          {group.packageName || "Unknown package"}
+                        </span>
+                        <span className="shrink-0">{group.ecosystem}</span>
+                        <span className="ml-auto shrink-0 tabular-nums">
+                          {group.rows.length}
+                        </span>
+                      </div>
+                      {group.rows.map(({ id, alert: a }) => (
+                        <button
+                          type="button"
+                          key={id}
+                          data-row={id}
+                          className={cn(
+                            "block w-full border-b px-3 py-2 text-left",
+                            selectedRowId === id
+                              ? "bg-accent text-accent-foreground"
+                              : "hover:bg-muted/60",
+                          )}
+                          onClick={() =>
+                            selectFinding({ type: "alert", number: a.number })
+                          }
+                        >
+                          <p className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                            <SeverityChip severity={a.severity} />
+                            <span className="ml-auto min-w-0 truncate">
+                              {a.firstPatchedVersion
+                                ? `fix: ${a.firstPatchedVersion}`
+                                : "no patch yet"}
+                            </span>
+                            <span className="shrink-0">
+                              <RelativeTime date={a.createdAt} />
+                            </span>
+                          </p>
+                          {/* The summary owns its own full-width line — sharing
+                              one with the chip left it cramped and truncating early. */}
+                          <p
+                            className="mt-1 truncate text-xs font-medium"
+                            title={a.summary}
+                          >
+                            {a.summary}
+                          </p>
+                        </button>
+                      ))}
+                    </div>
+                  ))
+                )}
+                <FindingsTruncationTail
+                  truncated={alertsOut.truncated}
+                  loaded={allAlerts.length}
+                noun={t("findingsUi.dependencyAlerts")}
+                  limits={limits}
+                  limitKey="alerts"
+                  setLimits={setFindingsLimits}
+                  loading={alerts.isFetching}
+                />
+              </>
+            )}
+
+            <SectionHeader title={t("findingsUi.codeScanningAlerts")} />
+            {codeScanning.isError ? (
+              <LoadFailed
+                category={t("findingsUi.codeScanningAlerts")}
+                onRetry={() => codeScanning.refetch()}
+              />
+            ) : !codeScanningOut ? (
+              <RowSkeletons name="code scanning alerts" />
+            ) : codeScanningOut.availability !== "available" ? (
+              <UnavailableCard
+                availability={codeScanningOut.availability}
+                detail={codeScanningOut.detail}
+                category={t("findingsUi.codeScanningAlerts")}
+                Category={t("findingsUi.codeScanningAlerts")}
+                notEnabledMessage={t("findingsUi.codeScanningDisabled")}
+                noResultsYetMessage={t("findingsUi.codeScanningNoResultsYet")}
+                onRetry={() => codeScanning.refetch()}
+                onEnable={
+                  canOpenRepoSettings
+                    ? () => requestRepoSettings("security", repoPath)
+                    : undefined
+                }
+              />
+            ) : (
+              <>
+                {codeScanningGroups.length === 0 ? (
+                  allCodeScanning.length > 0 ? (
+                    <p className="px-3 py-4 text-xs text-muted-foreground">
+                      {t("findingsUi.noCodeScanningMatchesFilter")}
+                    </p>
+                  ) : (
+                    <Empty className="py-8">
+                      <EmptyHeader>
+                        <EmptyMedia variant="icon">
+                          <ShieldCheckIcon />
+                        </EmptyMedia>
+                        <EmptyTitle>{t("findingsUi.noOpenCodeScanningAlerts")}</EmptyTitle>
+                      </EmptyHeader>
+                    </Empty>
+                  )
+                ) : (
+                  codeScanningGroups.map((group) => (
+                    <div key={group.key}>
+                      <div className="flex items-baseline gap-2 px-3 py-1 text-[11px] text-muted-foreground">
+                        <span
+                          className={cn(
+                            "truncate text-foreground",
+                            // A rule with no name falls back to its id, which
+                            // reads as an identifier, so it gets the mono face.
+                            group.label === group.key && "font-mono",
+                          )}
+                          title={group.label}
+                        >
+                          {group.label}
+                        </span>
+                        {/* The raw id, alongside a named rule. Suppressed when
+                            the id is itself empty — the label already covers it. */}
+                        {group.key && group.label !== group.key ? (
+                          <span
+                            className="min-w-0 shrink truncate font-mono"
+                            title={group.key}
+                          >
+                            {group.key}
+                          </span>
+                        ) : null}
+                        <span className="ml-auto shrink-0 tabular-nums">
+                          {group.rows.length}
+                        </span>
+                      </div>
+                      {group.rows.map(({ id, alert: a }) => (
+                        <button
+                          type="button"
+                          key={id}
+                          data-row={id}
+                          className={cn(
+                            "block w-full border-b px-3 py-2 text-left",
+                            selectedRowId === id
+                              ? "bg-accent text-accent-foreground"
+                              : "hover:bg-muted/60",
+                          )}
+                          onClick={() =>
+                            selectFinding({
+                              type: "codeScanning",
+                              number: a.number,
+                            })
+                          }
+                        >
+                          <p className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                            <CodeScanningChip
+                              securitySeverity={a.securitySeverity}
+                              severity={a.severity}
+                            />
+                            <PathLabel path={a.path} line={a.startLine} />
+                            <span className="shrink-0">
+                              <RelativeTime date={a.createdAt} />
+                            </span>
+                          </p>
+                          {/* Full-width message line, matching the alert rows. */}
+                          <p
+                            className="mt-1 truncate text-xs font-medium"
+                            title={a.message}
+                          >
+                            {a.message}
+                          </p>
+                        </button>
+                      ))}
+                    </div>
+                  ))
+                )}
+                <FindingsTruncationTail
+                  truncated={codeScanningOut.truncated}
+                  loaded={allCodeScanning.length}
+                noun={t("findingsUi.codeScanningAlerts")}
+                  limits={limits}
+                  limitKey="codeScanning"
+                  setLimits={setFindingsLimits}
+                  loading={codeScanning.isFetching}
+                />
+              </>
+            )}
+
+            <SectionHeader title={t("findingsUi.secretScanningAlerts")} />
+            {secrets.isError ? (
+              <LoadFailed
+                category={t("findingsUi.secretScanningAlerts")}
+                onRetry={() => secrets.refetch()}
+              />
+            ) : !secretsOut ? (
+              <RowSkeletons name="secret scanning alerts" />
+            ) : secretsOut.availability !== "available" ? (
+              <UnavailableCard
+                availability={secretsOut.availability}
+                detail={secretsOut.detail}
+                category={t("findingsUi.secretScanningAlerts")}
+                Category={t("findingsUi.secretScanningAlerts")}
+                notEnabledMessage={t("findingsUi.secretScanningDisabled")}
+                onRetry={() => secrets.refetch()}
+                onEnable={
+                  canOpenRepoSettings
+                    ? () => requestRepoSettings("security", repoPath)
+                    : undefined
+                }
+              />
+            ) : (
+              <>
+                {secretGroups.length === 0 ? (
+                  allSecrets.length > 0 ? (
+                    <p className="px-3 py-4 text-xs text-muted-foreground">
+                      {t("findingsUi.noSecretScanningMatchesFilter")}
+                    </p>
+                  ) : (
+                    <Empty className="py-8">
+                      <EmptyHeader>
+                        <EmptyMedia variant="icon">
+                          <ShieldCheckIcon />
+                        </EmptyMedia>
+                        <EmptyTitle>{t("findingsUi.noOpenSecretScanningAlerts")}</EmptyTitle>
+                      </EmptyHeader>
+                    </Empty>
+                  )
+                ) : (
+                  secretGroups.map((group) => (
+                    <div key={group.key}>
+                      <div className="flex items-baseline gap-2 px-3 py-1 text-[11px] text-muted-foreground">
+                        <span
+                          className="truncate text-foreground"
+                          title={group.label}
+                        >
+                          {group.label}
+                        </span>
+                        <span className="ml-auto shrink-0 tabular-nums">
+                          {group.rows.length}
+                        </span>
+                      </div>
+                      {group.rows.map(({ id, alert: a }) => (
+                        <button
+                          type="button"
+                          key={id}
+                          data-row={id}
+                          className={cn(
+                            "block w-full border-b px-3 py-2 text-left",
+                            selectedRowId === id
+                              ? "bg-accent text-accent-foreground"
+                              : "hover:bg-muted/60",
+                          )}
+                          onClick={() =>
+                            selectFinding({
+                              type: "secretScanning",
+                              number: a.number,
+                            })
+                          }
+                        >
+                          <p className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                            <ValidityChip validity={a.validity} />
+                            {/* Only ever rendered for a confirmed public leak —
+                                a null `publiclyLeaked` means GitHub didn't say. */}
+                            {a.publiclyLeaked === true ? (
+                              <Badge
+                                variant="outline"
+                                className="text-destructive"
+                              >
+                                {t("findingsUi.publiclyLeaked")}
+                              </Badge>
+                            ) : null}
+                            {/* Rows in a group share a type and often a date, so
+                                the alert number is what tells them apart — but a
+                                tolerated alert numbered 0 has none to show. */}
+                            {a.number === 0 ? null : (
+                              <span className="ml-auto shrink-0 tabular-nums">
+                                #{a.number}
+                              </span>
+                            )}
+                            {/* The number span normally carries `ml-auto`;
+                                without it the date takes over pushing right. */}
+                            <span
+                              className={cn(
+                                "shrink-0",
+                                a.number === 0 && "ml-auto",
+                              )}
+                            >
+                              <RelativeTime date={a.createdAt} />
+                            </span>
+                          </p>
+                          {/* Full-width type line, matching the alert rows. */}
+                          <p
+                            className="mt-1 truncate text-xs font-medium"
+                            title={secretTypeLabel(a, t("findingsUi.unknownSecretType"))}
+                          >
+                            {secretTypeLabel(a, t("findingsUi.unknownSecretType"))}
+                          </p>
+                        </button>
+                      ))}
+                    </div>
+                  ))
+                )}
+                <FindingsTruncationTail
+                  truncated={secretsOut.truncated}
+                  loaded={allSecrets.length}
+                noun={t("findingsUi.secretScanningAlerts")}
+                  limits={limits}
+                  limitKey="secretScanning"
+                  setLimits={setFindingsLimits}
+                  loading={secrets.isFetching}
+                />
+              </>
+            )}
+
+            <SectionHeader title={t("findingsUi.securityAdvisories")} />
+            {advisories.isError ? (
+              <LoadFailed
+                category={t("findingsUi.securityAdvisories")}
+                onRetry={() => advisories.refetch()}
+              />
+            ) : !advisoriesOut ? (
+              <RowSkeletons name="advisories" />
+            ) : advisoriesOut.availability !== "available" ? (
+              <UnavailableCard
+                availability={advisoriesOut.availability}
+                detail={advisoriesOut.detail}
+                category={t("findingsUi.securityAdvisories")}
+                Category={t("findingsUi.securityAdvisories")}
+                notEnabledMessage={t("findingsUi.advisoriesPublicOnly")}
+                onRetry={() => advisories.refetch()}
+              />
+            ) : (
+              <>
+                {advisoryRows.length === 0 ? (
+                  allAdvisories.length > 0 ? (
+                    <p className="px-3 py-4 text-xs text-muted-foreground">
+                      {t("findingsUi.noAdvisoryMatchesFilter")}
+                    </p>
+                  ) : (
+                    <Empty className="py-8">
+                      <EmptyHeader>
+                        <EmptyMedia variant="icon">
+                          <ShieldCheckIcon />
+                        </EmptyMedia>
+                        <EmptyTitle>{t("findingsUi.noAdvisoryMatchesFilter")}</EmptyTitle>
+                      </EmptyHeader>
+                    </Empty>
+                  )
+                ) : (
+                  advisoryRows.map(({ id, advisory: adv }) => {
+                    // Published is the meaningful date; fall back to updated, and
+                    // render nothing when both are absent — never invent one.
+                    const when = adv.publishedAt ?? adv.updatedAt;
+                    return (
+                      <button
+                        type="button"
+                        key={id}
+                        data-row={id}
+                        className={cn(
+                          "block w-full border-b px-3 py-2 text-left",
+                          selectedRowId === id
+                            ? "bg-accent text-accent-foreground"
+                            : "hover:bg-muted/60",
+                        )}
+                        onClick={() =>
+                          selectFinding({
+                            type: "advisory",
+                            ghsaId: adv.ghsaId,
+                          })
+                        }
+                      >
+                        <p className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                          <SeverityChip severity={adv.severity} />
+                          {adv.ghsaId ? (
+                            <span className="ml-auto min-w-0 truncate font-mono">
+                              {adv.ghsaId}
+                            </span>
+                          ) : null}
+                          {/* The GHSA span normally carries `ml-auto`; without
+                              it the state takes over pushing the row right. */}
+                          <span
+                            className={cn("shrink-0", !adv.ghsaId && "ml-auto")}
+                          >
+                            {adv.state}
+                          </span>
+                          {when ? (
+                            <span className="shrink-0">
+                              <RelativeTime date={when} />
+                            </span>
+                          ) : null}
+                        </p>
+                        {/* Full-width summary line, matching the alert rows. */}
+                        <p
+                          className="mt-1 truncate text-xs font-medium"
+                          title={adv.summary}
+                        >
+                          {adv.summary}
+                        </p>
+                      </button>
+                    );
+                  })
+                )}
+                <FindingsTruncationTail
+                  truncated={advisoriesOut.truncated}
+                  loaded={allAdvisories.length}
+                noun={t("findingsUi.securityAdvisories")}
+                  limits={limits}
+                  limitKey="advisories"
+                  setLimits={setFindingsLimits}
+                  loading={advisories.isFetching}
+                />
+              </>
+            )}
+          </div>
+        )}
+      </ScrollArea>
+    </div>
+  );
+}

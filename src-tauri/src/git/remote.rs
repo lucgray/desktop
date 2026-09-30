@@ -1,0 +1,3636 @@
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use tauri::State;
+
+use crate::error::{AppError, AppResult};
+use crate::git::runner::{
+    acquire_repo_lock, holder_label, run_git, run_git_mutating, run_git_raw, subcommand_of,
+    GitOutput, DEFAULT_TIMEOUT, LOCK_WAIT_TIMEOUT, NETWORK_LOCK_WAIT_TIMEOUT, NETWORK_TIMEOUT,
+};
+use crate::state::AppState;
+
+fn validate_remote_arg(value: &str, what: &str) -> AppResult<()> {
+    if value.is_empty() || value.starts_with('-') {
+        return Err(AppError::InvalidArgument(format!(
+            "invalid {what}: {value}"
+        )));
+    }
+    Ok(())
+}
+
+/// Prefix one-shot credential `-c` entries before a git subcommand's args.
+/// `pub(crate)` so provider-side pushes (e.g. Bitbucket `create_pr`) can build
+/// funnel-identical args.
+pub(crate) fn with_credentials(cred: &[String], sub: &[&str]) -> Vec<String> {
+    let mut v = Vec::with_capacity(cred.len() * 2 + sub.len());
+    for c in cred {
+        v.push("-c".to_string());
+        v.push(c.clone());
+    }
+    v.extend(sub.iter().map(|s| s.to_string()));
+    v
+}
+
+/// Whether a git network failure's `stderr` looks like an auth-class failure — the
+/// gate for the ambient-credential fallback in [`run_git_with_creds_once`].
+/// Case-insensitive substring match on three signatures:
+///
+/// 1. `"authentication failed"` — the helper-provided token was rejected (401).
+/// 2. `"could not read username"` — no helper answered and `GIT_TERMINAL_PROMPT=0`
+///    blocks the prompt (covers the ≤60s stale-cache window after `gh auth logout`,
+///    where the cached auth gate still injects a helper that no longer answers).
+/// 3. `"repository not found"` — GitHub 404s (sideband `remote: Repository not
+///    found.`) for a VALID identity that merely lacks access to a private repo: it
+///    hides existence rather than 403ing, so a wrong-identity CLI token surfaces as
+///    not-found, not as an auth error.
+///
+/// Deliberately narrow: network/DNS failures (e.g. `"could not resolve hostname"`)
+/// and merge conflicts must NOT match — retrying those can't help and would double
+/// the network timeout.
+fn is_auth_class_failure(stderr: &str) -> bool {
+    let s = stderr.to_lowercase();
+    s.contains("authentication failed")
+        || s.contains("could not read username")
+        // 404 tradeoff: on a transient not-found for the CORRECT CLI identity, the
+        // ambient retry can complete the op under a DIFFERENT identity than the
+        // severed CLI one — accepted (push identity ≠ commit authorship); don't
+        // widen this classifier further.
+        || s.contains("repository not found")
+}
+
+/// Run a git network op with one-shot credential `-c` entries prefixed, taking NO
+/// lock — so it is callable from inside a held domain: a pull's network phase
+/// (`git::pull_guard`) holds the network lock around it, and the autostash pull's
+/// bare fall-through holds the working tree and takes the network lock around it.
+/// Returns the raw output: a non-zero exit is not an error here.
+///
+/// When `cred` is non-empty and the injected run fails with an auth-class git error
+/// ([`is_auth_class_failure`]), retries EXACTLY ONCE with NO injected config (the
+/// same sub-args, plain) and returns that result — on a double failure the RETRY's
+/// output is surfaced, because the ambient attempt's error names the true end
+/// state. Empty `cred` ⇒ behavior unchanged.
+///
+/// The auth gates that produce `cred` only prove a credential EXISTS locally
+/// (`gh auth token` is a local read; glab's `hosts:` entry outlives PAT expiry) —
+/// not that it WORKS. Without this fallback, a revoked/expired CLI token would
+/// hard-fail a user whose ambient credential (git-credential-manager, OS keychain)
+/// is perfectly valid.
+///
+/// The retry is safe because HTTPS auth happens at ref negotiation BEFORE any
+/// server-side ref update: a failed-auth push mutated nothing on the remote, so it
+/// can't double-apply. Only a non-zero git exit is classified; spawn failures and
+/// timeouts return as-is with no retry.
+pub(crate) async fn run_git_with_creds_once(
+    repo_path: &str,
+    cred: &[String],
+    sub: &[&str],
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    let selected_credential = cred.iter().any(|entry| entry == "credential.useHttpPath=true")
+        || sub.iter().any(|entry| *entry == "credential.useHttpPath=true");
+    let origin_url = if selected_credential {
+        Some(crate::git::remote::git_remote_url(repo_path.to_owned(), "origin".to_owned()).await?)
+    } else { None };
+    let protected_identity = origin_url.as_deref()
+        .and_then(crate::forge::remote_host)
+        .is_some_and(|host| matches!(host.as_str(), "bitbucket.org" | "cnb.cool"));
+    let _identity_guard = if protected_identity {
+        Some(crate::forge::accounts::GIT_NETWORK_IDENTITY_LOCK.lock().await)
+    } else { None };
+    if protected_identity {
+        crate::forge::credential_config_for_remote(repo_path, "origin").await?;
+    }
+    let args = with_credentials(cred, sub);
+    let out = run_git_raw(
+        Some(repo_path),
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        timeout,
+    )
+    .await?;
+
+    // Injected credentials present but rejected → one-shot ambient retry.
+    if !cred.is_empty() && !cred.iter().any(|entry| entry == "credential.useHttpPath=true")
+        && out.code != 0 && is_auth_class_failure(&out.stderr) {
+        let bound_account = crate::forge::accounts::binding_for_repo(repo_path).await?.is_some();
+        let protected_host = crate::git::remote::git_remote_url(repo_path.to_owned(), "origin".to_owned())
+            .await.ok().and_then(|url| crate::forge::remote_host(&url))
+            .is_some_and(|host| matches!(host.as_str(), "bitbucket.org" | "cnb.cool"));
+        if !bound_account && !protected_host {
+            return run_git_raw(Some(repo_path), sub, timeout).await;
+        }
+    }
+    Ok(out)
+}
+
+/// [`run_git_with_creds_once`] under the repo's NETWORK lock, surfacing a non-zero
+/// exit as [`AppError::Git`] — the mutating-command contract every network caller
+/// (fetch/pull/push) is written against.
+///
+/// The network domain rather than the working tree: a transfer runs for up to
+/// `NETWORK_TIMEOUT` and must not stall staging or a commit for that long. The pull
+/// cores' bare fall-through is the one caller whose command also touches the working
+/// tree: it holds the working-tree lock across this call, which is the only sanctioned
+/// nesting direction (see `run_git_mutating`). Every other caller here — fetch, push,
+/// set-head — holds nothing but the network domain this takes.
+pub(crate) async fn run_git_mutating_with_creds(
+    state: &AppState,
+    repo_path: &str,
+    cred: &[String],
+    sub: &[&str],
+    timeout: Duration,
+) -> AppResult<GitOutput> {
+    let domain = state.network_lock(repo_path).await;
+    let _guard = acquire_repo_lock(
+        &domain,
+        NETWORK_LOCK_WAIT_TIMEOUT,
+        holder_label(subcommand_of(sub)),
+    )
+    .await?;
+
+    // index.lock contention from an external tool (editor, other client) is
+    // transient — retry once. Expressed here rather than via `run_git_mutating`
+    // because the injection half must stay lock-free.
+    let mut out = run_git_with_creds_once(repo_path, cred, sub, timeout).await?;
+    if out.code != 0 && out.stderr.contains("index.lock") {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        out = run_git_with_creds_once(repo_path, cred, sub, timeout).await?;
+    }
+    if out.code != 0 {
+        // Both streams: a merge-mode `pull` that conflicts puts the fetch summary
+        // on stderr and the whole merge verdict (`CONFLICT (…`, `Automatic merge
+        // failed`) on stdout, so substituting one for the other would drop the
+        // verdict. Inert for fetch/set-head/push, whose failures write no stdout.
+        // The classifier above reads raw `out.stderr` on purpose — keep it there.
+        return Err(AppError::Git {
+            code: out.code,
+            stderr: out.full_failure_text(),
+        });
+    }
+    Ok(out)
+}
+
+/// How long a resolved remote URL stays trusted before re-shelling to `git`. A few
+/// seconds collapses the burst of concurrent `forge_*` queries one forge view fires
+/// (each otherwise spawns `git remote get-url` twice) while still picking up an
+/// out-of-band `git remote set-url` promptly; in-app changes invalidate eagerly.
+const REMOTE_URL_TTL: Duration = Duration::from_secs(5);
+
+/// Cache map keyed by `(repo_path, remote_name)`; value is `(fetch time, resolved url)`.
+type RemoteUrlCache = Mutex<HashMap<(String, String), (Instant, String)>>;
+
+/// Per-`(repo_path, remote_name)` cache of the last resolved remote URL and when it was
+/// fetched. Bounded by (#repos × #remote names) — tiny, so a stale entry is simply
+/// overwritten on the next fetch rather than evicted. Only successful lookups are cached.
+static REMOTE_URL_CACHE: OnceLock<RemoteUrlCache> = OnceLock::new();
+
+fn remote_url_cache() -> &'static RemoteUrlCache {
+    REMOTE_URL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Return the cached URL for `(repo, name)` only if an entry exists AND it was fetched less
+/// than `ttl` ago. Pure over the module-level cache; the lock is held only long enough to
+/// clone the value out.
+fn cache_get(repo: &str, name: &str, ttl: Duration) -> Option<String> {
+    let guard = remote_url_cache().lock().unwrap();
+    let (fetched_at, url) = guard.get(&(repo.to_string(), name.to_string()))?;
+    if fetched_at.elapsed() < ttl {
+        Some(url.clone())
+    } else {
+        None
+    }
+}
+
+/// Record `url` as the current value for `(repo, name)`, stamped with the fetch time.
+fn cache_put(repo: &str, name: &str, url: &str) {
+    remote_url_cache().lock().unwrap().insert(
+        (repo.to_string(), name.to_string()),
+        (Instant::now(), url.to_string()),
+    );
+}
+
+/// Drop any cached entry for `(repo, name)` so the next read re-resolves immediately.
+fn cache_invalidate(repo: &str, name: &str) {
+    remote_url_cache()
+        .lock()
+        .unwrap()
+        .remove(&(repo.to_string(), name.to_string()));
+}
+
+/// Invalidate the cached URL for `(repo, name)` from another module. Call this after any
+/// out-of-band mutation of a remote's URL that bypasses [`git_remote_set_url`] — e.g. a
+/// forge rename that rewrites `origin` or a repo delete that removes it — so a forge query
+/// firing within the TTL re-resolves the now-changed remote instead of serving the stale
+/// value. Idempotent: a no-op when nothing is cached.
+pub(crate) fn invalidate_remote_url_cache(repo: &str, name: &str) {
+    cache_invalidate(repo, name);
+}
+
+#[tauri::command]
+pub async fn git_remote_url(repo_path: String, name: String) -> AppResult<String> {
+    validate_remote_arg(&name, "remote name")?;
+    if let Some(url) = cache_get(&repo_path, &name, REMOTE_URL_TTL) {
+        return Ok(url);
+    }
+    let out = run_git(
+        Some(&repo_path),
+        &["remote", "get-url", &name],
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    let url = out.stdout_lossy().trim().to_string();
+    cache_put(&repo_path, &name, &url);
+    Ok(url)
+}
+
+#[tauri::command]
+pub async fn git_remote_set_url(
+    state: State<'_, AppState>,
+    repo_path: String,
+    name: String,
+    url: String,
+) -> AppResult<()> {
+    validate_remote_arg(&name, "remote name")?;
+    validate_remote_arg(url.trim(), "remote URL")?;
+    run_git_mutating(
+        &state,
+        &repo_path,
+        &["remote", "set-url", &name, url.trim()],
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    // The URL changed under us — drop the cached entry so the next read re-resolves
+    // immediately instead of waiting out the TTL.
+    cache_invalidate(&repo_path, &name);
+    Ok(())
+}
+
+/// Add a new remote (`git remote add <name> <url>`) — used to give a fork the
+/// `upstream` remote it was cloned without, so the fork/upstream lens and
+/// create-on-parent path light up. Mirrors [`git_remote_set_url`]'s validation
+/// and cache handling; git itself errors (surfaced readably) if the remote name
+/// already exists.
+#[tauri::command]
+pub async fn git_remote_add(
+    state: State<'_, AppState>,
+    repo_path: String,
+    name: String,
+    url: String,
+) -> AppResult<()> {
+    git_remote_add_core(&state, repo_path, name, url).await
+}
+
+pub(crate) async fn git_remote_add_core(
+    state: &AppState,
+    repo_path: String,
+    name: String,
+    url: String,
+) -> AppResult<()> {
+    validate_remote_arg(&name, "remote name")?;
+    validate_remote_arg(url.trim(), "remote URL")?;
+    run_git_mutating(
+        state,
+        &repo_path,
+        &["remote", "add", &name, url.trim()],
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    // Drop any cached URL for this name: an out-of-band `git remote remove` (in a
+    // terminal, bypassing git_remote_remove_core's invalidate) can leave a stale
+    // POSITIVE entry that would be served for the re-added remote until the TTL.
+    cache_invalidate(&repo_path, &name);
+    Ok(())
+}
+
+/// Remove a remote (`git remote remove <name>`) — the "Detach from fork" action,
+/// dropping the `upstream` remote a fork was given so the fork/upstream lens stops
+/// treating the repo as a fork. Generic over the remote name.
+///
+/// What git does (git-remote(1)): deletes the whole `remote.<name>` config section,
+/// unsets `branch.<b>.remote` / `.merge` for every branch tracking it — those
+/// branches end up with **no** upstream, they are NOT re-pointed at another remote —
+/// and deletes `refs/remotes/<name>/`. [`ensure_remote_exists`] turns an unknown
+/// name into an honest `InvalidArgument` (and rejects the `-flag` shape) first.
+#[tauri::command]
+pub async fn git_remote_remove(
+    state: State<'_, AppState>,
+    repo_path: String,
+    name: String,
+) -> AppResult<()> {
+    git_remote_remove_core(&state, repo_path, name).await
+}
+
+pub(crate) async fn git_remote_remove_core(
+    state: &AppState,
+    repo_path: String,
+    name: String,
+) -> AppResult<()> {
+    ensure_remote_exists(&repo_path, &name).await?;
+    run_git_mutating(
+        state,
+        &repo_path,
+        &["remote", "remove", &name],
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    // The remote (and its URL) no longer exists — drop any cached URL so a forge
+    // query firing within the TTL doesn't serve the removed remote's stale value.
+    cache_invalidate(&repo_path, &name);
+    Ok(())
+}
+
+/// Names of the configured remotes (e.g. `["origin"]`), empty for a local repo.
+#[tauri::command]
+pub async fn git_remotes(repo_path: String) -> AppResult<Vec<String>> {
+    let out = run_git(Some(&repo_path), &["remote"], DEFAULT_TIMEOUT).await?;
+    Ok(out
+        .stdout_lossy()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+#[tauri::command]
+pub async fn git_fetch(state: State<'_, AppState>, repo_path: String) -> AppResult<()> {
+    git_fetch_core(&state, repo_path).await
+}
+
+/// The shared fetch. It prunes BRANCHES — clearing tracking refs for branches the
+/// forge no longer has is the action's whole point — and keeps the local tags a
+/// `fetch.pruneTags` / `remote.<name>.pruneTags` config would prune: the background
+/// auto-fetch runs this on a timer, and a transfer the user never asked for must
+/// not delete their refs. The flag reaches only the IMPLICIT tag refspec — a remote
+/// spelling `refs/tags/*` out in its own fetch config still prunes them here (the
+/// pull side stands down for that shape; this always-prune action has no stand-down).
+pub(crate) async fn git_fetch_core(state: &AppState, repo_path: String) -> AppResult<()> {
+    let cred = crate::forge::credential_config_for_remote(&repo_path, "origin").await?;
+    run_git_mutating_with_creds(
+        state,
+        &repo_path,
+        &cred,
+        &["fetch", "--prune", "--no-prune-tags"],
+        NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Error unless `remote` is one of the repo's configured remotes. We never
+/// interpolate a caller-supplied remote name into a git invocation without
+/// confirming it exists first — `validate_remote_arg` rejects the `-flag`
+/// injection shape, but a bare unknown name would still shell out to a
+/// confusing `git fetch <typo>` error; this turns it into an honest one.
+async fn ensure_remote_exists(repo_path: &str, remote: &str) -> AppResult<()> {
+    validate_remote_arg(remote, "remote name")?;
+    let names = git_remotes(repo_path.to_string()).await?;
+    if names.iter().any(|n| n == remote) {
+        Ok(())
+    } else {
+        Err(AppError::InvalidArgument(format!(
+            "remote does not exist: {remote}"
+        )))
+    }
+}
+
+/// Fetch a single named remote, unlike [`git_fetch`] which fetches only the
+/// default remote. Powers "Update from upstream" for forks: a default-remote fetch
+/// never touches an `upstream` remote, so a fork needs this to see upstream's new
+/// commits at all. The remote is validated to exist before use; the flags are
+/// [`git_fetch_core`]'s, for the same reasons.
+#[tauri::command]
+pub async fn git_fetch_remote(
+    state: State<'_, AppState>,
+    repo_path: String,
+    remote: String,
+) -> AppResult<()> {
+    ensure_remote_exists(&repo_path, &remote).await?;
+    let cred = crate::forge::credential_config_for_remote(&repo_path, &remote).await?;
+    run_git_mutating_with_creds(
+        &state,
+        &repo_path,
+        &cred,
+        &["fetch", "--prune", "--no-prune-tags", &remote],
+        NETWORK_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Resolve a remote's default branch name (e.g. `"master"` / `"main"`) — the branch
+/// a fork's `upstream` sync targets. Reads the LOCAL `refs/remotes/<remote>/HEAD`
+/// symbolic ref first: offline, written by the initial `git clone`, so it usually
+/// answers immediately. If that ref is unset — as it is for a hand-added `upstream`
+/// — one network call (`git remote set-head <remote> --auto`) writes it and we
+/// re-read. Returns the bare branch name (no `<remote>/` prefix).
+#[tauri::command]
+pub async fn git_remote_default_branch(
+    state: State<'_, AppState>,
+    repo_path: String,
+    remote: String,
+) -> AppResult<String> {
+    ensure_remote_exists(&repo_path, &remote).await?;
+
+    if let Some(branch) = remote_head_branch(&repo_path, &remote).await? {
+        return Ok(branch);
+    }
+
+    // The local ref is unset — ask the remote for its HEAD (one network call),
+    // then re-read. `set-head --auto` writes `refs/remotes/<remote>/HEAD`.
+    let cred = crate::forge::credential_config_for_remote(&repo_path, &remote).await?;
+    run_git_mutating_with_creds(
+        &state,
+        &repo_path,
+        &cred,
+        &["remote", "set-head", &remote, "--auto"],
+        NETWORK_TIMEOUT,
+    )
+    .await?;
+
+    remote_head_branch(&repo_path, &remote)
+        .await?
+        .ok_or_else(|| {
+            AppError::InvalidArgument(format!(
+                "could not resolve default branch for remote: {remote}"
+            ))
+        })
+}
+
+/// The branch `refs/remotes/<remote>/HEAD` points at, or `None` when that symref
+/// is unset (never written for a hand-added remote). Local read, no network.
+pub(crate) async fn remote_head_branch(repo_path: &str, remote: &str) -> AppResult<Option<String>> {
+    read_symbolic_ref(
+        repo_path,
+        &format!("refs/remotes/{remote}/HEAD"),
+        &format!("refs/remotes/{remote}/"),
+    )
+    .await
+}
+
+/// Read a symbolic ref and strip `prefix` off its target, returning the tail
+/// (the branch name). `None` when the ref is unset — `git symbolic-ref` exits
+/// non-zero — or its target doesn't start with `prefix`.
+async fn read_symbolic_ref(
+    repo_path: &str,
+    symref: &str,
+    prefix: &str,
+) -> AppResult<Option<String>> {
+    let out = run_git(
+        Some(repo_path),
+        &["symbolic-ref", "--quiet", symref],
+        DEFAULT_TIMEOUT,
+    )
+    .await;
+    // An unset ref makes `symbolic-ref` exit non-zero; run_git surfaces that as
+    // an error, which here means "not resolved yet", not a hard failure.
+    let Ok(out) = out else {
+        return Ok(None);
+    };
+    let target = out.stdout_lossy().trim().to_string();
+    Ok(target
+        .strip_prefix(prefix)
+        .filter(|b| !b.is_empty())
+        .map(str::to_string))
+}
+
+#[tauri::command]
+pub async fn git_pull(
+    state: State<'_, AppState>,
+    repo_path: String,
+    mode: String,
+) -> AppResult<()> {
+    git_pull_core(&state, repo_path, mode).await
+}
+
+pub(crate) async fn git_pull_core(
+    state: &AppState,
+    repo_path: String,
+    mode: String,
+) -> AppResult<()> {
+    // "rebase"/"merge" reconcile a diverged branch; the default stays the safe
+    // fast-forward-only. A conflicted rebase/merge surfaces in the conflict UI.
+    let flag = match mode.as_str() {
+        "rebase" => "--rebase",
+        "merge" => "--no-rebase",
+        _ => "--ff-only",
+    };
+    // The paused operation a conflicted pull leaves behind is the mode it RAN, so
+    // it is named here rather than inside the runner: `run_git_mutating_with_creds`
+    // also carries fetch and push, whose failures are never a paused conflict and
+    // would each pay for an unmerged probe that can only come back empty.
+    // A refused `--ff-only` leaves nothing unmerged, so its label never surfaces.
+    let op = if mode == "rebase" { "rebase" } else { "merge" };
+    // Every mode splits into a network phase and a local one (git::pull_guard), so the
+    // transfer holds the network domain alone and staging stays available across it.
+    // Rebase mode additionally runs the fork-point guard there — bare
+    // `git pull --rebase` computes its own fork point and can silently drop a pushed
+    // commit a force-push rewrote away.
+    if mode == "rebase" {
+        if crate::git::pull_guard::guarded_pull(state, &repo_path).await? {
+            return Ok(());
+        }
+    } else if let Some(plain) =
+        crate::git::pull_guard::pin_plain_pull(state, &repo_path, mode != "merge").await?
+    {
+        return crate::git::pull_guard::merge_pinned(state, &repo_path, &plain).await;
+    }
+    let cred = crate::forge::credential_config_for_remote(&repo_path, "origin").await?;
+    // The fall-through, for every state the split phases stand down on (each listed at
+    // `pin_plain_pull` / `guarded_pull`): bare `git pull` is a transfer AND a merge in
+    // one command, so it needs both domains — the working tree here, the network inside
+    // `run_git_mutating_with_creds` — that order only (see `run_git_mutating`). The
+    // split phases above take their own locks and must stay outside this hold.
+    let wt = state.working_tree_lock(&repo_path).await;
+    let _wt_guard = acquire_repo_lock(&wt, LOCK_WAIT_TIMEOUT, "a pull").await?;
+    let already_unmerged = crate::git::ops::unmerged_paths(&repo_path).await;
+    if let Err(err) =
+        run_git_mutating_with_creds(state, &repo_path, &cred, &["pull", flag], NETWORK_TIMEOUT).await
+    {
+        // The runner already folded both streams into `stderr`, so the report is
+        // relabeled here rather than re-running git.
+        return Err(match err {
+            AppError::Git { code, stderr } => {
+                crate::git::ops::classify_failure(
+                    &repo_path,
+                    op,
+                    &already_unmerged,
+                    code,
+                    stderr,
+                )
+                .await
+            }
+            other => other,
+        });
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn git_push(
+    state: State<'_, AppState>,
+    repo_path: String,
+    set_upstream: bool,
+    force: bool,
+    branch: Option<String>,
+    remote: Option<String>,
+    remote_branch: Option<String>,
+) -> AppResult<PushGuard> {
+    git_push_core(
+        &state,
+        repo_path,
+        set_upstream,
+        force,
+        branch,
+        remote,
+        remote_branch,
+    )
+    .await
+}
+
+/// Which guarantee a completed push actually ran under. Only meaningful for a
+/// FORCE push: a non-force push has no lease to degrade, and reports
+/// [`PushGuard::LeaseAndIncludes`] as the neutral value.
+///
+/// Crosses the IPC boundary as `git_push`'s return value, so the caller's
+/// success toast can name a degraded guarantee instead of overclaiming. The
+/// camelCase wire strings mirror the `PushGuard` union in `src/lib/git/api/sync.ts`
+/// and are pinned by `push_guard_serializes_to_the_camel_case_wire_values`.
+#[derive(Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::enum_variant_names)] // the shared `Lease` prefix IS the shared guarantee
+pub(crate) enum PushGuard {
+    /// `--force-with-lease --force-if-includes`, the intended pair.
+    LeaseAndIncludes,
+    /// This git predates `--force-if-includes` (2.30) — the lease alone.
+    LeaseOnlyOldGit,
+    /// The branch has no reflog for `--force-if-includes` to walk, so the check
+    /// could never pass — the lease alone.
+    LeaseOnlyNoReflog,
+}
+
+/// `remote_branch` names the DESTINATION branch when it differs from the local one
+/// (pushing a maintainer's local work back to a contributor's fork head). It only
+/// means anything alongside an explicit `branch` and `remote`, so any other
+/// combination is rejected rather than silently ignored.
+pub(crate) async fn git_push_core(
+    state: &AppState,
+    repo_path: String,
+    set_upstream: bool,
+    force: bool,
+    branch: Option<String>,
+    remote: Option<String>,
+    remote_branch: Option<String>,
+) -> AppResult<PushGuard> {
+    if remote_branch.is_some() && (branch.is_none() || remote.is_none()) {
+        return Err(AppError::InvalidArgument(
+            "remote branch requires an explicit branch and remote".to_string(),
+        ));
+    }
+    // The credential config is scoped to the remote we actually push to, resolved
+    // below. Defaults to origin (the HEAD path and the origin-tracked cases).
+    let mut cred_remote = "origin".to_string();
+    // Owned Strings: a named-branch push interpolates the branch into a refspec,
+    // which can't borrow from a temporary.
+    let args: Vec<String> = match &branch {
+        None => {
+            // A remote can only be chosen for an explicit branch — the HEAD path
+            // pushes to HEAD's own upstream and stays byte-identical.
+            if remote.is_some() {
+                return Err(AppError::InvalidArgument(
+                    "remote requires an explicit branch".to_string(),
+                ));
+            }
+            let mut a = vec!["push".to_string()];
+            if force {
+                // The pair refuses to clobber remote work this branch hasn't
+                // integrated: a bare lease is satisfied by ANY fetch, and the app
+                // auto-fetches in the background.
+                a.push("--force-with-lease".to_string());
+                a.push(FORCE_IF_INCLUDES.to_string());
+            }
+            if set_upstream {
+                a.extend(["-u", "origin", "HEAD"].map(str::to_string));
+            }
+            a
+        }
+        Some(b) => {
+            crate::git::branches::validate_ref_name(b)?;
+            // A caller-chosen remote is validated for shape AND verified to exist
+            // BEFORE any mutation: the existence check is the primary guard (a URL
+            // can never appear in `git remote` output — and it requires `:`, which
+            // validate_ref_name's blocklist already rejects). We never interpolate
+            // the remote into a refspec — it's the bare `push <remote>` argument.
+            if let Some(r) = &remote {
+                // `validate_ref_name` is the checker, but its message speaks of a
+                // "branch name" — remap it so an invalid remote reads accurately.
+                crate::git::branches::validate_ref_name(r).map_err(|_| {
+                    AppError::InvalidArgument(format!("invalid remote name: {r}"))
+                })?;
+                let remotes = git_remotes(repo_path.clone()).await?;
+                if !remotes.iter().any(|n| n == r) {
+                    return Err(AppError::InvalidArgument(format!("unknown remote: {r}")));
+                }
+            }
+            // The destination name IS interpolated into the refspec's right-hand
+            // side, so it takes the same blocklist as the local branch (`*` would
+            // mirror-push, `:` would add a refspec field).
+            if let Some(rb) = &remote_branch {
+                crate::git::branches::validate_ref_name(rb).map_err(|_| {
+                    AppError::InvalidArgument(format!("invalid remote branch name: {rb}"))
+                })?;
+            }
+            // Resolve b's tracking state in one read-only call. `for-each-ref`
+            // matches a pattern as a prefix up to a slash (`refs/heads/feat` also
+            // matches `refs/heads/feat/sub`), so emitting `%(refname)` and requiring
+            // an exact match (in `parse_upstream_tracking`) is what makes this an
+            // exact-name lookup. `%(upstream:track)` carries `[gone]`.
+            let out = run_git(
+                Some(&repo_path),
+                &[
+                    "for-each-ref",
+                    &format!("refs/heads/{b}"),
+                    "--format=%(refname)%00%(upstream:short)%00%(upstream:remotename)%00%(upstream:track)",
+                ],
+                DEFAULT_TIMEOUT,
+            )
+            .await?;
+            // No exact-refname line ⇒ no such local branch (an *untracked* branch
+            // still emits `refs/heads/<b>\0\0\0`).
+            let Some((upstream_short, remotename, gone)) =
+                parse_upstream_tracking(&out.stdout_lossy(), &format!("refs/heads/{b}"))
+            else {
+                return Err(AppError::InvalidArgument(format!("no such branch: {b}")));
+            };
+            // The credential config must target the remote we actually push to, not
+            // always origin — a branch tracking a fork's `upstream` (or an explicit
+            // `remote`) authenticates against THAT host, not origin's.
+            cred_remote = resolve_push_target(remote.as_deref(), &remotename, gone).to_string();
+            build_push_args(
+                b,
+                &upstream_short,
+                &remotename,
+                gone,
+                set_upstream,
+                force,
+                remote.as_deref(),
+                remote_branch.as_deref(),
+            )
+        }
+    };
+    let cred = crate::forge::credential_config_for_remote(&repo_path, &cred_remote).await?;
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run_git_mutating_with_creds(state, &repo_path, &cred, &argv, NETWORK_TIMEOUT).await {
+        Ok(_) => Ok(PushGuard::LeaseAndIncludes),
+        Err(AppError::Git { stderr, .. })
+            if argv.contains(&FORCE_IF_INCLUDES) && is_unknown_push_option(&stderr) =>
+        {
+            // git < 2.30 doesn't know `--force-if-includes`. Unknown options are
+            // rejected while parsing argv, before any network I/O, so this retry
+            // can't push twice; it degrades to the lease alone.
+            let retry = without_force_if_includes(&argv);
+            run_git_mutating_with_creds(state, &repo_path, &cred, &retry, NETWORK_TIMEOUT).await?;
+            Ok(PushGuard::LeaseOnlyOldGit)
+        }
+        Err(AppError::Git { code, stderr })
+            if argv.contains(&FORCE_IF_INCLUDES) && stderr.contains(IF_INCLUDES_REJECTION) =>
+        {
+            // The flag proves inclusion by walking the local branch's reflog, so
+            // with no reflog it can never pass: an amend with the remote left
+            // untouched is rejected (measured) under core.logAllRefUpdates=false.
+            // The lease still guards the retry — at worst, pre-change behavior.
+            // Left standing on purpose: a PRESENT reflog with expired entries
+            // (gc.reflogExpire), and a cross-name push colliding with a stale
+            // local branch named like the destination (git walks THAT branch's
+            // reflog — measured); neither can prove inclusion, so both reject.
+            let Some(b) = pushed_branch(&repo_path, branch.as_deref()).await else {
+                return Err(AppError::Git { code, stderr });
+            };
+            if branch_has_reflog(&repo_path, &b).await {
+                return Err(AppError::Git { code, stderr });
+            }
+            let retry = without_force_if_includes(&argv);
+            run_git_mutating_with_creds(state, &repo_path, &cred, &retry, NETWORK_TIMEOUT).await?;
+            Ok(PushGuard::LeaseOnlyNoReflog)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Companion to `--force-with-lease`: git refuses the push unless the remote tip
+/// is already incorporated into the local branch, so a background fetch can't
+/// satisfy the lease on a teammate's unseen work. Git 2.30+.
+const FORCE_IF_INCLUDES: &str = "--force-if-includes";
+
+/// git's per-ref reason when `--force-if-includes` finds the remote tip missing
+/// from the local branch's reflog — verbatim from `! [rejected] … (…)`.
+const IF_INCLUDES_REJECTION: &str = "remote ref updated since checkout";
+
+/// The local branch a push targeted: the caller's explicit name, else HEAD's own
+/// branch. `None` on a detached HEAD (and on a spawn failure) — no branch means
+/// no reflog to reason about, so callers must not retry. Git itself walks the
+/// local ref named after the DESTINATION when one exists (measured); the source
+/// name probed here covers the app's same-name default — see the arm's comment.
+async fn pushed_branch(repo_path: &str, branch: Option<&str>) -> Option<String> {
+    if let Some(b) = branch {
+        return Some(b.to_string());
+    }
+    let out = run_git_raw(
+        Some(repo_path),
+        &["symbolic-ref", "--short", "-q", "HEAD"],
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .ok()?;
+    (out.code == 0)
+        .then(|| out.stdout_lossy().trim().to_string())
+        .filter(|b| !b.is_empty())
+}
+
+/// Whether `refs/heads/<branch>` has a reflog (`git reflog exists`, exit 0/1). An
+/// unrunnable probe counts as "has one": the degrading retry only fires on
+/// positive proof that `--force-if-includes` had nothing to walk.
+async fn branch_has_reflog(repo_path: &str, branch: &str) -> bool {
+    run_git_raw(
+        Some(repo_path),
+        &["reflog", "exists", &format!("refs/heads/{branch}")],
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .map_or(true, |out| out.code == 0)
+}
+
+/// Whether git rejected an unknown command-line option — for a push, the signal
+/// that this git predates `--force-if-includes` (2.30). The matched text is the
+/// runner's `full_failure_text`, which can carry remote-relayed lines, so a
+/// server-echoed phrase triggers the retry too; that only degrades to the lease.
+fn is_unknown_push_option(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("unknown switch")
+        || lower.contains("unknown option")
+        || lower.contains("usage: git push")
+}
+
+/// The push argv minus `--force-if-includes`, everything else kept in order.
+fn without_force_if_includes<'a>(argv: &[&'a str]) -> Vec<&'a str> {
+    argv.iter()
+        .copied()
+        .filter(|a| *a != FORCE_IF_INCLUDES)
+        .collect()
+}
+
+/// Parse one `for-each-ref … --format=%(refname)%00%(upstream:short)%00%(upstream:remotename)%00%(upstream:track)`
+/// line into `(upstream_short, remotename, gone)`, but ONLY when its `%(refname)`
+/// equals `expected_ref`. `for-each-ref` matches a pattern as a prefix up to a
+/// slash (`refs/heads/feat` also matches `refs/heads/feat/sub`), so the exact
+/// refname check is what enforces "no such branch" for a non-exact name.
+/// Returns `None` when there is no line, or the first line's refname isn't
+/// `expected_ref`. An *untracked* branch still emits `refs/heads/<b>\0\0\0`,
+/// which (refname matches) parses to `Some(("","",false))`.
+fn parse_upstream_tracking(stdout: &str, expected_ref: &str) -> Option<(String, String, bool)> {
+    let line = stdout.lines().next()?;
+    let mut parts = line.split('\0');
+    let refname = parts.next().unwrap_or("");
+    if refname != expected_ref {
+        return None;
+    }
+    let upstream_short = parts.next().unwrap_or("").to_string();
+    let remotename = parts.next().unwrap_or("").to_string();
+    let track = parts.next().unwrap_or("");
+    // Mirror branches.rs's gone detection: `[gone]` in %(upstream:track).
+    Some((upstream_short, remotename, track.contains("[gone]")))
+}
+
+/// Resolve the remote a named-branch push targets. Pure so the decision table
+/// stays unit-testable, and shared by `git_push_core` (for the credential
+/// config) and [`build_push_args`] (for the argv) so there's one source of truth.
+///
+/// - An explicit `requested_remote` always wins.
+/// - Otherwise a branch tracked (and not gone) targets its OWN upstream remote;
+///   an untracked / gone branch falls back to `origin` (the publish destination).
+fn resolve_push_target<'a>(
+    requested_remote: Option<&'a str>,
+    remotename: &'a str,
+    gone: bool,
+) -> &'a str {
+    match requested_remote {
+        Some(r) => r,
+        None if !remotename.is_empty() && !gone => remotename,
+        None => "origin",
+    }
+}
+
+/// Decide the `git push` args for pushing a NAMED local branch, from its resolved
+/// tracking state and an optional caller-chosen `requested_remote`. Pure — no git
+/// calls — so the decision table is unit-testable.
+///
+/// - `upstream_short`: `%(upstream:short)` (e.g. `origin/feat`), empty when untracked.
+/// - `remotename`: `%(upstream:remotename)` (the tracked upstream's remote).
+/// - `gone`: the tracked ref was deleted (`[gone]`).
+/// - `requested_remote`: an explicit push target (the switcher's per-remote Publish
+///   items, or MCP's `remote`); `None` resolves the default.
+/// - `remote_branch`: an explicit DESTINATION branch name; only ever `Some` with an
+///   explicit `requested_remote` (the caller enforces it).
+///
+/// The target `T` is [`resolve_push_target`]. Rules:
+/// - `remote_branch` = `rb` → `push T refs/heads/<branch>:refs/heads/<rb>`, no `-u`:
+///   an explicitly named destination pins the refspec and leaves tracking alone.
+/// - untracked / gone / `set_upstream` → `-u T refs/heads/<branch>:refs/heads/<branch>`
+///   (publish + track). A *gone* upstream publishes under the LOCAL name, deliberately
+///   not resurrecting a differently-named deleted ref.
+/// - tracked and `T == remotename`: strip the `remotename/` prefix off
+///   `upstream_short` to get the remote branch name `up`;
+///   `push T refs/heads/<branch>:refs/heads/<up>` (a bare `push T <branch>` would
+///   advance the WRONG remote ref when the names differ).
+/// - tracked and `T != remotename` (a copy elsewhere, e.g. a fork's `origin` snapshot
+///   of an `upstream`-tracked branch): `push T refs/heads/<branch>:refs/heads/<branch>`
+///   with NO `-u` — publishes under the LOCAL name, upstream config untouched.
+///
+/// Refspecs are fully qualified so a branch named `+x`/`-x` can't be read as a
+/// force/delete indicator; the remote is only ever the bare `push <remote>` arg.
+/// `force` prepends `--force-with-lease --force-if-includes` before the refspec in
+/// every arm.
+#[allow(clippy::too_many_arguments)] // one flat arg per decision-table input
+fn build_push_args(
+    branch: &str,
+    upstream_short: &str,
+    remotename: &str,
+    gone: bool,
+    set_upstream: bool,
+    force: bool,
+    requested_remote: Option<&str>,
+    remote_branch: Option<&str>,
+) -> Vec<String> {
+    let target = resolve_push_target(requested_remote, remotename, gone);
+    let mut args = vec!["push".to_string()];
+    if force {
+        args.push("--force-with-lease".to_string());
+        args.push(FORCE_IF_INCLUDES.to_string());
+    }
+    if let Some(rb) = remote_branch {
+        // Destination named outright: never `-u` and never the tracking-derived
+        // name — the local branch's upstream is a different question from where
+        // this one push lands.
+        args.push(target.to_string());
+        args.push(format!("refs/heads/{branch}:refs/heads/{rb}"));
+        return args;
+    }
+    let untracked = upstream_short.is_empty();
+    if untracked || gone || set_upstream {
+        // Publish + track, under the LOCAL name.
+        args.extend(["-u", target].map(str::to_string));
+        args.push(publish_refspec(branch));
+    } else if target == remotename {
+        // Tracked → its own remote: target the remote branch name explicitly (it
+        // may differ from the local one).
+        let up = upstream_short
+            .strip_prefix(&format!("{remotename}/"))
+            .unwrap_or(upstream_short);
+        args.push(target.to_string());
+        args.push(format!("refs/heads/{branch}:refs/heads/{up}"));
+    } else {
+        // Tracked, but pushing to a DIFFERENT remote than the upstream — a copy
+        // under the local name, no `-u`, upstream config untouched (never retrack).
+        args.push(target.to_string());
+        args.push(publish_refspec(branch));
+    }
+    args
+}
+
+/// Fully-qualified same-name push refspec. Qualification alone only stops a
+/// leading `+`/`-` from reading as a force/delete marker at refspec position 0;
+/// the metacharacters that could reshape the refspec (`* ? [ : \`) are rejected
+/// by [`crate::git::branches::validate_ref_name`], which every caller runs first.
+pub(crate) fn publish_refspec(branch: &str) -> String {
+    format!("refs/heads/{branch}:refs/heads/{branch}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_push_args, cache_get, cache_invalidate, cache_put, git_fetch_core, git_pull_core,
+        git_push_core, git_remote_remove_core, is_auth_class_failure, is_unknown_push_option,
+        parse_upstream_tracking, publish_refspec, resolve_push_target, run_git_mutating_with_creds,
+        without_force_if_includes, IF_INCLUDES_REJECTION, PushGuard,
+    };
+    use crate::error::AppError;
+    use crate::git::runner::{run_git, DEFAULT_TIMEOUT};
+    use crate::state::AppState;
+    use std::time::Duration;
+
+    // Distinct keys per test — the cache is a process-wide static shared across all tests.
+    const BIG: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn put_then_get_within_ttl_hits() {
+        cache_put("/repo/a", "origin", "git@example.com:a.git");
+        assert_eq!(
+            cache_get("/repo/a", "origin", BIG),
+            Some("git@example.com:a.git".to_string())
+        );
+    }
+
+    #[test]
+    fn zero_ttl_is_always_expired() {
+        cache_put("/repo/b", "origin", "https://example.com/b.git");
+        // Zero TTL: any elapsed time (however small) is >= the TTL, so the entry reads as expired.
+        assert_eq!(cache_get("/repo/b", "origin", Duration::ZERO), None);
+    }
+
+    #[test]
+    fn invalidate_drops_the_entry() {
+        cache_put("/repo/c", "origin", "https://example.com/c.git");
+        assert!(cache_get("/repo/c", "origin", BIG).is_some());
+        cache_invalidate("/repo/c", "origin");
+        assert_eq!(cache_get("/repo/c", "origin", BIG), None);
+    }
+
+    #[test]
+    fn distinct_keys_do_not_collide() {
+        cache_put("/repo/d", "origin", "url-origin");
+        cache_put("/repo/d", "upstream", "url-upstream");
+        cache_put("/repo/e", "origin", "url-e-origin");
+        assert_eq!(
+            cache_get("/repo/d", "origin", BIG),
+            Some("url-origin".to_string())
+        );
+        assert_eq!(
+            cache_get("/repo/d", "upstream", BIG),
+            Some("url-upstream".to_string())
+        );
+        assert_eq!(
+            cache_get("/repo/e", "origin", BIG),
+            Some("url-e-origin".to_string())
+        );
+        // Invalidating one key leaves the others intact.
+        cache_invalidate("/repo/d", "origin");
+        assert_eq!(cache_get("/repo/d", "origin", BIG), None);
+        assert_eq!(
+            cache_get("/repo/d", "upstream", BIG),
+            Some("url-upstream".to_string())
+        );
+    }
+
+    #[test]
+    fn miss_returns_none() {
+        assert_eq!(cache_get("/repo/never-written", "origin", BIG), None);
+    }
+
+    // --- Auth-class classifier for the ambient-credential fallback. ---
+
+    #[test]
+    fn auth_class_matches_rejected_credentials() {
+        assert!(is_auth_class_failure(
+            "fatal: Authentication failed for 'https://github.com/x/y.git/'"
+        ));
+    }
+
+    #[test]
+    fn auth_class_matches_prompt_disabled_no_username() {
+        assert!(is_auth_class_failure(
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+        ));
+    }
+
+    #[test]
+    fn auth_class_matches_repository_not_found_sideband() {
+        // The 404 sideband line is what identifies a wrong-identity token.
+        assert!(is_auth_class_failure(
+            "remote: Repository not found.\nfatal: repository 'https://github.com/x/y.git/' not found"
+        ));
+    }
+
+    #[test]
+    fn auth_class_ignores_merge_conflict() {
+        assert!(!is_auth_class_failure(
+            "CONFLICT (content): Merge conflict in file.txt\nAutomatic merge failed; fix conflicts"
+        ));
+    }
+
+    #[test]
+    fn auth_class_ignores_network_dns_error() {
+        // A DNS/network failure must NOT trigger the fallback — retrying can't help
+        // and would double the timeout.
+        assert!(!is_auth_class_failure(
+            "ssh: Could not resolve hostname github.com"
+        ));
+    }
+
+    /// The failure contract every caller (fetch/pull/push) branches on: a non-zero
+    /// sub-command surfaces as `AppError::Git` carrying git's OWN exit code and
+    /// stderr, not a synthesized message.
+    #[tokio::test]
+    async fn mutating_with_creds_surfaces_gits_own_code_and_stderr() {
+        let (_base, base) = temp_base("creds-error");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        init_repo(&repo_s, "a.txt").await;
+
+        let state = AppState::default();
+        let result = run_git_mutating_with_creds(
+            &state,
+            &repo_s,
+            &[],
+            &["merge", "nonexistent-ref-xyz"],
+            DEFAULT_TIMEOUT,
+        )
+        .await;
+        match result {
+            Err(AppError::Git { code, stderr }) => {
+                assert_eq!(code, 1);
+                assert!(
+                    stderr.contains("nonexistent-ref-xyz - not something we can merge"),
+                    "expected git's own stderr, got: {stderr}"
+                );
+            }
+            Err(other) => panic!("expected AppError::Git, got {other:?}"),
+            Ok(_) => panic!("merging a missing ref should fail"),
+        }
+    }
+
+    /// The half that stderr alone cannot carry: a merge-mode pull that conflicts
+    /// writes only its fetch summary to stderr and the whole merge verdict to
+    /// stdout, so an error shaped from stderr looks populated while saying
+    /// nothing about the conflict the user now has to resolve.
+    #[tokio::test]
+    async fn a_conflicted_pull_surfaces_gits_merge_verdict() {
+        let (_base, base) = temp_base("pull-conflict");
+        let origin = base.join("origin.git");
+        let work = base.join("work");
+        let clone = base.join("clone");
+        std::fs::create_dir_all(&work).unwrap();
+        let base_s = base.to_string_lossy().into_owned();
+        let work_s = work.to_string_lossy().into_owned();
+        let clone_s = clone.to_string_lossy().into_owned();
+        let url = format!("file://{}", origin.to_string_lossy().replace('\\', "/"));
+
+        run(&base_s, &["init", "-q", "--bare", "-b", "main", "origin.git"]).await;
+        init_repo(&work_s, "a.txt").await;
+        run(&work_s, &["branch", "-M", "main"]).await;
+        run(&work_s, &["remote", "add", "origin", &url]).await;
+        run(&work_s, &["push", "-q", "-u", "origin", "main"]).await;
+        run(&base_s, &["-c", "core.autocrlf=false", "clone", "-q", &url, "clone"]).await;
+        run(&clone_s, &["config", "core.autocrlf", "false"]).await;
+        run(&clone_s, &["config", "user.email", "t@t.local"]).await;
+        run(&clone_s, &["config", "user.name", "T"]).await;
+
+        // Both sides rewrite the same file, so `--no-rebase` merges and conflicts.
+        std::fs::write(work.join("a.txt"), "upstream\n").unwrap();
+        run(&work_s, &["commit", "-qam", "upstream"]).await;
+        run(&work_s, &["push", "-q"]).await;
+        std::fs::write(clone.join("a.txt"), "mine\n").unwrap();
+        run(&clone_s, &["commit", "-qam", "local"]).await;
+
+        let state = AppState::default();
+        let result = run_git_mutating_with_creds(
+            &state,
+            &clone_s,
+            &[],
+            &["pull", "--no-rebase"],
+            DEFAULT_TIMEOUT,
+        )
+        .await;
+        match result {
+            Err(AppError::Git { code, stderr }) => {
+                assert_eq!(code, 1);
+                assert!(
+                    stderr.contains("Automatic merge failed"),
+                    "the merge verdict rides stdout and must reach the error, got: {stderr}"
+                );
+                assert!(
+                    stderr.contains("CONFLICT (content): Merge conflict in a.txt"),
+                    "and the conflicted-file list with it, got: {stderr}"
+                );
+            }
+            Err(other) => panic!("expected AppError::Git, got {other:?}"),
+            Ok(_) => panic!("a diverged pull with an overlapping edit should conflict"),
+        }
+    }
+
+    /// A clone diverged from its origin on `a.txt`, so a reconciling pull in
+    /// either mode conflicts. Returns the temp guard (drop removes the fixture)
+    /// and the clone's path.
+    async fn diverged_clone(tag: &str) -> (tempfile::TempDir, String) {
+        let (guard, base) = temp_base(tag);
+        let origin = base.join("origin.git");
+        let work = base.join("work");
+        let clone = base.join("clone");
+        std::fs::create_dir_all(&work).unwrap();
+        let base_s = base.to_string_lossy().into_owned();
+        let work_s = work.to_string_lossy().into_owned();
+        let clone_s = clone.to_string_lossy().into_owned();
+        let url = format!("file://{}", origin.to_string_lossy().replace('\\', "/"));
+
+        run(&base_s, &["init", "-q", "--bare", "-b", "main", "origin.git"]).await;
+        init_repo(&work_s, "a.txt").await;
+        run(&work_s, &["branch", "-M", "main"]).await;
+        run(&work_s, &["remote", "add", "origin", &url]).await;
+        run(&work_s, &["push", "-q", "-u", "origin", "main"]).await;
+        run(&base_s, &["-c", "core.autocrlf=false", "clone", "-q", &url, "clone"]).await;
+        run(&clone_s, &["config", "core.autocrlf", "false"]).await;
+        run(&clone_s, &["config", "user.email", "t@t.local"]).await;
+        run(&clone_s, &["config", "user.name", "T"]).await;
+
+        std::fs::write(work.join("a.txt"), "upstream\n").unwrap();
+        run(&work_s, &["commit", "-qam", "upstream"]).await;
+        run(&work_s, &["push", "-q"]).await;
+        std::fs::write(clone.join("a.txt"), "mine\n").unwrap();
+        run(&clone_s, &["commit", "-qam", "local"]).await;
+        (guard, clone_s)
+    }
+
+    /// A pull that conflicts leaves a PAUSED merge/rebase, and `git_pull_core` is
+    /// where that gets named — the runner it goes through also carries fetch and
+    /// push, whose failures are never paused.
+    #[tokio::test]
+    async fn a_conflicted_pull_reports_a_paused_merge() {
+        let (_guard, clone_s) = diverged_clone("pull-conflict-op").await;
+
+        let state = AppState::default();
+        let err = git_pull_core(&state, clone_s.clone(), "merge".into())
+            .await
+            .unwrap_err();
+        let AppError::Conflict { op, paths, report } = &err else {
+            panic!("expected a conflict error, got {err:?}");
+        };
+        assert_eq!(op, "merge", "a merge-mode pull pauses a merge");
+        assert_eq!(paths, &vec!["a.txt".to_string()]);
+        // Both halves: the fetch summary fills stderr while the merge verdict and
+        // its file list ride stdout, so either alone loses the conflict.
+        assert!(
+            report.contains("CONFLICT (content): Merge conflict in a.txt"),
+            "git's conflict list must survive: {report}"
+        );
+        assert!(
+            report.contains("Automatic merge failed"),
+            "and the verdict line with it: {report}"
+        );
+    }
+
+    /// The other half of the mode→op branch: the same divergence pulled with
+    /// `--rebase` leaves a paused REBASE, and the frontend's copy for the two
+    /// differs (a merge finishes with a commit, a rebase with `--continue`).
+    #[tokio::test]
+    async fn a_conflicted_rebase_pull_reports_a_paused_rebase() {
+        let (_guard, clone_s) = diverged_clone("pull-conflict-rebase").await;
+
+        let state = AppState::default();
+        let err = git_pull_core(&state, clone_s.clone(), "rebase".into())
+            .await
+            .unwrap_err();
+        let AppError::Conflict { op, paths, report } = &err else {
+            panic!("expected a conflict error, got {err:?}");
+        };
+        assert_eq!(op, "rebase", "a rebase-mode pull pauses a rebase");
+        assert_eq!(paths, &vec!["a.txt".to_string()]);
+        assert!(
+            report.contains("CONFLICT (content): Merge conflict in a.txt"),
+            "git's conflict list must survive: {report}"
+        );
+        assert!(
+            crate::git::ops::op_state(&clone_s).await.unwrap().rebasing,
+            "and the rebase really is the operation left in progress"
+        );
+    }
+
+    /// Pulling on a tree already paused on a MERGE: git refuses without touching
+    /// the index ("Pulling is not possible because you have unmerged files",
+    /// measured on git 2.51.1), so the only unmerged path belongs to that merge.
+    /// Attributing it to the pull would toast "Rebase paused…" over a tree whose
+    /// conflict banner reads *merge*.
+    #[tokio::test]
+    async fn a_pull_refused_over_someone_elses_conflict_is_not_a_paused_rebase() {
+        let (_guard, clone_s) = diverged_clone("pull-refused-misattrib").await;
+        // Pause a merge from a side branch, so the tree is unmerged before the pull.
+        run(&clone_s, &["switch", "-q", "-c", "side", "HEAD~1"]).await;
+        std::fs::write(
+            std::path::Path::new(&clone_s).join("a.txt"),
+            "side\n",
+        )
+        .unwrap();
+        run(&clone_s, &["commit", "-qam", "side"]).await;
+        run(&clone_s, &["switch", "-q", "main"]).await;
+        let merged = run_git(
+            Some(&clone_s),
+            &["merge", "--no-edit", "side"],
+            DEFAULT_TIMEOUT,
+        )
+        .await;
+        assert!(merged.is_err(), "the fixture's merge must conflict");
+        assert!(crate::git::ops::op_state(&clone_s).await.unwrap().merging);
+
+        let state = AppState::default();
+        let err = git_pull_core(&state, clone_s.clone(), "rebase".into())
+            .await
+            .unwrap_err();
+        let AppError::Git { stderr, .. } = &err else {
+            panic!("expected a plain git error, got {err:?}");
+        };
+        assert!(
+            stderr.contains("unmerged files"),
+            "git's own refusal must reach the user: {stderr}"
+        );
+        assert!(
+            !crate::git::ops::op_state(&clone_s).await.unwrap().rebasing,
+            "no rebase was ever started — naming one would contradict the banner"
+        );
+    }
+
+    // --- The fork-point guard on a rebase-mode pull. ---
+
+    /// A clone whose PUSHED commit `V` the upstream then force-pushed away — the
+    /// state a bare `git pull --rebase` replays out of existence. Returns the
+    /// fixture guard, the clone's path, V's sha, and the rewritten origin tip.
+    ///
+    /// The push is what arms it: it writes V into the clone's
+    /// `refs/remotes/origin/main` reflog, which is where fork-point reads it.
+    async fn vaporize_clone(tag: &str) -> (tempfile::TempDir, String, String, String) {
+        let (guard, base, _origin_s, url) = seeded_origin(tag).await;
+        let base_s = base.to_string_lossy().into_owned();
+        let work = base.join("work");
+        let work_s = work.to_string_lossy().into_owned();
+
+        run(&base_s, &["-c", "core.autocrlf=false", "clone", "-q", &url, "clone"]).await;
+        let clone = base.join("clone");
+        let clone_s = clone.to_string_lossy().into_owned();
+        run(&clone_s, &["config", "core.autocrlf", "false"]).await;
+        run(&clone_s, &["config", "user.email", "t@t.local"]).await;
+        run(&clone_s, &["config", "user.name", "T"]).await;
+
+        std::fs::write(clone.join("v.txt"), "v\n").unwrap();
+        run(&clone_s, &["add", "-A"]).await;
+        run(&clone_s, &["commit", "-qm", "V the victim"]).await;
+        run(&clone_s, &["push", "-q"]).await;
+        let victim = run(&clone_s, &["rev-parse", "HEAD"]).await.trim().to_string();
+
+        run(&work_s, &["fetch", "-q"]).await;
+        run(&work_s, &["reset", "-q", "--hard", "origin/main~1"]).await;
+        std::fs::write(work.join("r.txt"), "r\n").unwrap();
+        run(&work_s, &["add", "-A"]).await;
+        run(&work_s, &["commit", "-qm", "teammate rewrite"]).await;
+        run(&work_s, &["push", "-q", "--force"]).await;
+        let rewritten = run(&work_s, &["rev-parse", "HEAD"]).await.trim().to_string();
+
+        (guard, clone_s, victim, rewritten)
+    }
+
+    async fn head_of(repo: &str, rev: &str) -> String {
+        run(repo, &["rev-parse", rev]).await.trim().to_string()
+    }
+
+    async fn subjects(repo: &str) -> Vec<String> {
+        run(repo, &["log", "--format=%s"])
+            .await
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The whole point: a teammate's force-push over a commit the user already
+    /// pushed makes bare `git pull --rebase` drop it silently ("Successfully
+    /// rebased", no conflict). The guard refuses instead, naming the commit — and
+    /// leaves the branch and the working tree exactly where it found them.
+    #[tokio::test]
+    async fn a_rebase_pull_refuses_to_vaporize_a_force_pushed_commit() {
+        let (_guard, clone_s, victim, rewritten) = vaporize_clone("vaporize").await;
+        assert_eq!(
+            head_of(&clone_s, "refs/remotes/origin/main").await,
+            victim,
+            "the clone has not seen the rewrite yet — the guard's own fetch must"
+        );
+
+        let state = AppState::default();
+        let err = git_pull_core(&state, clone_s.clone(), "rebase".into())
+            .await
+            .expect_err("a pull that would drop a pushed commit must refuse");
+        let AppError::PullRebaseWouldDrop(drop) = &err else {
+            panic!("expected a would-drop refusal, got {err:?}");
+        };
+        assert_eq!(drop.branch, "main");
+        assert_eq!(drop.upstream, "origin/main");
+        assert_eq!(drop.branch_tip, victim);
+        assert_eq!(
+            drop.fork_point, victim,
+            "V is the fork point the reflog remembers"
+        );
+        assert_eq!(drop.new_tip, rewritten);
+        assert_eq!(
+            drop.merge_base,
+            head_of(&clone_s, &format!("{victim}~1")).await,
+            "the merge base is V's parent — the last commit both sides share"
+        );
+        assert_eq!(drop.commits.len(), 1, "{:?}", drop.commits);
+        assert_eq!(drop.commits[0].sha, victim);
+        assert_eq!(drop.commits[0].subject, "V the victim");
+        assert_eq!(drop.commits[0].author, "T");
+        assert!(
+            drop.commits[0].author_date.starts_with("20"),
+            "the ISO author date must be populated: {:?}",
+            drop.commits[0].author_date
+        );
+
+        // The guard fetched (that is how it learned of the rewrite) and then
+        // touched nothing else.
+        assert_eq!(head_of(&clone_s, "refs/remotes/origin/main").await, rewritten);
+        assert_eq!(head_of(&clone_s, "HEAD").await, victim);
+        assert_eq!(subjects(&clone_s).await.first().unwrap(), "V the victim");
+        assert!(
+            run(&clone_s, &["status", "--porcelain"]).await.trim().is_empty(),
+            "the working tree is untouched"
+        );
+        assert!(run(&clone_s, &["stash", "list"]).await.trim().is_empty());
+        assert!(!crate::git::ops::op_state(&clone_s).await.unwrap().rebasing);
+    }
+
+    /// A rewrite can take more than one commit with it, and the decision UI lists
+    /// them — newest first, the order `git log` walks the range in.
+    #[tokio::test]
+    async fn a_rebase_pull_names_every_commit_a_rewrite_would_take() {
+        let (_guard, base, _origin_s, url) = seeded_origin("multi-drop").await;
+        let base_s = base.to_string_lossy().into_owned();
+        let work = base.join("work");
+        let work_s = work.to_string_lossy().into_owned();
+        run(&base_s, &["-c", "core.autocrlf=false", "clone", "-q", &url, "clone"]).await;
+        let clone = base.join("clone");
+        let clone_s = clone.to_string_lossy().into_owned();
+        run(&clone_s, &["config", "core.autocrlf", "false"]).await;
+        run(&clone_s, &["config", "user.email", "t@t.local"]).await;
+        run(&clone_s, &["config", "user.name", "T"]).await;
+
+        // Two commits, both PUSHED — so both sit in the tracking ref's reflog.
+        for (file, subject) in [("v1.txt", "V1 the first"), ("v2.txt", "V2 the second")] {
+            std::fs::write(clone.join(file), "v\n").unwrap();
+            run(&clone_s, &["add", "-A"]).await;
+            run(&clone_s, &["commit", "-qm", subject]).await;
+        }
+        run(&clone_s, &["push", "-q"]).await;
+        let v1 = head_of(&clone_s, "HEAD~1").await;
+        let v2 = head_of(&clone_s, "HEAD").await;
+
+        run(&work_s, &["fetch", "-q"]).await;
+        run(&work_s, &["reset", "-q", "--hard", "origin/main~2"]).await;
+        std::fs::write(work.join("r.txt"), "r\n").unwrap();
+        run(&work_s, &["add", "-A"]).await;
+        run(&work_s, &["commit", "-qm", "teammate rewrite"]).await;
+        run(&work_s, &["push", "-q", "--force"]).await;
+
+        let state = AppState::default();
+        let err = git_pull_core(&state, clone_s.clone(), "rebase".into())
+            .await
+            .expect_err("two doomed commits must refuse just as one does");
+        let AppError::PullRebaseWouldDrop(drop) = &err else {
+            panic!("expected a would-drop refusal, got {err:?}");
+        };
+        assert_eq!(drop.commits.len(), 2, "{:?}", drop.commits);
+        assert_eq!(
+            drop.commits.iter().map(|c| c.sha.as_str()).collect::<Vec<_>>(),
+            vec![v2.as_str(), v1.as_str()],
+            "newest first"
+        );
+        assert_eq!(drop.commits[0].subject, "V2 the second");
+        assert_eq!(drop.commits[1].subject, "V1 the first");
+        assert!(
+            drop.message.contains("2 commits"),
+            "the summary counts them: {}",
+            drop.message
+        );
+        assert_eq!(head_of(&clone_s, "HEAD").await, v2, "nothing was touched");
+    }
+
+    /// A tree left mid-merge has a CLEAN index (`git merge --no-commit` stages
+    /// without conflicting), so only the in-progress probe catches it. The guard
+    /// stands down and git's own refusal — which names the unfinished merge —
+    /// reaches the user, instead of `rebase --onto`'s "you have unstaged changes",
+    /// which the frontend would offer to stash-recover over a live merge.
+    #[tokio::test]
+    async fn a_rebase_pull_mid_merge_stands_down_to_bare_pull() {
+        let (_guard, clone_s, victim, _rewritten) = vaporize_clone("mid-op").await;
+        run(&clone_s, &["switch", "-q", "-c", "side", "HEAD~1"]).await;
+        std::fs::write(std::path::Path::new(&clone_s).join("s.txt"), "s\n").unwrap();
+        run(&clone_s, &["add", "-A"]).await;
+        run(&clone_s, &["commit", "-qm", "side"]).await;
+        run(&clone_s, &["switch", "-q", "main"]).await;
+        run(&clone_s, &["merge", "--no-commit", "--no-ff", "side"]).await;
+        assert!(
+            run(&clone_s, &["ls-files", "--unmerged"]).await.trim().is_empty(),
+            "the fixture's merge must be paused with a CLEAN index"
+        );
+        assert!(crate::git::ops::op_state(&clone_s).await.unwrap().merging);
+
+        let state = AppState::default();
+        let err = git_pull_core(&state, clone_s.clone(), "rebase".into())
+            .await
+            .expect_err("git refuses to pull over an unfinished merge");
+        let AppError::Git { stderr, .. } = &err else {
+            panic!("expected git's own error, got {err:?}");
+        };
+        assert!(
+            stderr.contains("MERGE_HEAD exists"),
+            "bare pull's own refusal must survive: {stderr}"
+        );
+        assert!(
+            !crate::git::ops::op_state(&clone_s).await.unwrap().rebasing,
+            "and no rebase was started over the paused merge"
+        );
+        assert_eq!(head_of(&clone_s, "HEAD").await, victim);
+    }
+
+    /// A detached HEAD has no upstream to compare against, so the guard stands
+    /// down and git says so in its own words.
+    #[tokio::test]
+    async fn a_rebase_pull_on_a_detached_head_stands_down_to_bare_pull() {
+        let (_guard, clone_s, victim, _rewritten) = vaporize_clone("detached").await;
+        run(&clone_s, &["switch", "-q", "--detach"]).await;
+
+        let state = AppState::default();
+        let err = git_pull_core(&state, clone_s.clone(), "rebase".into())
+            .await
+            .expect_err("git refuses a pull with no branch to rebase");
+        let AppError::Git { stderr, .. } = &err else {
+            panic!("expected git's own error, got {err:?}");
+        };
+        assert!(
+            stderr.to_lowercase().contains("not currently on a branch"),
+            "bare pull's own refusal must survive: {stderr}"
+        );
+        assert_eq!(head_of(&clone_s, "HEAD").await, victim);
+    }
+
+    /// A branch tracking another LOCAL branch has no remote to fetch from, so the
+    /// guard runs its verdict and skips phase A's fetch. The repo has no remote at
+    /// all, which is what makes a skipped fetch provable: any attempt would fail.
+    #[tokio::test]
+    async fn a_rebase_pull_tracking_a_local_branch_never_fetches() {
+        let (_base, base) = temp_base("local-upstream");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        init_repo(&repo_s, "a.txt").await;
+        run(&repo_s, &["branch", "-M", "main"]).await;
+        run(&repo_s, &["switch", "-q", "-c", "dev"]).await;
+        std::fs::write(repo.join("dev.txt"), "dev\n").unwrap();
+        run(&repo_s, &["add", "-A"]).await;
+        run(&repo_s, &["commit", "-qm", "dev work"]).await;
+        run(&repo_s, &["switch", "-q", "main"]).await;
+        run(&repo_s, &["branch", "--set-upstream-to=dev", "main"]).await;
+        assert!(
+            run(&repo_s, &["remote"]).await.trim().is_empty(),
+            "no remote exists, so a fetch could only fail"
+        );
+
+        let state = AppState::default();
+        git_pull_core(&state, repo_s.clone(), "rebase".into())
+            .await
+            .expect("a local-branch upstream pulls without any network step");
+        assert_eq!(
+            head_of(&repo_s, "refs/heads/main").await,
+            head_of(&repo_s, "refs/heads/dev").await,
+            "main fast-forwarded onto its local upstream"
+        );
+    }
+
+    /// Fork-point's protective face, which is why this is a question and not a
+    /// silent policy: the upstream deliberately amended its OWN commit, so
+    /// replaying the local copy would duplicate it. The guard still asks — the
+    /// user is the one who knows which happened.
+    #[tokio::test]
+    async fn a_rebase_pull_reports_a_deliberate_upstream_amend() {
+        let (_guard, base, _origin_s, url) = seeded_origin("amend").await;
+        let base_s = base.to_string_lossy().into_owned();
+        let work = base.join("work");
+        let work_s = work.to_string_lossy().into_owned();
+
+        // X lands upstream first, so the clone starts with it.
+        std::fs::write(work.join("x.txt"), "x\n").unwrap();
+        run(&work_s, &["add", "-A"]).await;
+        run(&work_s, &["commit", "-qm", "X the amended"]).await;
+        run(&work_s, &["push", "-q"]).await;
+        run(&base_s, &["-c", "core.autocrlf=false", "clone", "-q", &url, "clone"]).await;
+        let clone = base.join("clone");
+        let clone_s = clone.to_string_lossy().into_owned();
+        run(&clone_s, &["config", "core.autocrlf", "false"]).await;
+        run(&clone_s, &["config", "user.email", "t@t.local"]).await;
+        run(&clone_s, &["config", "user.name", "T"]).await;
+        let old_x = head_of(&clone_s, "HEAD").await;
+
+        // A local, unpushed commit on top of X.
+        std::fs::write(clone.join("v.txt"), "v\n").unwrap();
+        run(&clone_s, &["add", "-A"]).await;
+        run(&clone_s, &["commit", "-qm", "my local work"]).await;
+
+        // Upstream amends X and force-pushes.
+        std::fs::write(work.join("x.txt"), "x amended\n").unwrap();
+        run(&work_s, &["commit", "-q", "--amend", "-am", "X the amended"]).await;
+        run(&work_s, &["push", "-q", "--force"]).await;
+
+        let state = AppState::default();
+        let err = git_pull_core(&state, clone_s.clone(), "rebase".into())
+            .await
+            .expect_err("an upstream rewrite is always the user's call");
+        let AppError::PullRebaseWouldDrop(drop) = &err else {
+            panic!("expected a would-drop refusal, got {err:?}");
+        };
+        assert_eq!(drop.commits.len(), 1, "{:?}", drop.commits);
+        assert_eq!(
+            drop.commits[0].sha, old_x,
+            "the stale copy of X is what would go"
+        );
+        assert_eq!(drop.commits[0].subject, "X the amended");
+    }
+
+    /// The case that must stay promptless: with nothing being rewritten away, a
+    /// guarded pull has to land in the same state bare `git pull --rebase` did —
+    /// both when the branch is merely behind and when it has diverged.
+    #[tokio::test]
+    async fn a_rebase_pull_with_nothing_to_drop_matches_bare_pull() {
+        for diverged in [false, true] {
+            let tag = if diverged { "same-diverged" } else { "same-behind" };
+            let (_guard, base, _origin_s, url) = seeded_origin(tag).await;
+            let base_s = base.to_string_lossy().into_owned();
+            let work = base.join("work");
+            let work_s = work.to_string_lossy().into_owned();
+
+            let mut clones = Vec::new();
+            for name in ["guarded", "bare"] {
+                run(&base_s, &["-c", "core.autocrlf=false", "clone", "-q", &url, name]).await;
+                let c = base.join(name).to_string_lossy().into_owned();
+                run(&c, &["config", "core.autocrlf", "false"]).await;
+                run(&c, &["config", "user.email", "t@t.local"]).await;
+                run(&c, &["config", "user.name", "T"]).await;
+                if diverged {
+                    // A different file from upstream's, so the replay is clean.
+                    std::fs::write(base.join(name).join("mine.txt"), "mine\n").unwrap();
+                    run(&c, &["add", "-A"]).await;
+                    run(&c, &["commit", "-qm", "my local work"]).await;
+                }
+                clones.push(c);
+            }
+
+            // Ordinary upstream progress — no rewrite anywhere.
+            std::fs::write(work.join("a.txt"), "upstream\n").unwrap();
+            run(&work_s, &["commit", "-qam", "upstream moves on"]).await;
+            run(&work_s, &["push", "-q"]).await;
+
+            let state = AppState::default();
+            git_pull_core(&state, clones[0].clone(), "rebase".into())
+                .await
+                .expect("a pull with nothing to drop must not prompt");
+            run(&clones[1], &["pull", "--rebase", "-q"]).await;
+
+            assert_eq!(
+                subjects(&clones[0]).await,
+                subjects(&clones[1]).await,
+                "diverged={diverged}: the guarded pull's history must match bare pull's"
+            );
+            assert_eq!(
+                run(&clones[0], &["ls-files"]).await,
+                run(&clones[1], &["ls-files"]).await,
+                "diverged={diverged}: and so must the tree"
+            );
+            if !diverged {
+                assert_eq!(
+                    head_of(&clones[0], "HEAD").await,
+                    head_of(&clones[0], "refs/remotes/origin/main").await,
+                    "a behind-only pull still fast-forwards onto the upstream tip"
+                );
+            }
+        }
+    }
+
+    /// No upstream to compare against is no fork-point question, so the guard
+    /// stands down and git's own tracking-information error reaches the user
+    /// unchanged.
+    #[tokio::test]
+    async fn a_rebase_pull_without_an_upstream_falls_back_to_bare_pull() {
+        let (_guard, clone_s, _victim, _rewritten) = vaporize_clone("no-upstream").await;
+        run(&clone_s, &["switch", "-q", "-c", "untracked-branch"]).await;
+
+        let state = AppState::default();
+        let err = git_pull_core(&state, clone_s.clone(), "rebase".into())
+            .await
+            .expect_err("git refuses a pull with nothing to pull from");
+        let AppError::Git { stderr, .. } = &err else {
+            panic!("expected git's own error, got {err:?}");
+        };
+        assert!(
+            stderr.to_lowercase().contains("no tracking information"),
+            "bare pull's own refusal must survive: {stderr}"
+        );
+    }
+
+    /// An upstream branch deleted on the forge. Without a pruning fetch the stale
+    /// tracking ref survives, every rev in the probe resolves against it, and the
+    /// rebase onto that stale tip succeeds — reporting a pull that bare git
+    /// refuses outright. The prune is what turns this back into git's own error.
+    #[tokio::test]
+    async fn a_rebase_pull_whose_upstream_branch_was_deleted_falls_back_to_bare_pull() {
+        let (_guard, base, origin_s, url) = seeded_origin("upstream-deleted").await;
+        let base_s = base.to_string_lossy().into_owned();
+        run(&base_s, &["-c", "core.autocrlf=false", "clone", "-q", &url, "clone"]).await;
+        let clone = base.join("clone");
+        let clone_s = clone.to_string_lossy().into_owned();
+        run(&clone_s, &["config", "core.autocrlf", "false"]).await;
+        run(&clone_s, &["config", "user.email", "t@t.local"]).await;
+        run(&clone_s, &["config", "user.name", "T"]).await;
+
+        // The branch goes away on the remote, as a merged-and-deleted PR head does.
+        run(&origin_s, &["update-ref", "-d", "refs/heads/main"]).await;
+        assert!(
+            !head_of(&clone_s, "refs/remotes/origin/main").await.is_empty(),
+            "the clone still holds a tracking ref, which is what makes this silent"
+        );
+
+        let state = AppState::default();
+        let err = git_pull_core(&state, clone_s.clone(), "rebase".into())
+            .await
+            .expect_err("a branch that no longer exists upstream cannot be pulled");
+        let AppError::Git { stderr, .. } = &err else {
+            panic!("expected git's own error, got {err:?}");
+        };
+        assert!(
+            stderr.contains("no such ref was fetched"),
+            "bare pull's own refusal must reach the user: {stderr}"
+        );
+        assert!(
+            run_git(
+                Some(&clone_s),
+                &["rev-parse", "--verify", "refs/remotes/origin/main"],
+                DEFAULT_TIMEOUT,
+            )
+            .await
+            .is_err(),
+            "and the guard's fetch pruned the stale tracking ref on its way out"
+        );
+    }
+
+    /// git's refusal wording for a dirty-tree rebase, which `isDirtyTreeRefusal`
+    /// (src/lib/error-summary.ts) matches to offer the stash-and-retry recovery.
+    /// The explicit rebase says "cannot rebase" where bare pull said "cannot pull
+    /// with rebase" — both are in that list, and this is what keeps them there.
+    /// Twin of `refusal_stderr_still_matches_the_frontend_markers` (autostash.rs).
+    const REBASE_UNSTAGED: &str = "cannot rebase: you have unstaged changes";
+    const REBASE_STAGED: &str = "cannot rebase: your index contains uncommitted changes";
+
+    /// A clone one commit behind its upstream, with a dirty TRACKED file the
+    /// upstream's commit does not touch. Non-overlapping on purpose: rebase
+    /// refuses on any dirty tracked file, so the refusal arm still fires, while an
+    /// autostash arm can reapply cleanly instead of conflicting on the same lines.
+    /// Returns the guard and the clone's path.
+    async fn behind_clone_with_dirty_tree(tag: &str) -> (tempfile::TempDir, String) {
+        let (guard, base, _origin_s, url) = seeded_origin(tag).await;
+        let base_s = base.to_string_lossy().into_owned();
+        let work = base.join("work");
+        let work_s = work.to_string_lossy().into_owned();
+
+        // A second tracked file, published BEFORE the clone so the clone has one
+        // to dirty that the upstream commit below leaves alone.
+        std::fs::write(work.join("b.txt"), "b\n").unwrap();
+        run(&work_s, &["add", "-A"]).await;
+        run(&work_s, &["commit", "-qm", "add b"]).await;
+        run(&work_s, &["push", "-q"]).await;
+
+        run(&base_s, &["-c", "core.autocrlf=false", "clone", "-q", &url, "clone"]).await;
+        let clone = base.join("clone");
+        let clone_s = clone.to_string_lossy().into_owned();
+        run(&clone_s, &["config", "core.autocrlf", "false"]).await;
+        run(&clone_s, &["config", "user.email", "t@t.local"]).await;
+        run(&clone_s, &["config", "user.name", "T"]).await;
+
+        std::fs::write(work.join("a.txt"), "upstream\n").unwrap();
+        run(&work_s, &["commit", "-qam", "upstream moves on"]).await;
+        run(&work_s, &["push", "-q"]).await;
+
+        std::fs::write(clone.join("b.txt"), "dirty\n").unwrap();
+        (guard, clone_s)
+    }
+
+    #[tokio::test]
+    async fn a_guarded_rebase_pull_still_refuses_a_dirty_tree_recoverably() {
+        let (_guard, clone_s) = behind_clone_with_dirty_tree("dirty-refusal").await;
+        // Both autostash keys off, pinned locally so the machine's own git config
+        // can't decide this test's outcome. `pull.autoStash` stays unset, which is
+        // the arm that passes NO flag and lets `rebase.autoStash` govern.
+        run(&clone_s, &["config", "rebase.autoStash", "false"]).await;
+
+        let state = AppState::default();
+        for (stage, marker) in [(false, REBASE_UNSTAGED), (true, REBASE_STAGED)] {
+            if stage {
+                run(&clone_s, &["add", "b.txt"]).await;
+            }
+            let err = git_pull_core(&state, clone_s.clone(), "rebase".into())
+                .await
+                .expect_err("git must not clobber uncommitted work");
+            let AppError::Git { stderr, .. } = &err else {
+                panic!("expected a plain git error, got {err:?}");
+            };
+            assert!(
+                stderr.to_lowercase().contains(marker),
+                "git no longer emits {marker:?} — the frontend's stash-and-retry recovery is \
+                 now blind to this refusal. Actual stderr:\n{stderr}"
+            );
+        }
+    }
+
+    /// Bare `git pull --rebase` honors `pull.autoStash`, and falls back to
+    /// `rebase.autoStash` when it is unset. The guarded pull replaced that one
+    /// command with a fetch plus a rebase, so it has to translate the first key
+    /// (a bare rebase ignores it) and stay out of the way of the second.
+    #[tokio::test]
+    async fn a_guarded_rebase_pull_honors_the_autostash_config() {
+        for (tag, key) in [("autostash-pull", "pull.autoStash"), ("autostash-rebase", "rebase.autoStash")] {
+            let (_guard, clone_s) = behind_clone_with_dirty_tree(tag).await;
+            run(&clone_s, &["config", key, "true"]).await;
+
+            let state = AppState::default();
+            git_pull_core(&state, clone_s.clone(), "rebase".into())
+                .await
+                .unwrap_or_else(|e| panic!("{key}=true must let the pull through: {e}"));
+
+            assert_eq!(
+                head_of(&clone_s, "HEAD").await,
+                head_of(&clone_s, "refs/remotes/origin/main").await,
+                "{key}: the pull landed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(std::path::Path::new(&clone_s).join("b.txt")).unwrap(),
+                "dirty\n",
+                "{key}: and git put the uncommitted change back"
+            );
+            assert_eq!(
+                std::fs::read_to_string(std::path::Path::new(&clone_s).join("a.txt")).unwrap(),
+                "upstream\n",
+                "{key}: with the upstream's own change applied under it"
+            );
+            assert!(
+                run(&clone_s, &["stash", "list"]).await.trim().is_empty(),
+                "{key}: the autostash entry is not left behind"
+            );
+        }
+    }
+
+    /// A merge-mode pull runs its own `git merge` rather than `git pull`, so it has
+    /// to spell pull's own merge subject — the line the user reads in their history,
+    /// and the one place git's URL rendering (a stripped trailing `.git`, anonymized
+    /// credentials) and its `into <branch>` rule show through. Compared against a
+    /// real bare pull in a twin clone, so no wording is asserted from memory.
+    #[tokio::test]
+    async fn a_merge_mode_pull_writes_bare_pulls_merge_subject() {
+        let (_guard, base, _origin_s, url) = seeded_origin("merge-subject").await;
+        let base_s = base.to_string_lossy().into_owned();
+        let work = base.join("work");
+        let work_s = work.to_string_lossy().into_owned();
+
+        let mut clones = Vec::new();
+        for name in ["guarded", "bare"] {
+            run(&base_s, &["-c", "core.autocrlf=false", "clone", "-q", &url, name]).await;
+            let c = base.join(name).to_string_lossy().into_owned();
+            run(&c, &["config", "core.autocrlf", "false"]).await;
+            run(&c, &["config", "user.email", "t@t.local"]).await;
+            run(&c, &["config", "user.name", "T"]).await;
+            // A local commit on a file upstream never touches: the branch has to have
+            // DIVERGED, since a fast-forward writes no merge commit to compare.
+            std::fs::write(base.join(name).join("mine.txt"), "mine\n").unwrap();
+            run(&c, &["add", "-A"]).await;
+            run(&c, &["commit", "-qm", "my local work"]).await;
+            clones.push(c);
+        }
+
+        std::fs::write(work.join("a.txt"), "upstream\n").unwrap();
+        run(&work_s, &["commit", "-qam", "upstream moves on"]).await;
+        run(&work_s, &["push", "-q"]).await;
+
+        let state = AppState::default();
+        git_pull_core(&state, clones[0].clone(), "merge".into())
+            .await
+            .expect("a non-overlapping divergence merges cleanly");
+        run(&clones[1], &["pull", "--no-rebase", "-q"]).await;
+
+        let ours = subjects(&clones[0]).await.first().cloned().unwrap();
+        let theirs = subjects(&clones[1]).await.first().cloned().unwrap();
+        assert_eq!(ours, theirs, "the merge subject must be pull's own");
+        assert!(
+            ours.starts_with("Merge branch 'main' of "),
+            "and it names the upstream branch it merged: {ours}"
+        );
+    }
+
+    // --- Pure arg-building for a named-branch push. ---
+
+    #[test]
+    fn push_untracked_publishes_with_upstream() {
+        // Empty upstream → first-time publish + track.
+        assert_eq!(
+            build_push_args("feature", "", "", false, false, false, None, None),
+            vec!["push", "-u", "origin", "refs/heads/feature:refs/heads/feature"]
+        );
+    }
+
+    #[test]
+    fn push_gone_upstream_publishes_with_upstream() {
+        // A deleted upstream ref (still named by %(upstream:short)) republishes.
+        assert_eq!(
+            build_push_args("feature", "origin/feature", "origin", true, false, false, None, None),
+            vec!["push", "-u", "origin", "refs/heads/feature:refs/heads/feature"]
+        );
+    }
+
+    #[test]
+    fn push_tracked_same_name_plain_push() {
+        assert_eq!(
+            build_push_args("feature", "origin/feature", "origin", false, false, false, None, None),
+            vec!["push", "origin", "refs/heads/feature:refs/heads/feature"]
+        );
+    }
+
+    #[test]
+    fn push_tracked_different_name_uses_refspec() {
+        // Local `feature` tracks `origin/feat` → explicit refspec so we advance
+        // the right remote ref, not `origin/feature`.
+        assert_eq!(
+            build_push_args("feature", "origin/feat", "origin", false, false, false, None, None),
+            vec!["push", "origin", "refs/heads/feature:refs/heads/feat"]
+        );
+    }
+
+    #[test]
+    fn push_tracked_non_origin_default_targets_own_remote() {
+        // No requested remote + a branch tracking a fork's `upstream/main` targets
+        // its OWN remote: T == remotename → the refspec-to-`up` arm.
+        assert_eq!(
+            build_push_args("main", "upstream/main", "upstream", false, false, false, None, None),
+            vec!["push", "upstream", "refs/heads/main:refs/heads/main"]
+        );
+    }
+
+    #[test]
+    fn push_requested_remote_matches_tracked_remote() {
+        // Explicitly requesting the branch's OWN tracked remote is the same arm:
+        // T == remotename → advance the tracked remote-branch name explicitly.
+        assert_eq!(
+            build_push_args("feature", "origin/feat", "origin", false, false, false, Some("origin"), None),
+            vec!["push", "origin", "refs/heads/feature:refs/heads/feat"]
+        );
+    }
+
+    #[test]
+    fn push_requested_remote_differs_from_tracked_remote() {
+        // A tracked-on-origin branch pushed explicitly to `upstream` → a copy under
+        // the LOCAL name, no `-u`, upstream config untouched.
+        assert_eq!(
+            build_push_args("feature", "origin/feat", "origin", false, false, false, Some("upstream"), None),
+            vec!["push", "upstream", "refs/heads/feature:refs/heads/feature"]
+        );
+    }
+
+    #[test]
+    fn push_requested_remote_on_untracked_publish() {
+        // Publishing an untracked branch to a chosen remote: `-u <remote>` under
+        // the local name.
+        assert_eq!(
+            build_push_args("feature", "", "", false, false, false, Some("fork"), None),
+            vec!["push", "-u", "fork", "refs/heads/feature:refs/heads/feature"]
+        );
+    }
+
+    #[test]
+    fn push_set_upstream_forces_upstream_form_even_when_tracked() {
+        // An explicit set_upstream request retracks even a tracked branch.
+        assert_eq!(
+            build_push_args("feature", "origin/feature", "origin", false, true, false, None, None),
+            vec!["push", "-u", "origin", "refs/heads/feature:refs/heads/feature"]
+        );
+    }
+
+    #[test]
+    fn push_force_flag_precedes_refspec_args() {
+        // The force pair sits right after `push`, before the refspec.
+        assert_eq!(
+            build_push_args("feature", "origin/feat", "origin", false, false, true, None, None),
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-if-includes",
+                "origin",
+                "refs/heads/feature:refs/heads/feat"
+            ]
+        );
+        assert_eq!(
+            build_push_args("feature", "", "", false, false, true, None, None),
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-if-includes",
+                "-u",
+                "origin",
+                "refs/heads/feature:refs/heads/feature"
+            ]
+        );
+    }
+
+    #[test]
+    fn push_force_flag_precedes_refspec_on_requested_remote() {
+        // Force + a requested non-tracked remote: the force pair still sits right
+        // after `push`, then the bare remote, then the fully-qualified refspec.
+        assert_eq!(
+            build_push_args("feature", "origin/feat", "origin", false, false, true, Some("upstream"), None),
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-if-includes",
+                "upstream",
+                "refs/heads/feature:refs/heads/feature"
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_push_option_matches_gits_phrasings_only() {
+        assert!(is_unknown_push_option("error: unknown option `force-if-includes'"));
+        assert!(is_unknown_push_option(
+            "fatal: unknown switch `force-if-includes'"
+        ));
+        assert!(is_unknown_push_option(
+            "usage: git push [<options>] [<repository> [<refspec>...]]"
+        ));
+        // A real rejection must NOT trigger the pre-2.30 retry.
+        assert!(!is_unknown_push_option(
+            " ! [rejected]        feature -> feature (stale info)\nerror: failed to push some refs to 'C:/temp/remote.git'"
+        ));
+    }
+
+    #[test]
+    fn strip_removes_only_the_if_includes_flag() {
+        assert_eq!(
+            without_force_if_includes(&[
+                "push",
+                "--force-with-lease",
+                "--force-if-includes",
+                "-u",
+                "origin",
+                "refs/heads/feature:refs/heads/feature",
+            ]),
+            vec![
+                "push",
+                "--force-with-lease",
+                "-u",
+                "origin",
+                "refs/heads/feature:refs/heads/feature"
+            ]
+        );
+        // Nothing to strip: the argv survives untouched.
+        assert_eq!(
+            without_force_if_includes(&["push", "-u", "origin", "HEAD"]),
+            vec!["push", "-u", "origin", "HEAD"]
+        );
+    }
+
+    /// Set up a bare origin seeded with one commit on `main`, and return the temp
+    /// guard, the base dir, and the origin's path plus its `file://` URL.
+    async fn seeded_origin(tag: &str) -> (tempfile::TempDir, std::path::PathBuf, String, String) {
+        let (guard, base) = temp_base(tag);
+        let origin = base.join("origin.git");
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let base_s = base.to_string_lossy().into_owned();
+        let work_s = work.to_string_lossy().into_owned();
+        let url = format!("file://{}", origin.to_string_lossy().replace('\\', "/"));
+
+        run(&base_s, &["init", "-q", "--bare", "-b", "main", "origin.git"]).await;
+        init_repo(&work_s, "a.txt").await;
+        run(&work_s, &["branch", "-M", "main"]).await;
+        run(&work_s, &["remote", "add", "origin", &url]).await;
+        run(&work_s, &["push", "-q", "-u", "origin", "main"]).await;
+        (guard, base, origin.to_string_lossy().into_owned(), url)
+    }
+
+    /// git's per-ref reason when `--force-with-lease` finds the remote-tracking ref
+    /// behind the real remote — verbatim from `! [rejected] … (…)`. The prod-side
+    /// twin is [`IF_INCLUDES_REJECTION`]; this one only ever appears in git's report.
+    const STALE_LEASE_REJECTION: &str = "stale info";
+
+    /// Assert git's failure report still carries a `! [rejected] … (<reason>)` line
+    /// — the exact shape `PUSH_REJECTION_SUMMARIES` (src/lib/error-summary.ts)
+    /// anchors on to turn a blocked force push into one human line. Keep the two
+    /// lists in step: a reason git renames goes back to raw stderr in the toast.
+    fn assert_rejection_reason(report: &str, reason: &str) {
+        let marked = format!("({reason})");
+        assert!(
+            report
+                .lines()
+                .any(|l| l.trim_start().starts_with("! [rejected]") && l.contains(&marked)),
+            "git no longer emits `! [rejected] … {marked}` — the frontend summary is now blind \
+             to this rejection. Actual report:\n{report}"
+        );
+    }
+
+    /// The bare lease's own refusal, driven end to end: with the remote moved and
+    /// never fetched, the remote-tracking ref is stale and git rejects before
+    /// `--force-if-includes` has anything to say. Canary for the frontend's
+    /// `(stale info)` marker — the counterpart of
+    /// `refusal_stderr_still_matches_the_frontend_markers` (autostash.rs).
+    #[tokio::test]
+    async fn force_push_rejection_stderr_still_matches_the_frontend_markers() {
+        let (_guard, base, origin_s, url) = seeded_origin("stale-info").await;
+        let base_s = base.to_string_lossy().into_owned();
+
+        for name in ["clone1", "clone2"] {
+            run(&base_s, &["-c", "core.autocrlf=false", "clone", "-q", &url, name]).await;
+            let c = base.join(name).to_string_lossy().into_owned();
+            run(&c, &["config", "core.autocrlf", "false"]).await;
+            run(&c, &["config", "user.email", "t@t.local"]).await;
+            run(&c, &["config", "user.name", "T"]).await;
+        }
+        let clone1 = base.join("clone1");
+        let clone2 = base.join("clone2");
+        let clone1_s = clone1.to_string_lossy().into_owned();
+        let clone2_s = clone2.to_string_lossy().into_owned();
+
+        // clone2 moves the shared branch; clone1 never learns of it, so its
+        // remote-tracking ref — the lease's expectation — is stale.
+        std::fs::write(clone2.join("b.txt"), "theirs\n").unwrap();
+        run(&clone2_s, &["add", "-A"]).await;
+        run(&clone2_s, &["commit", "-qm", "from clone2"]).await;
+        run(&clone2_s, &["push", "-q"]).await;
+        let theirs = run(&clone2_s, &["rev-parse", "HEAD"]).await.trim().to_string();
+
+        std::fs::write(clone1.join("c.txt"), "mine\n").unwrap();
+        run(&clone1_s, &["add", "-A"]).await;
+        run(&clone1_s, &["commit", "-q", "--amend", "-m", "amended seed"]).await;
+
+        let state = AppState::default();
+        let err = git_push_core(&state, clone1_s.clone(), false, true, None, None, None)
+            .await
+            .expect_err("a stale lease must not clobber the remote");
+        let AppError::Git { stderr, .. } = &err else {
+            panic!("expected a git error, got {err:?}")
+        };
+        assert_rejection_reason(stderr, STALE_LEASE_REJECTION);
+        assert_eq!(
+            run(&origin_s, &["rev-parse", "refs/heads/main"]).await.trim(),
+            theirs,
+            "clone2's commit is still origin's tip"
+        );
+    }
+
+    /// A push GitHub's secret push protection refused, from a real GH013
+    /// rejection measured on this machine (github.com over HTTPS, 2026-08-11).
+    /// The flagged secret's own value never appears in the block, and the
+    /// unblock id is a placeholder here; two purely informational `(?)` notes
+    /// GitHub prints between the violation list and the locations are trimmed.
+    /// GitHub pads every one of these lines with trailing spaces, dropped here
+    /// because an editor would strip them back out anyway — which is the reason
+    /// the frontend markers, and `has_remote_bullet` below, never end-anchor.
+    const PUSH_PROTECTION_STDERR: &str = "\
+remote: error: GH013: Repository rule violations found for refs/heads/feat/security-findings-phase-3.
+remote:
+remote: - GITHUB PUSH PROTECTION
+remote:   —————————————————————————————————————————
+remote:     Resolve the following violations before pushing again
+remote:
+remote:     - Push cannot contain secrets
+remote:
+remote:
+remote:       —— GitLab Access Token ———————————————————————————————
+remote:        locations:
+remote:          - commit: 64a012e497764a53e38949a968553daa2d8f51a3
+remote:            path: src-tauri/src/forge/gitlab_findings.rs:1151
+remote:
+remote:        (?) To push, remove secret from commit(s) or follow this URL to allow the secret.
+remote:        https://github.com/theBGuy/GitDesktop/security/secret-scanning/unblock-secret/<id>
+remote:
+remote:
+To https://github.com/theBGuy/GitDesktop.git
+ ! [remote rejected] feat/security-findings-phase-3 -> feat/security-findings-phase-3 (push declined due to repository rule violations)
+error: failed to push some refs to 'https://github.com/theBGuy/GitDesktop.git'
+";
+
+    /// A branch simply behind its remote: the negative control for the block
+    /// above. It shares the `failed to push some refs` tail, so anything the
+    /// frontend anchors on has to come from the push-protection block itself.
+    const NON_FAST_FORWARD_STDERR: &str = "\
+To https://github.com/theBGuy/GitDesktop.git
+ ! [rejected]        main -> main (non-fast-forward)
+error: failed to push some refs to 'https://github.com/theBGuy/GitDesktop.git'
+hint: Updates were rejected because the tip of your current branch is behind
+";
+
+    /// Whether `report` carries a `remote:` bullet whose text opens with
+    /// `label`, matching `PUSH_PROTECTION_MARKERS` (src/lib/error-summary.ts)
+    /// exactly: space/tab indent only, the `remote:` prefix, the `-` bullet,
+    /// the label at a word boundary — and no end anchor, since git pads the
+    /// line. Looser matching here would let the canary pass stderr the
+    /// frontend rejects, which is the one direction it must not be loose in.
+    fn has_remote_bullet(report: &str, label: &str) -> bool {
+        fn eat(s: &str) -> &str {
+            s.trim_start_matches([' ', '\t'])
+        }
+        report.lines().any(|l| {
+            eat(l)
+                .strip_prefix("remote:")
+                .and_then(|r| eat(r).strip_prefix('-'))
+                .and_then(|r| eat(r).strip_prefix(label))
+                .is_some_and(|rest| {
+                    !rest
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                })
+        })
+    }
+
+    /// Canary for the frontend's push-protection markers: `pushProtectionSummary`
+    /// (src/lib/error-summary.ts) can only turn a blocked push into one human
+    /// line while GitHub still prints these two bullets, so the measured stderr
+    /// and the marker shapes are pinned together here. `GH013` is asserted apart
+    /// from them on purpose — it heads every repository rule violation, not just
+    /// secrets, so the frontend must never classify on it alone.
+    #[test]
+    fn push_protection_stderr_still_matches_the_frontend_markers() {
+        for label in ["GITHUB PUSH PROTECTION", "Push cannot contain secrets"] {
+            assert!(
+                has_remote_bullet(PUSH_PROTECTION_STDERR, label),
+                "the `{label}` bullet is gone — the frontend summary is now blind to a \
+                 blocked push. Actual stderr:\n{PUSH_PROTECTION_STDERR}"
+            );
+            assert!(
+                !has_remote_bullet(NON_FAST_FORWARD_STDERR, label),
+                "`{label}` matched a plain non-fast-forward rejection, which must keep its \
+                 own presentation"
+            );
+        }
+        assert!(
+            !has_remote_bullet(
+                "remote: - GITHUB PUSH PROTECTIONAL",
+                "GITHUB PUSH PROTECTION"
+            ),
+            "the label matched past its word boundary — the frontend's \\b would refuse \
+             this line, so the canary must too"
+        );
+        assert!(
+            PUSH_PROTECTION_STDERR
+                .lines()
+                .any(|l| l.trim_start().starts_with("remote: error: GH013:")),
+            "the fixture no longer carries the GH013 code it was measured from"
+        );
+    }
+
+    /// git asked for a username with prompting disabled and nothing in the
+    /// credential helper — measured against github.com on git 2.51.1.windows.1,
+    /// 2026-09.
+    const NO_CREDENTIALS_STDERR: &str = "\
+fatal: could not read Username for 'https://github.com': terminal prompts disabled
+";
+
+    /// Credentials github.com refused, same provenance. The sideband line names
+    /// the cause; the `fatal:` line is the one the frontend anchors on.
+    const REJECTED_CREDENTIALS_STDERR: &str = "\
+remote: Invalid username or token. Password authentication is not supported for Git operations.
+fatal: Authentication failed for 'https://github.com/octocat/Hello-World.git/'
+";
+
+    /// A push to a repository the authenticated account cannot write, same
+    /// provenance: the account is recognized, the permission is not there.
+    const FORBIDDEN_STDERR: &str = "\
+remote: Permission to octocat/Hello-World.git denied to theBGuy.
+fatal: unable to access 'https://github.com/octocat/Hello-World.git/': The requested URL returned error: 403
+";
+
+    /// A push dry-run against an archived GitHub repository, same provenance.
+    /// Only the `remote:` line is measured verbatim; the `fatal:` line under it is
+    /// git's standard curl-error shape, written out rather than captured — hence a
+    /// placeholder URL, so this blob makes no claim about a repository another
+    /// fixture presents differently.
+    const ARCHIVED_STDERR: &str = "\
+remote: This repository was archived so it is read-only.
+fatal: unable to access 'https://github.com/example/archived.git/': The requested URL returned error: 403
+";
+
+    /// A push to a Gitea pull-mirror over plain HTTP, from the user report the
+    /// read-only marker was written for (GitDesktop 0.10.0 on Linux, self-hosted
+    /// Gitea). The marker-bearing `remote:` line is verbatim; the report's paste
+    /// wraps the `fatal:` line after the colon, which git emits on one line, and
+    /// the `99xx` port is the reporter's own masking.
+    const GITEA_MIRROR_STDERR: &str = "\
+remote: mirror repository is read-only
+fatal: unable to access 'http://192.168.1.10:99xx/gituser1/GitDesktop/': The requested URL returned error: 403
+";
+
+    /// A push dry-run against an archived GitLab project — measured against
+    /// gitlab.com on git 2.51.1.windows.1, 2026-09 (`theBGuy/gitdesktop-gitlab-demo`,
+    /// archived via the API for this capture and unarchived immediately after).
+    /// GitLab's wording carries neither "read-only" nor "repository", so it needs
+    /// its own marker rather than widening the generic one.
+    const GITLAB_ARCHIVED_STDERR: &str = "\
+remote: You can't push code to an archived project.
+fatal: unable to access 'https://gitlab.com/theBGuy/gitdesktop-gitlab-demo.git/': The requested URL returned error: 403
+";
+
+    /// git asked for a username with prompting disabled and nothing in the
+    /// credential helper — measured against gitlab.com, same provenance as the
+    /// GitHub fixture above. Same `fatal:` shape: this is git's own wording, not
+    /// the host's.
+    const GITLAB_NO_CREDENTIALS_STDERR: &str = "\
+fatal: could not read Username for 'https://gitlab.com': terminal prompts disabled
+";
+
+    /// The Bitbucket counterpart, from a remote URL carrying an embedded username
+    /// (`https://user@bitbucket.org/...` — this app's own Bitbucket remotes are
+    /// shaped this way, see `strip_https_userinfo`). Git already has a username, so
+    /// it asks for the missing half instead: "Password", not "Username". Measured
+    /// against bitbucket.org, same provenance; the account name itself is
+    /// immaterial to the shape, so it's swapped for a placeholder here.
+    const BITBUCKET_NO_CREDENTIALS_STDERR: &str = "\
+fatal: could not read Password for 'https://user@bitbucket.org': terminal prompts disabled
+";
+
+    /// Credentials gitlab.com refused, same provenance as the GitHub fixture. The
+    /// sideband wording differs by host; the `fatal:` line the frontend anchors on
+    /// does not.
+    const GITLAB_REJECTED_CREDENTIALS_STDERR: &str = "\
+remote: HTTP Basic: Access denied. If a password was provided for Git authentication, the password was incorrect or you're required to use a token instead of a password. If a token was provided, it was either incorrect, expired, or improperly scoped. See https://gitlab.com/help/topics/git/troubleshooting_git.md#error-on-git-fetch-http-basic-access-denied
+fatal: Authentication failed for 'https://gitlab.com/theBGuy/gitdesktop-gitlab-demo.git/'
+";
+
+    /// The Bitbucket counterpart, same provenance.
+    const BITBUCKET_REJECTED_CREDENTIALS_STDERR: &str = "\
+remote: You may not have access to this repository or it no longer exists in this workspace. If you think this repository exists and you have access, make sure you are authenticated.
+fatal: Authentication failed for 'https://bitbucket.org/thebguy1/dispatch-demo.git/'
+";
+
+    /// A push to a GitLab project the authenticated account cannot write
+    /// (`gitlab-org/gitlab`, a real project this account has read-only access to),
+    /// same provenance as the GitHub fixture.
+    const GITLAB_FORBIDDEN_STDERR: &str = "\
+remote: You are not allowed to push code to this project.
+fatal: unable to access 'https://gitlab.com/gitlab-org/gitlab.git/': The requested URL returned error: 403
+";
+
+    /// The Bitbucket counterpart, against a repository this account cannot write.
+    /// Bitbucket returns the same 403 shape for "no access" and "doesn't exist" —
+    /// deliberately, so a probe can't distinguish a private repo from a missing one.
+    const BITBUCKET_FORBIDDEN_STDERR: &str = "\
+remote: The requested repository either does not exist or you do not have access. If you believe this repository exists and you have access, make sure you're authenticated.
+fatal: unable to access 'https://bitbucket.org/atlassian/python-bitbucket.git/': The requested URL returned error: 403
+";
+
+    /// `git ls-remote` over SSH with no usable key — measured against gitlab.com
+    /// on git 2.51.1.windows.1, 2026-09. The ssh client ends its line with CRLF
+    /// while git's own lines use LF; the `\r` is kept byte-exact.
+    const GITLAB_SSH_NO_ACCESS_STDERR: &str = "\
+git@gitlab.com: Permission denied (publickey).\r
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights
+and the repository exists.
+";
+
+    /// The github.com counterpart, same provenance: identical but for the host.
+    const GITHUB_SSH_NO_ACCESS_STDERR: &str = "\
+git@github.com: Permission denied (publickey).\r
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights
+and the repository exists.
+";
+
+    /// `git ls-remote` against a local path that doesn't exist, same git,
+    /// 2026-09-24. It ends on the same `fatal:` tail as the SSH refusals above.
+    const LOCAL_MISSING_PATH_STDERR: &str = "\
+fatal: 'C:/definitely-not-a-repo-x7q9z' does not appear to be a git repository
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights
+and the repository exists.
+";
+
+    /// `git ls-remote` against an SSH host that doesn't resolve, same provenance;
+    /// the ssh line ends in CRLF like the key refusals'.
+    const UNRESOLVABLE_HOST_STDERR: &str = "\
+ssh: Could not resolve hostname definitely-not-a-host-x7q9z.invalid: Name or service not known\r
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights
+and the repository exists.
+";
+
+    /// The chunks the frontend's `/m` regexes see as lines. JS `.` refuses every
+    /// LineTerminator and `^` re-anchors after each, while `str::lines` splits on
+    /// `\n` alone — and git's sideband re-emits `remote: ` after a BARE `\r` when
+    /// it overwrites a progress line, so `lines` would hand two sideband chunks to
+    /// one marker as a single matchable line.
+    fn js_lines(report: &str) -> impl Iterator<Item = &str> {
+        report.split(['\n', '\r', '\u{2028}', '\u{2029}'])
+    }
+
+    /// Whether `text` carries `word` at JS `\b` boundaries — `[A-Za-z0-9_]` on
+    /// either flank refuses the hit, which is what keeps `read-onlyish` and
+    /// `repositoryX` out. `-` is outside that set, so `read-only`'s own hyphen
+    /// never ends the word.
+    fn contains_word(text: &str, word: &str) -> bool {
+        fn is_word_char(c: char) -> bool {
+            c.is_ascii_alphanumeric() || c == '_'
+        }
+        text.match_indices(word).any(|(start, _)| {
+            text[..start].chars().next_back().is_none_or(|c| !is_word_char(c))
+                && text[start + word.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !is_word_char(c))
+        })
+    }
+
+    /// Entry one: a `remote:` line naming both a repository and a read-only state.
+    /// The JS lookahead makes the two order-independent within the line, and `.`
+    /// never crosses a line terminator, so both tokens must sit on the SAME line.
+    /// The case tolerance is `[Rr]` only, not a case-insensitive match.
+    fn marks_read_only_repository(report: &str) -> bool {
+        js_lines(report).any(|l| {
+            l.trim_start_matches([' ', '\t'])
+                .strip_prefix("remote: ")
+                .is_some_and(|rest| {
+                    ["repository", "Repository", "repositories", "Repositories"]
+                        .iter()
+                        .any(|w| contains_word(rest, w))
+                        && ["read-only", "Read-only"]
+                            .iter()
+                            .any(|w| contains_word(rest, w))
+                })
+        })
+    }
+
+    /// Entry two: GitLab's archived-project refusal. Plain substring, not a word
+    /// scan — GitLab's own wording is fixed copy, unlike the generic entry above
+    /// which has to tolerate a repository name or state description around it.
+    fn marks_gitlab_archived_project(report: &str) -> bool {
+        js_lines(report).any(|l| {
+            l.trim_start_matches([' ', '\t'])
+                .starts_with("remote: You can't push code to an archived project.")
+        })
+    }
+
+    /// Entry three. Line-anchored with no indent tolerance, exactly like the
+    /// regex. Covers both halves of git's credential-fill prompt: "Username" when
+    /// the remote URL carries none, "Password" when it already has one embedded
+    /// (this app's own Bitbucket remotes are shaped that way).
+    fn marks_missing_credentials(report: &str) -> bool {
+        js_lines(report).any(|l| {
+            l.starts_with("fatal: could not read Username for ")
+                || l.starts_with("fatal: could not read Password for ")
+        })
+    }
+
+    /// Entry four, anchored the same way.
+    fn marks_rejected_credentials(report: &str) -> bool {
+        js_lines(report).any(|l| l.starts_with("fatal: Authentication failed for "))
+    }
+
+    /// Entry five: git's curl-level 403. The regex's `[^'\n]*` cannot cross a
+    /// quote, so the URL runs to the FIRST `'` on the line and the tail has to
+    /// follow immediately. A bare `\r` inside the quotes ends the chunk here while
+    /// JS would keep reading — stricter than the frontend, the safe direction.
+    fn marks_forbidden_403(report: &str) -> bool {
+        js_lines(report).any(|l| {
+            l.strip_prefix("fatal: unable to access '")
+                .and_then(|r| r.split_once('\''))
+                .is_some_and(|(_url, tail)| {
+                    tail.starts_with(": The requested URL returned error: 403")
+                })
+        })
+    }
+
+    /// Entry six, `^\S+@\S+: Permission denied \((?=[^)\n]*publickey)`. The
+    /// regex's `\S` runs can't cross whitespace, so its `user@host:` token is the
+    /// line's whole first word: that word must end in `:` and hold an `@` with a
+    /// character on each side before that colon. `is_js_space` is JS's `\s`, which
+    /// differs from `char::is_whitespace` on U+0085 and U+FEFF. The method list up
+    /// to the first `)` must name `publickey`; a bare `\r`, U+2028, or U+2029
+    /// inside it ends the chunk here while JS keeps reading, stricter like entry
+    /// five.
+    fn marks_ssh_key_refused(report: &str) -> bool {
+        fn is_js_space(c: char) -> bool {
+            (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+        }
+        js_lines(report).any(|l| {
+            let (word, rest) = l.split_at(l.find(is_js_space).unwrap_or(l.len()));
+            rest.strip_prefix(" Permission denied (")
+                .is_some_and(|methods| {
+                    methods
+                        .split_once(')')
+                        .map_or(methods, |(list, _)| list)
+                        .contains("publickey")
+                })
+                && word.strip_suffix(':').is_some_and(|user_host| {
+                    user_host
+                        .char_indices()
+                        .any(|(i, c)| c == '@' && i > 0 && i + 1 < user_host.len())
+                })
+        })
+    }
+
+    /// Rust mirrors of `REMOTE_ACCESS_SUMMARIES` (src/lib/error-summary.ts), in
+    /// the frontend's table order.
+    const REMOTE_ACCESS_MARKERS: [fn(&str) -> bool; 6] = [
+        marks_read_only_repository,
+        marks_gitlab_archived_project,
+        marks_missing_credentials,
+        marks_rejected_credentials,
+        marks_forbidden_403,
+        marks_ssh_key_refused,
+    ];
+
+    /// Positions in [`REMOTE_ACCESS_MARKERS`], named for the pattern each entry
+    /// matches — not a 1:1 verdict: `READ_ONLY` and `GITLAB_ARCHIVED` are
+    /// different patterns that both resolve to the same toast text
+    /// (`READ_ONLY_REPOSITORY_SUMMARY`, error-summary.ts), since GitLab's
+    /// archived-project wording is exactly the case that summary describes.
+    const READ_ONLY: usize = 0;
+    const GITLAB_ARCHIVED: usize = 1;
+    const NO_CREDENTIALS: usize = 2;
+    const REJECTED_CREDENTIALS: usize = 3;
+    const FORBIDDEN_403: usize = 4;
+    const SSH_KEY_REFUSED: usize = 5;
+
+    /// The entry `remoteAccessSummary` would pick: the FIRST match in table order,
+    /// mirroring its `.find()`. The index is the table POSITION, so order is
+    /// precedence — not a unique verdict, since two positions can share one.
+    fn first_remote_access_match(report: &str) -> Option<usize> {
+        REMOTE_ACCESS_MARKERS.iter().position(|m| m(report))
+    }
+
+    /// Canary for the frontend's remote-access markers: `remoteAccessSummary`
+    /// (src/lib/error-summary.ts) can only turn a transport or sideband refusal
+    /// into one human line while these measured stderr shapes still land on the
+    /// entry whose wording was written for them, so the blobs and Rust mirrors of
+    /// `REMOTE_ACCESS_SUMMARIES` are pinned together here. Keep the two lists in
+    /// step, ORDER INCLUDED — the table's order is precedence, not just layout.
+    /// GitLab's credential/permission/archived shapes and Bitbucket's
+    /// credential/permission shapes are measured live (gitlab.com, bitbucket.org,
+    /// 2026-09); Bitbucket's read-only wording stays absent on purpose — grown
+    /// from captured stderr when it's reachable, never from a guess.
+    #[test]
+    fn remote_access_stderr_still_matches_the_frontend_markers() {
+        for (stderr, entry, what) in [
+            (NO_CREDENTIALS_STDERR, NO_CREDENTIALS, "no stored credentials"),
+            (
+                GITLAB_NO_CREDENTIALS_STDERR,
+                NO_CREDENTIALS,
+                "no stored credentials, on GitLab",
+            ),
+            (
+                BITBUCKET_NO_CREDENTIALS_STDERR,
+                NO_CREDENTIALS,
+                "no stored password, on a Bitbucket remote with an embedded username",
+            ),
+            (
+                REJECTED_CREDENTIALS_STDERR,
+                REJECTED_CREDENTIALS,
+                "rejected credentials",
+            ),
+            (
+                GITLAB_REJECTED_CREDENTIALS_STDERR,
+                REJECTED_CREDENTIALS,
+                "rejected credentials, on GitLab",
+            ),
+            (
+                BITBUCKET_REJECTED_CREDENTIALS_STDERR,
+                REJECTED_CREDENTIALS,
+                "rejected credentials, on Bitbucket",
+            ),
+            (FORBIDDEN_STDERR, FORBIDDEN_403, "a permission refusal"),
+            (
+                GITLAB_FORBIDDEN_STDERR,
+                FORBIDDEN_403,
+                "a permission refusal, on GitLab",
+            ),
+            (
+                BITBUCKET_FORBIDDEN_STDERR,
+                FORBIDDEN_403,
+                "a permission refusal, on Bitbucket",
+            ),
+            (ARCHIVED_STDERR, READ_ONLY, "an archived repository"),
+            (GITEA_MIRROR_STDERR, READ_ONLY, "a read-only mirror"),
+            (
+                GITLAB_ARCHIVED_STDERR,
+                GITLAB_ARCHIVED,
+                "an archived GitLab project",
+            ),
+            (
+                GITLAB_SSH_NO_ACCESS_STDERR,
+                SSH_KEY_REFUSED,
+                "an SSH key refusal, on GitLab",
+            ),
+            (
+                GITHUB_SSH_NO_ACCESS_STDERR,
+                SSH_KEY_REFUSED,
+                "an SSH key refusal, on GitHub",
+            ),
+        ] {
+            assert_eq!(
+                first_remote_access_match(stderr),
+                Some(entry),
+                "{what} no longer reaches entry {entry} — the toast would explain \
+                 something else, or nothing. Actual stderr:\n{stderr}"
+            );
+        }
+
+        // The TS regex has no `$` anchor, so it matches a line carrying trailing
+        // text after the period too (a version banner, a self-managed instance's
+        // appended hint) — the Rust mirror must match the SAME set, not a
+        // stricter one, or the canary could pass while under-approximating what
+        // the frontend actually classifies.
+        assert!(
+            REMOTE_ACCESS_MARKERS[GITLAB_ARCHIVED](
+                "remote: You can't push code to an archived project. Contact an admin.\n"
+            ),
+            "a trailing-text variant of the archived-project line must still match"
+        );
+
+        // All three read-only-family blobs also carry git's generic 403 line, so
+        // the read-only/archived verdicts above rest on the table's ORDER rather
+        // than on exclusivity.
+        for stderr in [ARCHIVED_STDERR, GITEA_MIRROR_STDERR, GITLAB_ARCHIVED_STDERR] {
+            assert!(
+                REMOTE_ACCESS_MARKERS[FORBIDDEN_403](stderr),
+                "a read-only blob lost its 403 line — the fixture no longer exercises \
+                 the precedence entry one depends on. Actual stderr:\n{stderr}"
+            );
+        }
+
+        // The permission blob reaches entry five on its own merits: its `remote:`
+        // line reports no repository state, and no earlier entry claims it.
+        for earlier in [READ_ONLY, GITLAB_ARCHIVED, NO_CREDENTIALS, REJECTED_CREDENTIALS] {
+            assert!(
+                !REMOTE_ACCESS_MARKERS[earlier](FORBIDDEN_STDERR),
+                "entry {earlier} claimed a plain permission refusal, which has its own \
+                 summary"
+            );
+        }
+
+        // The ssh line's CRLF joint is part of the measured shape; a fixture that
+        // lost it would stop exercising the `\r` the frontend regex must tolerate.
+        for stderr in [GITLAB_SSH_NO_ACCESS_STDERR, GITHUB_SSH_NO_ACCESS_STDERR] {
+            assert!(
+                stderr.contains("(publickey).\r\nfatal: "),
+                "an SSH fixture lost its measured CRLF joint. Actual stderr:\n{stderr}"
+            );
+        }
+
+        // These end on the same shared `fatal:` tail as the key refusals, but their
+        // own first lines say more than any mapped summary, so no entry may claim
+        // them.
+        for stderr in [LOCAL_MISSING_PATH_STDERR, UNRESOLVABLE_HOST_STDERR] {
+            assert_eq!(
+                first_remote_access_match(stderr),
+                None,
+                "a first-contact failure with a specific first line was claimed by \
+                 a remote-access entry. Actual stderr:\n{stderr}"
+            );
+        }
+
+        // Constructed, not measured: ssh's method list varies, and entry six only
+        // needs it to name `publickey`.
+        assert_eq!(
+            first_remote_access_match("git@example.com: Permission denied (publickey,password).\n"),
+            Some(SSH_KEY_REFUSED),
+            "a key refusal listing more methods than publickey must still match"
+        );
+
+        // Shapes the line anchor, word boundaries, and exact wording refuse.
+        // Looser matching here would let the canary pass stderr the frontend
+        // leaves raw, which is the one direction it must not be loose in.
+        for line in [
+            "Add read-only repository guard",          // a commit subject echoed back
+            "remote: repository is readonly",          // no hyphen
+            "remote: branch main is read-only",        // no repository token
+            "remote: this repository is read-onlyish", // past the word boundary
+            // Two sideband chunks a bare `\r` separates: neither carries both
+            // tokens, and JS `.` cannot span the `\r` to join them.
+            "remote: repository access\rremote: mirror is read-only\n",
+            // Entry three is anchored at the line start with no indent tolerance.
+            "  fatal: could not read Username for 'https://x'",
+            // Entry five's quoted run stops at the first `'`, so the tail has to
+            // follow that quote and not a later one.
+            "fatal: unable to access 'a': 'b': The requested URL returned error: 403",
+            // Entry two's wording is GitLab's exact copy — a paraphrase must not
+            // borrow its verdict.
+            "remote: You cannot push code to an archived project.",
+            // Entry six's `user@host:` token must open the line, so ssh's
+            // refusal quoted after other text is not ssh's.
+            "warning: git@gitlab.com: Permission denied (publickey).",
+            // Constructed: a refusal that never involved a key must not get key
+            // advice.
+            "git@example.com: Permission denied (password).",
+            "git@example.com: Permission denied (keyboard-interactive).",
+        ] {
+            assert_eq!(
+                first_remote_access_match(line),
+                None,
+                "`{line}` matched a remote-access marker the frontend would refuse"
+            );
+        }
+    }
+
+    /// Mirror of `PUSH_TRANSFER_HEADER` / `FETCH_TRANSFER_HEADER`
+    /// (src/lib/error-summary.ts), on the trimmed line like the frontend: the
+    /// keyword, one space, then ONE token of an optional `[\w.-]+@`, a `[\w.+-]+`
+    /// run, `:`, and a non-empty tail. Each class excludes the separator after it,
+    /// so the first `@` and the first `:` are the only splits the regex can take.
+    fn is_transfer_header(line: &str, keyword: &str) -> bool {
+        fn run_then_tail(s: &str) -> bool {
+            s.split_once(':').is_some_and(|(run, tail)| {
+                !run.is_empty()
+                    && run
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "_.+-".contains(c))
+                    && !tail.is_empty()
+            })
+        }
+        let Some(token) = line
+            .trim()
+            .strip_prefix(keyword)
+            .and_then(|r| r.strip_prefix(' '))
+        else {
+            return false;
+        };
+        !token.chars().any(char::is_whitespace)
+            && (run_then_tail(token)
+                || token.split_once('@').is_some_and(|(user, rest)| {
+                    !user.is_empty()
+                        && user
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+                        && run_then_tail(rest)
+                }))
+    }
+
+    /// Mirror of `TRANSFER_REF_LINE` (src/lib/error-summary.ts), on the UNTRIMMED
+    /// line: a space, one of the documented success flags ` +-*=t`, a space, a
+    /// `[…]` status, a lowercase hex range (`..` or `...`), or the bare `branch` /
+    /// `tag` / `remote-tracking branch` words, a space run, then a non-space
+    /// character with a ` -> ` arrow somewhere after it that a non-space character
+    /// follows.
+    fn is_transfer_ref_noise(line: &str) -> bool {
+        let Some(rest) = line.strip_prefix(' ') else {
+            return false;
+        };
+        let mut chars = rest.chars();
+        if !chars.next().is_some_and(|flag| " +-*=t".contains(flag)) {
+            return false;
+        }
+        let Some(rest) = chars.as_str().strip_prefix(' ') else {
+            return false;
+        };
+        let tail = if let Some(status) = rest.strip_prefix('[') {
+            match status.split_once(']') {
+                Some((inner, tail)) if !inner.is_empty() => tail,
+                _ => return false,
+            }
+        } else if let Some(tail) = rest.strip_prefix("remote-tracking branch") {
+            tail
+        } else {
+            let is_hex =
+                |s: &str| !s.is_empty() && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'));
+            let (word, tail) = rest.split_at(rest.find(' ').unwrap_or(rest.len()));
+            if word != "branch" && word != "tag" {
+                let Some((old, new)) = word.split_once("..") else {
+                    return false;
+                };
+                if !(is_hex(old) && is_hex(new.strip_prefix('.').unwrap_or(new))) {
+                    return false;
+                }
+            }
+            tail
+        };
+        let after = tail.trim_start_matches(' ');
+        let mut rest = after.chars();
+        after.len() < tail.len()
+            && rest.next().is_some_and(|c| !c.is_whitespace())
+            && rest.as_str().match_indices(" -> ").any(|(i, _)| {
+                rest.as_str()[i + 4..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !c.is_whitespace())
+            })
+    }
+
+    /// Mirror of `TRANSFER_DELETED_LINE` (src/lib/error-summary.ts), on the
+    /// UNTRIMMED line: ` - [deleted]`, a space run, then exactly one non-space
+    /// token (an optional trailing `\r` aside) running to the end.
+    fn is_transfer_deleted_noise(line: &str) -> bool {
+        let Some(rest) = line.strip_prefix(" - [deleted]") else {
+            return false;
+        };
+        let after = rest.trim_start_matches(' ');
+        let token = after.strip_suffix('\r').unwrap_or(after);
+        after.len() < rest.len() && !token.is_empty() && !token.chars().any(char::is_whitespace)
+    }
+
+    /// Mirror of `isNoiseLine` (src/lib/error-summary.ts), minus its
+    /// `Rebasing (x/y)` arm, which no transfer report carries.
+    fn is_summary_noise(line: &str) -> bool {
+        let t = line.trim();
+        t.is_empty()
+            || t.starts_with("hint:")
+            || is_transfer_header(t, "To")
+            || is_transfer_header(t, "From")
+            || is_transfer_ref_noise(line)
+            || is_transfer_deleted_noise(line)
+    }
+
+    /// The line `firstMeaningfulLine` would summarize, before its prefix strip and
+    /// space collapse.
+    fn first_meaningful(report: &str) -> Option<&str> {
+        report.lines().find(|l| !is_summary_noise(l))
+    }
+
+    /// `line` with git's column padding collapsed, as the summary shows it.
+    fn collapsed(line: &str) -> String {
+        line.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// stderr of a git call that must fail, run the way the app's runner runs it.
+    async fn failing_stderr(repo: &str, args: &[&str]) -> String {
+        match run_git(Some(repo), args, DEFAULT_TIMEOUT).await {
+            Err(AppError::Git { stderr, .. }) => stderr,
+            Err(other) => panic!("expected `git {args:?}` to fail with a git error, got {other:?}"),
+            Ok(_) => panic!("expected `git {args:?}` to fail, but it succeeded"),
+        }
+    }
+
+    /// Canary for the frontend's transfer-report noise family: `firstMeaningfulLine`
+    /// (src/lib/error-summary.ts) skips git's `To`/`From` headers and the per-ref
+    /// lines carrying a documented success flag, while a `!` line stays meaningful,
+    /// so a failed push, pull, or fetch summarizes git's reason rather than a ref
+    /// that moved fine. Real repos re-derive the measured shapes against Rust
+    /// mirrors of `PUSH_TRANSFER_HEADER`, `FETCH_TRANSFER_HEADER`,
+    /// `TRANSFER_REF_LINE`, and `TRANSFER_DELETED_LINE`, in both directions — keep
+    /// the two lists in step. The `remote-tracking branch` form needs a
+    /// `refs/remotes/*` ref on the remote to reproduce, so it is pinned from its
+    /// measured line only.
+    #[tokio::test]
+    async fn transfer_report_stderr_still_matches_the_frontend_markers() {
+        let (_guard, base, _origin_s, url) = seeded_origin("transfer-report").await;
+        let base_s = base.to_string_lossy().into_owned();
+        for name in ["clone1", "clone2"] {
+            run(
+                &base_s,
+                &["-c", "core.autocrlf=false", "clone", "-q", &url, name],
+            )
+            .await;
+            let c = base.join(name).to_string_lossy().into_owned();
+            run(&c, &["config", "core.autocrlf", "false"]).await;
+            run(&c, &["config", "user.email", "t@t.local"]).await;
+            run(&c, &["config", "user.name", "T"]).await;
+        }
+        let clone1 = base.join("clone1");
+        let clone2 = base.join("clone2");
+        let clone1_s = clone1.to_string_lossy().into_owned();
+        let clone2_s = clone2.to_string_lossy().into_owned();
+
+        // clone2 moves main, tags its new tip, and publishes a branch for clone1 to
+        // delete later; clone1 commits on the old tip, so the two have diverged.
+        std::fs::write(clone2.join("b.txt"), "theirs\n").unwrap();
+        run(&clone2_s, &["add", "-A"]).await;
+        run(&clone2_s, &["commit", "-qm", "from clone2"]).await;
+        run(&clone2_s, &["tag", "v1"]).await;
+        run(
+            &clone2_s,
+            &[
+                "push",
+                "-q",
+                "origin",
+                "main",
+                "v1",
+                "HEAD:refs/heads/doomed",
+            ],
+        )
+        .await;
+        std::fs::write(clone1.join("c.txt"), "mine\n").unwrap();
+        run(&clone1_s, &["add", "-A"]).await;
+        run(&clone1_s, &["commit", "-qm", "from clone1"]).await;
+
+        // The app's default pull mode, on its fall-through path: the fetch half's
+        // report leads, and git's refusal is the reason.
+        let pull = failing_stderr(&clone1_s, &["pull", "--ff-only"]).await;
+        assert!(
+            pull.trim()
+                .lines()
+                .next()
+                .is_some_and(|l| is_transfer_header(l, "From")),
+            "a refused pull no longer leads with the `From` header. Actual stderr:\n{pull}"
+        );
+        assert!(
+            pull.lines()
+                .any(|l| l.contains("-> origin/main") && is_transfer_ref_noise(l)),
+            "the pull's fast-forward table line is gone or no longer reads as noise. \
+             Actual stderr:\n{pull}"
+        );
+        assert!(
+            first_meaningful(&pull)
+                .is_some_and(|l| l.starts_with("fatal: Not possible to fast-forward")),
+            "the refused pull would no longer summarize git's reason. Actual stderr:\n{pull}"
+        );
+
+        // A local tag the remote's disagrees with: `fetch --tags` refuses to move it,
+        // and that `!` line is the reason. Naming `main` adds fetch's bare-word
+        // `* branch … -> FETCH_HEAD` line to the same report.
+        run(&clone1_s, &["tag", "-f", "v1"]).await;
+        let fetch = failing_stderr(&clone1_s, &["fetch", "--tags", "origin", "main"]).await;
+        assert!(
+            fetch
+                .trim()
+                .lines()
+                .next()
+                .is_some_and(|l| is_transfer_header(l, "From")),
+            "a refused fetch no longer leads with the `From` header. Actual stderr:\n{fetch}"
+        );
+        assert!(
+            fetch.lines().any(|l| l.starts_with(" * branch")
+                && collapsed(l).contains("main -> FETCH_HEAD")
+                && is_transfer_ref_noise(l)),
+            "the fetch's `* branch` line is gone or no longer reads as noise. \
+             Actual stderr:\n{fetch}"
+        );
+        assert!(
+            first_meaningful(&fetch).is_some_and(|l| {
+                l.trim_start().starts_with("! [rejected]")
+                    && collapsed(l).contains("v1 -> v1")
+                    && l.contains("(would clobber existing tag)")
+            }),
+            "the tag-clobber refusal would no longer summarize its `!` line. \
+             Actual stderr:\n{fetch}"
+        );
+
+        // A rejected branch pushed alongside a new tag and a deletion: neither success
+        // line may headline the failure.
+        run(&clone1_s, &["tag", "v2"]).await;
+        let push = failing_stderr(
+            &clone1_s,
+            &[
+                "push",
+                "origin",
+                ":refs/heads/doomed",
+                "main",
+                "refs/tags/v2",
+            ],
+        )
+        .await;
+        assert!(
+            push.trim()
+                .lines()
+                .next()
+                .is_some_and(|l| is_transfer_header(l, "To")),
+            "a rejected push no longer leads with the `To` header. Actual stderr:\n{push}"
+        );
+        assert!(
+            push.lines().any(|l| l.starts_with(" * [new tag]")
+                && collapsed(l).contains("v2 -> v2")
+                && is_transfer_ref_noise(l)),
+            "the new tag's report line is gone or no longer reads as noise. \
+             Actual stderr:\n{push}"
+        );
+        assert!(
+            push.lines().any(|l| l.starts_with(" - [deleted]")
+                && collapsed(l) == "- [deleted] doomed"
+                && is_transfer_deleted_noise(l)),
+            "the deletion's report line is gone or no longer reads as noise. \
+             Actual stderr:\n{push}"
+        );
+        assert!(
+            first_meaningful(&push).is_some_and(|l| {
+                l.trim_start().starts_with("! [rejected]")
+                    && collapsed(l).contains("main -> main")
+                    && l.contains("(non-fast-forward)")
+            }),
+            "the rejected push would no longer summarize its `!` line. Actual stderr:\n{push}"
+        );
+
+        // Measured on git 2.51.1.windows.1 (a fetch of a `refs/remotes/*` ref): the
+        // two-word summary column, followed by a single space.
+        assert!(
+            is_summary_noise(" * remote-tracking branch mirror/main -> FETCH_HEAD"),
+            "the remote-tracking fetch line no longer reads as noise"
+        );
+
+        // Shapes the mirrors refuse, as the frontend's own boundary tests do.
+        // Looser matching here would let the canary pass a report the frontend
+        // summarizes differently.
+        for line in [
+            " ! [rejected]        main -> main (non-fast-forward)",
+            " - make sure the remote still exists",
+            " - [deleted]         feat and the rest",
+            "Renamed main -> trunk on the remote.",
+            "   Fix the parser -> faster builds",
+            " * note: main -> trunk",
+            " * branches main -> trunk",
+            "From /home/u/origin",
+            "From here on, retry the fetch.",
+        ] {
+            assert!(
+                !is_summary_noise(line),
+                "`{line}` reads as noise here, but the frontend keeps it meaningful"
+            );
+        }
+    }
+
+    /// The wire values the TS `PushGuard` union (src/lib/git/api/sync.ts) mirrors: the
+    /// success toast keys on these exact strings, so a variant rename that skips
+    /// the mirror would silently stop reporting a degraded force push.
+    #[test]
+    fn push_guard_serializes_to_the_camel_case_wire_values() {
+        for (guard, wire) in [
+            (PushGuard::LeaseAndIncludes, "leaseAndIncludes"),
+            (PushGuard::LeaseOnlyOldGit, "leaseOnlyOldGit"),
+            (PushGuard::LeaseOnlyNoReflog, "leaseOnlyNoReflog"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(&guard).unwrap(),
+                serde_json::Value::String(wire.to_string()),
+                "{guard:?} must stay on the wire as {wire:?}"
+            );
+        }
+    }
+
+    /// The gap `--force-if-includes` closes, driven end to end: a plain `fetch`
+    /// alone satisfies the bare lease, so with the lease only, clone1's amend would
+    /// clobber a commit clone2 pushed and clone1 never integrated. Integrating it
+    /// (`pull --rebase`) is what lets the same force push land.
+    #[tokio::test]
+    async fn force_push_refuses_fetched_but_unintegrated_remote_work() {
+        let (_guard, base, origin_s, url) = seeded_origin("if-includes").await;
+        let base_s = base.to_string_lossy().into_owned();
+
+        for name in ["clone1", "clone2"] {
+            run(&base_s, &["-c", "core.autocrlf=false", "clone", "-q", &url, name]).await;
+            let c = base.join(name).to_string_lossy().into_owned();
+            run(&c, &["config", "core.autocrlf", "false"]).await;
+            run(&c, &["config", "user.email", "t@t.local"]).await;
+            run(&c, &["config", "user.name", "T"]).await;
+        }
+        let clone1 = base.join("clone1");
+        let clone2 = base.join("clone2");
+        let clone1_s = clone1.to_string_lossy().into_owned();
+        let clone2_s = clone2.to_string_lossy().into_owned();
+
+        // clone2 lands a commit of its own on the shared branch.
+        std::fs::write(clone2.join("b.txt"), "theirs\n").unwrap();
+        run(&clone2_s, &["add", "-A"]).await;
+        run(&clone2_s, &["commit", "-qm", "from clone2"]).await;
+        run(&clone2_s, &["push", "-q"]).await;
+        let theirs = run(&clone2_s, &["rev-parse", "HEAD"]).await.trim().to_string();
+
+        // clone1 only FETCHES it — the whole point: that alone used to satisfy the
+        // lease. Its amend adds a NEW file so the later replay stays conflict-free.
+        run(&clone1_s, &["fetch", "-q"]).await;
+        std::fs::write(clone1.join("c.txt"), "mine\n").unwrap();
+        run(&clone1_s, &["add", "-A"]).await;
+        run(&clone1_s, &["commit", "-q", "--amend", "-m", "amended seed"]).await;
+
+        let state = AppState::default();
+        let err = git_push_core(&state, clone1_s.clone(), false, true, None, None, None)
+            .await
+            .expect_err("a merely-fetched remote commit must not be clobbered");
+        let AppError::Git { stderr, .. } = &err else {
+            panic!("expected a git error, got {err:?}")
+        };
+        assert_rejection_reason(stderr, IF_INCLUDES_REJECTION);
+        assert_eq!(
+            run(&origin_s, &["rev-parse", "refs/heads/main"]).await.trim(),
+            theirs,
+            "clone2's commit is still origin's tip"
+        );
+
+        // Integrating the remote work unblocks the very same push.
+        run(&clone1_s, &["pull", "--rebase", "-q"]).await;
+        assert_eq!(
+            git_push_core(&state, clone1_s.clone(), false, true, None, None, None)
+                .await
+                .expect("an integrated branch force-pushes"),
+            PushGuard::LeaseAndIncludes
+        );
+        let landed = run(&origin_s, &["ls-tree", "--name-only", "refs/heads/main"]).await;
+        assert!(
+            landed.contains("b.txt") && landed.contains("c.txt"),
+            "both sides' work is on the new tip: {landed}"
+        );
+    }
+
+    /// `--force-if-includes` walks the local branch's REFLOG, so a repo with
+    /// reflogs off rejects every force push — even with the remote untouched and
+    /// nothing to clobber. The push must still land, degraded to the lease alone
+    /// and reported as such.
+    #[tokio::test]
+    async fn force_push_falls_back_to_the_lease_when_the_branch_has_no_reflog() {
+        let (_guard, base, origin_s, url) = seeded_origin("no-reflog").await;
+        let base_s = base.to_string_lossy().into_owned();
+
+        // Reflogs off at CLONE time: set afterwards, `.git/logs/` already exists and
+        // the check would pass. This is `git clone`'s OWN `-c`, which writes the key
+        // into the new repo's config — git's one-shot `-c` (before the subcommand)
+        // would not persist, and the first ref update would re-enable reflogs.
+        run(
+            &base_s,
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "clone",
+                "-q",
+                "-c",
+                "core.logAllRefUpdates=false",
+                &url,
+                "nolog",
+            ],
+        )
+        .await;
+        let clone = base.join("nolog");
+        let clone_s = clone.to_string_lossy().into_owned();
+        run(&clone_s, &["config", "core.autocrlf", "false"]).await;
+        run(&clone_s, &["config", "user.email", "t@t.local"]).await;
+        run(&clone_s, &["config", "user.name", "T"]).await;
+
+        // Rewrite the tip; the remote is untouched, so the lease has no complaint.
+        std::fs::write(clone.join("c.txt"), "mine\n").unwrap();
+        run(&clone_s, &["add", "-A"]).await;
+        run(&clone_s, &["commit", "-q", "--amend", "-m", "amended seed"]).await;
+        let amended = run(&clone_s, &["rev-parse", "HEAD"]).await.trim().to_string();
+        // The discriminating state, in the retry gate's own terms — asserted AFTER
+        // the amend, since a ref update would otherwise create the reflog.
+        assert!(
+            run_git(
+                Some(&clone_s),
+                &["reflog", "exists", "refs/heads/main"],
+                DEFAULT_TIMEOUT
+            )
+            .await
+            .is_err(),
+            "the fixture's branch must have no reflog for the flag to walk"
+        );
+
+        let state = AppState::default();
+        assert_eq!(
+            git_push_core(&state, clone_s.clone(), false, true, None, None, None)
+                .await
+                .expect("a no-reflog rejection is spurious; the push must still land"),
+            PushGuard::LeaseOnlyNoReflog
+        );
+        assert_eq!(
+            run(&origin_s, &["rev-parse", "refs/heads/main"]).await.trim(),
+            amended,
+            "the amended commit is origin's tip"
+        );
+    }
+
+    #[test]
+    fn publish_refspec_is_fully_qualified_on_both_sides() {
+        assert_eq!(
+            publish_refspec("feature"),
+            "refs/heads/feature:refs/heads/feature"
+        );
+        // A `+` lands INSIDE the ref path, never at refspec position 0 where git
+        // would read it as the force marker.
+        assert_eq!(publish_refspec("+x"), "refs/heads/+x:refs/heads/+x");
+    }
+
+    #[test]
+    fn push_plus_prefixed_branch_is_not_a_force() {
+        // Security regression guard: a branch named `+main` is a VALID git ref,
+        // and as a BARE refspec source `+` is git's force indicator. Fully
+        // qualifying the refspec embeds the `+` inside `refs/heads/+main`, never
+        // as its leading char, so git can't read it as a force-push.
+        assert_eq!(
+            build_push_args("+main", "", "", false, false, false, None, None),
+            vec!["push", "-u", "origin", "refs/heads/+main:refs/heads/+main"]
+        );
+    }
+
+    #[test]
+    fn push_gone_different_name_publishes_under_local_name() {
+        // Deliberate: a gone upstream publishes under the LOCAL name (a fresh
+        // `origin/feature`), not the deleted `feat` — matching the "Publish"
+        // affordance and toast.
+        assert_eq!(
+            build_push_args("feature", "origin/feat", "origin", true, false, false, None, None),
+            vec!["push", "-u", "origin", "refs/heads/feature:refs/heads/feature"]
+        );
+    }
+
+    #[test]
+    fn push_explicit_remote_branch_pins_the_destination_refspec() {
+        // Untracked local branch, explicit remote + destination.
+        assert_eq!(
+            build_push_args("local", "", "", false, false, false, Some("fork"), Some("contrib")),
+            vec!["push", "fork", "refs/heads/local:refs/heads/contrib"]
+        );
+        // A destination name never re-tracks, so `set_upstream` can't add `-u`.
+        assert_eq!(
+            build_push_args("local", "", "", false, true, false, Some("fork"), Some("contrib")),
+            vec!["push", "fork", "refs/heads/local:refs/heads/contrib"]
+        );
+        // A gone upstream likewise can't drag the publish arm back in.
+        assert_eq!(
+            build_push_args("local", "origin/local", "origin", true, false, false, Some("fork"), Some("contrib")),
+            vec!["push", "fork", "refs/heads/local:refs/heads/contrib"]
+        );
+        // Tracked elsewhere: the refspec still targets `contrib`, upstream untouched.
+        assert_eq!(
+            build_push_args("local", "origin/local", "origin", false, false, false, Some("fork"), Some("contrib")),
+            vec!["push", "fork", "refs/heads/local:refs/heads/contrib"]
+        );
+        // `force` keeps its position ahead of the target, as in every other arm.
+        assert_eq!(
+            build_push_args("local", "", "", false, false, true, Some("fork"), Some("contrib")),
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-if-includes",
+                "fork",
+                "refs/heads/local:refs/heads/contrib"
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_push_target_prefers_request_then_tracked_then_origin() {
+        // Explicit request wins; else the tracked-and-not-gone remote; else origin
+        // (untracked, or gone).
+        assert_eq!(resolve_push_target(Some("fork"), "upstream", false), "fork");
+        assert_eq!(resolve_push_target(None, "upstream", false), "upstream");
+        assert_eq!(resolve_push_target(None, "", false), "origin");
+        assert_eq!(resolve_push_target(None, "upstream", true), "origin");
+    }
+
+    #[test]
+    fn parse_upstream_tracking_missing_branch_is_none() {
+        assert_eq!(parse_upstream_tracking("", "refs/heads/feature"), None);
+    }
+
+    #[test]
+    fn parse_upstream_tracking_untracked_is_some_empty() {
+        // An untracked branch: refname present, empty upstream fields → valid publish.
+        assert_eq!(
+            parse_upstream_tracking("refs/heads/feature\0\0\0\n", "refs/heads/feature"),
+            Some(("".into(), "".into(), false))
+        );
+    }
+
+    #[test]
+    fn parse_upstream_tracking_gone() {
+        assert_eq!(
+            parse_upstream_tracking("refs/heads/feature\0origin/feat\0origin\0[gone]", "refs/heads/feature"),
+            Some(("origin/feat".into(), "origin".into(), true))
+        );
+    }
+
+    #[test]
+    fn parse_upstream_tracking_normal() {
+        assert_eq!(
+            parse_upstream_tracking("refs/heads/feature\0origin/feature\0origin\0[ahead 2]", "refs/heads/feature"),
+            Some(("origin/feature".into(), "origin".into(), false))
+        );
+    }
+
+    #[test]
+    fn parse_upstream_tracking_prefix_match_is_rejected() {
+        // `for-each-ref refs/heads/feat` also matches `refs/heads/feat/sub`; the
+        // exact-refname check must reject it so the caller returns "no such branch"
+        // instead of reading feat/sub's tracking.
+        assert_eq!(
+            parse_upstream_tracking("refs/heads/feat/sub\0\0\0\n", "refs/heads/feat"),
+            None
+        );
+    }
+
+    // --- Real-repo tests for git_remote_remove (temp_dir, git on PATH). ---
+
+    async fn run(repo: &str, args: &[&str]) -> String {
+        run_git(Some(repo), args, DEFAULT_TIMEOUT)
+            .await
+            .unwrap()
+            .stdout_lossy()
+    }
+
+    /// A unique temp base dir for a test — the returned `TempDir` guard removes it
+    /// (and every subdir under it) on Drop, so a panicking or killed run cannot
+    /// leak the fixture.
+    fn temp_base(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("gd-remote-{tag}-"))
+            .tempdir()
+            .expect("create temp dir");
+        let path = dir.path().to_path_buf();
+        (dir, path)
+    }
+
+    async fn init_repo(repo_s: &str, seed_file: &str) {
+        run(repo_s, &["init", "-q"]).await;
+        run(repo_s, &["config", "user.email", "t@t.local"]).await;
+        run(repo_s, &["config", "user.name", "T"]).await;
+        std::fs::write(std::path::Path::new(repo_s).join(seed_file), "hello\n").unwrap();
+        run(repo_s, &["add", "-A"]).await;
+        run(repo_s, &["commit", "-qm", "seed"]).await;
+    }
+
+    /// Add an `upstream` remote (a second local repo), fetch it, point a branch's
+    /// upstream at it, then remove it via `git_remote_remove_core` and assert git
+    /// tore down everything: the remote is gone from `git remote`, the branch's
+    /// `branch.<b>.remote` config is unset, and `refs/remotes/upstream/` is empty.
+    #[tokio::test]
+    async fn remove_drops_remote_tracking_and_branch_upstream() {
+        let (_base, base) = temp_base("remove");
+        let repo = base.join("repo");
+        let up = base.join("upstream");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&up).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        let up_s = up.to_string_lossy().into_owned();
+
+        // The upstream repo, with a commit so it has a branch to fetch.
+        init_repo(&up_s, "u.txt").await;
+        let up_branch = run(&up_s, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await
+            .trim()
+            .to_string();
+
+        // The consuming repo, with its own branch.
+        init_repo(&repo_s, "a.txt").await;
+        let branch = run(&repo_s, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await
+            .trim()
+            .to_string();
+
+        // Add + fetch upstream by file path, then track upstream/<branch>.
+        run(&repo_s, &["remote", "add", "upstream", &up_s]).await;
+        run(&repo_s, &["fetch", "-q", "upstream"]).await;
+        run(
+            &repo_s,
+            &[
+                "branch",
+                &format!("--set-upstream-to=upstream/{up_branch}"),
+                &branch,
+            ],
+        )
+        .await;
+
+        // Preconditions: the remote is listed, the branch tracks it, refs exist.
+        assert!(run(&repo_s, &["remote"]).await.contains("upstream"));
+        assert_eq!(
+            run(&repo_s, &["config", &format!("branch.{branch}.remote")])
+                .await
+                .trim(),
+            "upstream"
+        );
+        assert!(!run(&repo_s, &["for-each-ref", "refs/remotes/upstream/"])
+            .await
+            .trim()
+            .is_empty());
+
+        // Remove via the command core.
+        let state = AppState::default();
+        git_remote_remove_core(&state, repo_s.clone(), "upstream".into())
+            .await
+            .expect("remove succeeds");
+
+        // The remote is gone.
+        assert!(!run(&repo_s, &["remote"]).await.contains("upstream"));
+        // The branch's upstream config is unset — `git config` exits non-zero.
+        assert!(
+            run_git(
+                Some(&repo_s),
+                &["config", &format!("branch.{branch}.remote")],
+                DEFAULT_TIMEOUT,
+            )
+            .await
+            .is_err(),
+            "branch.<b>.remote is unset after removal"
+        );
+        // The remote-tracking refs are gone.
+        assert!(
+            run(&repo_s, &["for-each-ref", "refs/remotes/upstream/"])
+                .await
+                .trim()
+                .is_empty(),
+            "refs/remotes/upstream/ is empty after removal"
+        );
+    }
+
+    /// A destination branch name is meaningless without both an explicit branch and
+    /// an explicit remote, so those combinations are refused rather than silently
+    /// dropping the destination. Guarded before any git call — no repo needed.
+    /// The MESSAGE is the assertion: the remote-without-branch row would ALSO be
+    /// satisfied by the next guard's "remote requires an explicit branch", so a
+    /// variant-only match cannot tell which one refused it.
+    #[tokio::test]
+    async fn remote_branch_requires_both_branch_and_remote() {
+        let state = AppState::default();
+        for (branch, remote) in [
+            (None, None),
+            (Some("local".to_string()), None),
+            (None, Some("fork".to_string())),
+        ] {
+            let err = git_push_core(
+                &state,
+                "/definitely/not/a/repo".into(),
+                false,
+                false,
+                branch.clone(),
+                remote.clone(),
+                Some("contrib".into()),
+            )
+            .await
+            .expect_err("a lone remote_branch is refused");
+            assert!(
+                matches!(&err, AppError::InvalidArgument(m) if m.contains("remote branch requires")),
+                "branch={branch:?} remote={remote:?} → {err:?}"
+            );
+        }
+    }
+
+    /// The destination name is interpolated into the refspec's right-hand side, so
+    /// it takes the same refspec-injection blocklist as the local branch: `*` would
+    /// mirror-push, `:` would add a refspec field. Then the accepted arm is driven
+    /// end to end against a real bare remote.
+    #[tokio::test]
+    async fn push_to_a_named_remote_branch_validates_then_lands_on_that_ref() {
+        let (_base, base) = temp_base("remote-branch");
+        let repo = base.join("repo");
+        let fork = base.join("fork.git");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&fork).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        let fork_s = fork.to_string_lossy().into_owned();
+
+        run(&fork_s, &["init", "-q", "--bare"]).await;
+        init_repo(&repo_s, "a.txt").await;
+        run(&repo_s, &["branch", "local"]).await;
+        run(&repo_s, &["remote", "add", "fork", &fork_s]).await;
+
+        let state = AppState::default();
+        for bad in ["a*b", "a?b", "a[b", "a:b", "a b"] {
+            let err = git_push_core(
+                &state,
+                repo_s.clone(),
+                false,
+                false,
+                Some("local".into()),
+                Some("fork".into()),
+                Some(bad.into()),
+            )
+            .await
+            .expect_err("refspec metacharacters are rejected");
+            assert!(
+                matches!(err, AppError::InvalidArgument(_)),
+                "{bad:?} → {err:?}"
+            );
+        }
+        // Nothing was pushed while validating.
+        assert!(run(&fork_s, &["for-each-ref", "refs/heads/"])
+            .await
+            .trim()
+            .is_empty());
+
+        git_push_core(
+            &state,
+            repo_s.clone(),
+            false,
+            false,
+            Some("local".into()),
+            Some("fork".into()),
+            Some("contrib".into()),
+        )
+        .await
+        .expect("push to the named destination succeeds");
+
+        // The commit landed under the DESTINATION name, not the local one.
+        assert_eq!(
+            run(&fork_s, &["rev-parse", "refs/heads/contrib"]).await.trim(),
+            run(&repo_s, &["rev-parse", "refs/heads/local"]).await.trim()
+        );
+        assert!(
+            run_git(
+                Some(&fork_s),
+                &["rev-parse", "refs/heads/local"],
+                DEFAULT_TIMEOUT
+            )
+            .await
+            .is_err(),
+            "the local name must not be published"
+        );
+        // And no `-u`: the local branch is still untracked.
+        assert!(
+            run_git(
+                Some(&repo_s),
+                &["rev-parse", "--abbrev-ref", "local@{upstream}"],
+                DEFAULT_TIMEOUT
+            )
+            .await
+            .is_err(),
+            "a named destination must not set upstream"
+        );
+    }
+
+    /// Removing a remote that doesn't exist is an honest `InvalidArgument`, not a
+    /// raw git error — the `ensure_remote_exists` gate.
+    #[tokio::test]
+    async fn remove_nonexistent_remote_errors_invalid_argument() {
+        let (_base, base) = temp_base("missing");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_s = repo.to_string_lossy().into_owned();
+        init_repo(&repo_s, "a.txt").await;
+
+        let state = AppState::default();
+        let err = git_remote_remove_core(&state, repo_s.clone(), "upstream".into())
+            .await
+            .expect_err("removing a missing remote errors");
+        match err {
+            AppError::InvalidArgument(msg) => {
+                assert_eq!(msg, "remote does not exist: upstream");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    /// The real `for-each-ref` output shape feeding `parse_upstream_tracking` — the
+    /// format assumption is otherwise only checked against hand-written strings.
+    #[tokio::test]
+    async fn parse_upstream_tracking_matches_real_for_each_ref_output() {
+        let (_base, base) = temp_base("track");
+        let origin = base.join("origin");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let origin_s = origin.to_string_lossy().into_owned();
+        let repo_s = repo.to_string_lossy().into_owned();
+
+        init_repo(&origin_s, "o.txt").await;
+        // The default branch name (main/master) is whatever git is configured for.
+        let def = run(&origin_s, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await
+            .trim()
+            .to_string();
+
+        init_repo(&repo_s, "r.txt").await;
+        run(&repo_s, &["remote", "add", "origin", &origin_s]).await;
+        run(&repo_s, &["fetch", "-q", "origin"]).await;
+        run(
+            &repo_s,
+            &["branch", &format!("--set-upstream-to=origin/{def}"), &def],
+        )
+        .await;
+        run(&repo_s, &["branch", "feature"]).await; // untracked
+        run(&repo_s, &["branch", "feat/sub"]).await; // prefix sibling; no exact `feat`
+
+        let fmt = "--format=%(refname)%00%(upstream:short)%00%(upstream:remotename)%00%(upstream:track)";
+        // Run the real `for-each-ref` and parse it exactly as the caller does.
+        let track = |b: &str| {
+            let repo_s = repo_s.clone();
+            let refspec = format!("refs/heads/{b}");
+            async move {
+                let out = run(&repo_s, &["for-each-ref", &refspec, fmt]).await;
+                parse_upstream_tracking(&out, &refspec)
+            }
+        };
+
+        // Untracked branch → non-empty refname line with empty upstream fields.
+        assert_eq!(
+            track("feature").await,
+            Some((String::new(), String::new(), false))
+        );
+        // Tracked branch → upstream short + remote name; gone=false (ahead/behind are
+        // ignored by the parser, so divergent histories are fine).
+        assert_eq!(
+            track(&def).await,
+            Some((format!("origin/{def}"), "origin".into(), false))
+        );
+        // Prefix: `for-each-ref refs/heads/feat` matches `feat/sub`, whose refname
+        // isn't `refs/heads/feat` → None (the exact-match guard, end to end).
+        assert_eq!(track("feat").await, None);
+
+        // Gone upstream: track origin/<def>, then delete the remote-tracking ref so
+        // `%(upstream:track)` becomes `[gone]`. Do this LAST — it also makes <def> gone.
+        run(
+            &repo_s,
+            &["branch", "--track", "goner", &format!("origin/{def}")],
+        )
+        .await;
+        run(
+            &repo_s,
+            &["update-ref", "-d", &format!("refs/remotes/origin/{def}")],
+        )
+        .await;
+        let g = track("goner").await;
+        assert!(
+            matches!(g, Some((_, _, true))),
+            "goner upstream should read gone: {g:?}"
+        );
+    }
+
+    /// A tag-pruning user keeps their local tags through the Fetch action, and the
+    /// BRANCH half of the prune still runs — that half is what the action exists
+    /// for, and the auto-fetch timer is what makes the tag half matter. A sibling
+    /// clone under the same config is the negative control: there a raw pruning
+    /// fetch deletes the tag, so the config is proven to bite before the flag is
+    /// credited with anything.
+    #[tokio::test]
+    async fn fetch_keeps_local_tags_and_still_prunes_branches() {
+        let (_guard, base, _origin_s, url) = seeded_origin("prune-tags").await;
+        let base_s = base.to_string_lossy().into_owned();
+        let work = base.join("work");
+        let work_s = work.to_string_lossy().into_owned();
+
+        // A branch both clones track, deleted on the origin afterwards — the stale
+        // tracking ref the prune has to take.
+        run(&work_s, &["switch", "-q", "-c", "doomed"]).await;
+        std::fs::write(work.join("d.txt"), "d\n").unwrap();
+        run(&work_s, &["add", "-A"]).await;
+        run(&work_s, &["commit", "-qm", "doomed"]).await;
+        run(&work_s, &["push", "-q", "-u", "origin", "doomed"]).await;
+
+        for name in ["clone", "control"] {
+            run(&base_s, &["-c", "core.autocrlf=false", "clone", "-q", &url, name]).await;
+            let c = base.join(name).to_string_lossy().into_owned();
+            run(&c, &["config", "fetch.pruneTags", "true"]).await;
+            // A tag the origin does not carry, which is what makes it prunable.
+            run(&c, &["tag", "keep-me"]).await;
+        }
+        run(&work_s, &["push", "-q", "origin", "--delete", "doomed"]).await;
+
+        let clone_s = base.join("clone").to_string_lossy().into_owned();
+        let control_s = base.join("control").to_string_lossy().into_owned();
+
+        // Both preconditions, asserted before the fetch: without them the two
+        // assertions below would pass on an empty starting state.
+        assert_eq!(run(&clone_s, &["tag"]).await.trim(), "keep-me");
+        assert!(
+            !run(&clone_s, &["for-each-ref", "refs/remotes/origin/doomed"])
+                .await
+                .trim()
+                .is_empty(),
+            "the clone must start with the tracking ref the prune is meant to clear"
+        );
+
+        // The config has to bite, or retention below proves nothing.
+        run(&control_s, &["fetch", "--prune", "origin"]).await;
+        assert!(
+            run(&control_s, &["tag"]).await.trim().is_empty(),
+            "fetch.pruneTags must delete the tag on the control's raw pruning fetch"
+        );
+
+        git_fetch_core(&AppState::default(), clone_s.clone())
+            .await
+            .expect("the fetch action succeeds");
+        assert_eq!(
+            run(&clone_s, &["tag"]).await.trim(),
+            "keep-me",
+            "the Fetch action deleted a tag the user still holds"
+        );
+        assert!(
+            run(&clone_s, &["for-each-ref", "refs/remotes/origin/doomed"])
+                .await
+                .trim()
+                .is_empty(),
+            "the deleted upstream branch's tracking ref must still be pruned"
+        );
+    }
+}

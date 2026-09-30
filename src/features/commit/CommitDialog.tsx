@@ -1,0 +1,336 @@
+import { InfoIcon, SparkleIcon } from "@phosphor-icons/react";
+import { DiffStat } from "@/components/diff-stat";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { PathText } from "@/components/path-text";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Spinner } from "@/components/ui/spinner";
+import { Textarea } from "@/components/ui/textarea";
+import { changeKindLabel, KIND_BADGE } from "@/lib/git/change-kind-badge";
+import { useWorkingLineStats } from "@/lib/git/queries";
+import type { FileEntry } from "@/lib/git/types";
+import { formatBinding } from "@/lib/hotkeys/binding";
+import { useEffectiveBindings } from "@/lib/hotkeys/hotkeys";
+import { useGenerateChordHint } from "@/lib/hotkeys/useGenerateChord";
+import { useSettings } from "@/lib/settings/queries";
+import { useUiStore } from "@/lib/stores/ui";
+import { useTranslation } from "@/lib/i18n";
+import { cn } from "@/lib/utils";
+import { CoAuthorPicker } from "./CoAuthorPicker";
+import { useCommitSubmit } from "./useCommitSubmit";
+
+/**
+ * The pop-out commit composer. Rendered exactly ONCE, hoisted in RepositoryView:
+ * it is the commit path that survives a collapsed sidebar, where the inline
+ * CommitBox is `<Activity>`-hidden and its hotkeys are unregistered.
+ *
+ * Every field reads the shared ui-store draft, so this and the box are the same
+ * message from two angles. Staging stays in the Changes panel — the file list
+ * here is read-only.
+ */
+export function CommitDialog({ repoPath }: { repoPath: string }) {
+  const { t } = useTranslation();
+  const open = useUiStore((s) => s.commitDialogOpen);
+  const closeCommitDialog = useUiStore((s) => s.closeCommitDialog);
+  const openSettings = useUiStore((s) => s.openSettings);
+  const repoTab = useUiStore((s) => s.repoTab);
+  const settings = useSettings();
+  // The one state with no commit surface mounted: a collapsed sidebar hides the
+  // Changes panel, and Activity tears CommitBox's registration down with it.
+  // This dialog is hoisted for exactly that, so the chord registers here.
+  const noCommitSurface =
+    repoTab === "changes" && (settings.data?.sidebarCollapsed ?? false);
+  const {
+    title,
+    body,
+    coAuthors,
+    setCommitTitle,
+    setCommitBody,
+    setCoAuthors,
+    clearCommitDraft,
+    amending,
+    amendingHash,
+    branchName,
+    locked,
+    stagedEntries,
+    stagedCount,
+    canCommit,
+    commitDisabledReason,
+    commitLabel,
+    committing,
+    aiEnabled,
+    aiConfigured,
+    generate,
+    cancel,
+    generating,
+    doCommit,
+  } = useCommitSubmit(repoPath, {
+    active: open,
+    commitHotkeyFallback: noCommitSurface,
+    onCommitted: closeCommitDialog,
+  });
+  // Same query (and cache entry) the Changes panel's rows read, so a file's
+  // counts here can't disagree with its counts there. Only fetched while the
+  // list is on screen with something in it.
+  const lineStats = useWorkingLineStats(repoPath, open && stagedCount > 0);
+  const commitBinding = useEffectiveBindings().get("commit") ?? null;
+  const generateHint = useGenerateChordHint();
+
+  const stagedStats = new Map(
+    (lineStats.data?.staged ?? []).map((e) => [e.path, e]),
+  );
+  // numstat emits duplicate noise rows for conflicted paths, so those render a
+  // blank slot — the Changes panel's rule, kept as belt-and-braces here even
+  // though a staged row never carries that kind.
+  function statFor(entry: FileEntry) {
+    if (entry.staged === "conflicted") return undefined;
+    return stagedStats.get(entry.path);
+  }
+
+  const emptyStagedNote = amending
+    ? t("commitUi.nothingStagedAmend")
+    : t("commitUi.nothingStaged");
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) closeCommitDialog();
+      }}
+    >
+      <DialogContent className="flex max-h-[85vh] flex-col sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{t("commitUi.commitTitle")}</DialogTitle>
+          <DialogDescription>
+            {t("commitUi.dialogDescription")}
+          </DialogDescription>
+        </DialogHeader>
+
+        {locked && (
+          <div className="bg-muted px-2.5 py-2 text-xs text-muted-foreground">
+            <p className="flex items-start gap-2">
+              <InfoIcon className="mt-0.5 size-3.5 shrink-0" />
+              <span className="flex-1">
+                {t("commitUi.lockedBranch", { branch: branchName ?? "" })}
+              </span>
+            </p>
+          </div>
+        )}
+        {amending && (
+          <div className="bg-warning/10 px-2.5 py-2 text-xs text-warning">
+            <p className="flex items-start gap-2">
+              <InfoIcon className="mt-0.5 size-3.5 shrink-0" />
+              <span className="flex-1">
+                {t("commitUi.amending", { hash: amendingHash?.slice(0, 7) ?? "" })}{" "}
+                <button
+                  type="button"
+                  className="font-medium underline underline-offset-2 hover:no-underline"
+                  onClick={clearCommitDraft}
+                >
+                  {t("commitUi.stopAmending")}
+                </button>{" "}
+                {t("commitUi.commitSeparately")}
+              </span>
+            </p>
+          </div>
+        )}
+
+        <div className="space-y-2">
+          <div className="relative">
+            <Input
+              autoFocus
+              placeholder={t("commitUi.titlePlaceholder")}
+              value={title}
+              onChange={(e) => setCommitTitle(e.target.value)}
+              disabled={generating}
+              className="ph-no-capture pr-12"
+              autoComplete="off"
+            />
+            <span
+              className={cn(
+                "pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-[10px] tabular-nums",
+                title.length > 72
+                  ? "text-destructive"
+                  : "text-muted-foreground",
+              )}
+            >
+              {title.length > 0 && `${title.length}/72`}
+            </span>
+          </div>
+          <Textarea
+            placeholder={t("commitUi.descriptionPlaceholder")}
+            value={body}
+            onChange={(e) => setCommitBody(e.target.value)}
+            disabled={generating}
+            // The point of the pop-out: a body field with room to write in.
+            className="ph-no-capture max-h-80 min-h-40 resize-y"
+          />
+          <CoAuthorPicker
+            repoPath={repoPath}
+            value={coAuthors}
+            onChange={setCoAuthors}
+            disabled={generating}
+          />
+        </div>
+
+        <div className="flex min-h-0 flex-1 flex-col gap-1.5">
+          <h3 className="text-xs font-medium text-muted-foreground">
+            {t("commitUi.stagedCount", { count: stagedCount })}
+          </h3>
+          {stagedCount > 0 ? (
+            <ScrollArea className="min-h-0 flex-1 overflow-hidden border">
+              <ul className="py-1">
+                {stagedEntries.map((entry) => {
+                  const badge = KIND_BADGE[entry.staged];
+                  const label = entry.origPath
+                    ? `${entry.origPath} → ${entry.path}`
+                    : entry.path;
+                  const stat = statFor(entry);
+                  return (
+                    <li
+                      key={entry.path}
+                      className="flex items-center gap-2 px-2 py-0.5 text-xs"
+                    >
+                      <span
+                        aria-hidden
+                        className={cn(
+                          "w-3 shrink-0 font-semibold",
+                          badge.className,
+                        )}
+                      >
+                        {badge.letter}
+                      </span>
+                      {/* The letter carries no meaning for assistive tech; the
+                          name span sits ahead of the path so the kind is
+                          announced first, and its trailing space keeps the two
+                          from fusing. */}
+                      <span className="sr-only">{changeKindLabel(entry.staged, t)} </span>
+                      {entry.origPath ? (
+                        // A rename is two paths and an arrow: the composite
+                        // can't ride PathText's only-when-clipped measurement,
+                        // so the row keeps a static title for the whole label.
+                        <span
+                          className="flex min-w-0 flex-1 items-center gap-1"
+                          title={label}
+                        >
+                          <PathText path={entry.origPath} />
+                          <span className="shrink-0">→</span>
+                          <PathText path={entry.path} />
+                        </span>
+                      ) : (
+                        <PathText path={entry.path} className="flex-1" />
+                      )}
+                      {stat ? (
+                        <DiffStat
+                          added={stat.added}
+                          deleted={stat.deleted}
+                          isBinary={stat.isBinary}
+                          className="text-[11px]"
+                        />
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ul>
+            </ScrollArea>
+          ) : (
+            <p className="text-xs text-muted-foreground">{emptyStagedNote}</p>
+          )}
+        </div>
+
+        <DialogFooter>
+          {aiEnabled && (
+            <GenerateButton
+              aiConfigured={aiConfigured}
+              generating={generating}
+              stagedCount={stagedCount}
+              hint={generateHint}
+              onGenerate={generate}
+              onCancel={cancel}
+              onSetUpAi={() => openSettings("ai")}
+            />
+          )}
+          <DisabledReasonButton
+            disabled={!canCommit || generating}
+            reason={commitDisabledReason}
+            title={commitBinding ? formatBinding(commitBinding) : undefined}
+            onClick={doCommit}
+          >
+            {committing && <Spinner data-icon="inline-start" />}
+            <span className="truncate">{commitLabel}</span>
+          </DisabledReasonButton>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** The footer's AI arm: cancel while a stream runs, generate when one could. */
+function GenerateButton({
+  aiConfigured,
+  generating,
+  stagedCount,
+  hint,
+  onGenerate,
+  onCancel,
+  onSetUpAi,
+}: {
+  aiConfigured: boolean;
+  generating: boolean;
+  stagedCount: number;
+  hint: string;
+  onGenerate: () => void;
+  onCancel: () => void;
+  onSetUpAi: () => void;
+}) {
+  const { t } = useTranslation();
+  if (generating) {
+    return (
+      <Button variant="outline" onClick={onCancel}>
+        <Spinner data-icon="inline-start" />
+        {t("common.cancel")}
+      </Button>
+    );
+  }
+  if (!aiConfigured) {
+    // AI is on but no provider is set up yet — turn the dead-end Generate click
+    // into a one-time path to Settings → AI.
+    return (
+      <Button
+        variant="outline"
+        onClick={onSetUpAi}
+        title={t("commitUi.setUpAiTitle")}
+      >
+        <SparkleIcon data-icon="inline-start" />
+        {t("commitUi.setUpAi")}
+      </Button>
+    );
+  }
+  return (
+    <DisabledReasonButton
+      variant="outline"
+      disabled={stagedCount === 0}
+      reason={t("commitUi.stageToGenerate")}
+      // The chord is only offered while it would do something — a disabled
+      // Generate's shortcut is dead too.
+      title={
+        stagedCount > 0
+          ? t("commitUi.generateWithAi", { hint })
+          : t("commitUi.generateWithAi", { hint: "" })
+      }
+      onClick={onGenerate}
+    >
+      <SparkleIcon data-icon="inline-start" />
+      {t("commitUi.generate")}
+    </DisabledReasonButton>
+  );
+}
