@@ -1,0 +1,1253 @@
+import {
+  CheckCircleIcon,
+  PlusIcon,
+  XCircleIcon,
+  XIcon,
+} from "@phosphor-icons/react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSelector } from "@tanstack/react-store";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import type { ReactNode } from "react";
+import { useRef, useState } from "react";
+import { toast } from "sonner";
+import { CopyIconButton } from "@/components/CopyIconButton";
+import { Button } from "@/components/ui/button";
+import {
+  Combobox,
+  ComboboxContent,
+  ComboboxEmpty,
+  ComboboxInput,
+  ComboboxItem,
+  ComboboxList,
+} from "@/components/ui/combobox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Spinner } from "@/components/ui/spinner";
+import { Switch } from "@/components/ui/switch";
+import { detectAgentCli, providerKind } from "@/lib/ai/agent";
+import {
+  entryMatchesUrl,
+  isHostAllowed,
+  normalizeHost,
+} from "@/lib/ai/allowed-hosts";
+import { LOGIN_COMMAND } from "@/lib/ai/cli-client";
+import { createAiClient } from "@/lib/ai/client";
+import { modelPickerEmptyText, useAvailableModels } from "@/lib/ai/models";
+import {
+  ALL_PROVIDER_IDS,
+  defaultModelForProvider,
+  GENERATION_PROVIDER_IDS,
+  GOOGLE_AI_STUDIO_KEYS_URL,
+  isCliProvider,
+  OPENAI_COMPATIBLE_PRESETS,
+  PROVIDER_LABELS,
+  PROVIDERS_REQUIRING_KEY,
+} from "@/lib/ai/providers";
+import {
+  REVIEW_CONTEXT_SIZES,
+  type ReviewContextSize,
+} from "@/lib/ai/review-context-size";
+import {
+  REVIEW_EFFORTS,
+  type ReviewEffort,
+  reviewEffortCapable,
+} from "@/lib/ai/review-effort";
+import { REVIEW_TIMEOUTS, type ReviewTimeout } from "@/lib/ai/review-timeout";
+import type { AiProviderId, AiSettings } from "@/lib/ai/types";
+import { required, useAppForm, withForm } from "@/lib/form";
+import { deleteSecret, setSecret } from "@/lib/git/api";
+import type { DEFAULT_AGENT_IDS } from "@/lib/settings/api";
+import { settingsKeys, useSecretPreview } from "@/lib/settings/queries";
+import { useUiStore } from "@/lib/stores/ui";
+import { errorMessage } from "@/lib/tauri/invoke";
+import { toastError } from "@/lib/toast";
+import { useTranslation } from "@/lib/i18n";
+import { cn } from "@/lib/utils";
+import { AgentSandboxField } from "./AgentSandboxField";
+import { HostAllowNote } from "./HostAllowNote";
+import { settingsFormOpts } from "./settings-form";
+
+/** Typical key shapes per provider; used for a soft warning, never to block. */
+const KEY_HINTS: Partial<
+  Record<AiProviderId, { prefix: string; minLength: number }>
+> = {
+  openai: { prefix: "sk-", minLength: 40 },
+  anthropic: { prefix: "sk-ant-", minLength: 40 },
+  openrouter: { prefix: "sk-or-", minLength: 40 },
+  // No google entry: AI Studio issues both legacy `AIza…` keys and current `AQ.…`
+  // auth keys, so any single-prefix hint false-warns on a working key.
+};
+
+function keyShapeWarning(provider: AiProviderId, value: string): string | null {
+  const hint = KEY_HINTS[provider];
+  if (!hint || !value.trim()) return null;
+  const v = value.trim();
+  if (v.startsWith(hint.prefix) && v.length >= hint.minLength) return null;
+  return `Doesn't look like a ${PROVIDER_LABELS[provider]} key (expected "${hint.prefix}…"). You can still save it.`;
+}
+
+/**
+ * Provider + model picker pair, shared by the generation and review model
+ * blocks. Edits are draft-local; switching provider remembers the model you
+ * had chosen for each provider and restores it when you switch back.
+ */
+function ModelPicker({
+  idPrefix,
+  value,
+  onChange,
+  providerIds,
+  allowedHosts,
+}: {
+  idPrefix: string;
+  value: AiSettings;
+  onChange: (next: AiSettings) => void;
+  providerIds: AiProviderId[];
+  allowedHosts: string[];
+}) {
+  const { t } = useTranslation();
+  const keyPreview = useSecretPreview(value.provider);
+  const isCli = isCliProvider(value.provider);
+  // Listing a CLI's catalog spawns it, so a CLI provider's probe waits for the
+  // user to reach the picker — sticky, matching the session and PR-review
+  // pickers. HTTP providers keep fetching eagerly: reaching Settings → AI is
+  // itself the intent, and the cost is a GET, not a subprocess.
+  const [modelsWanted, setModelsWanted] = useState(false);
+  const availableModels = useAvailableModels(
+    value,
+    Boolean(keyPreview.data),
+    allowedHosts,
+    { enabled: !isCli || modelsWanted },
+  );
+  const catalog = availableModels.data;
+  const models = catalog?.models ?? [];
+  const modelMemory = useRef<Partial<Record<AiProviderId, string>>>({});
+  // Only a failed fetch carries unbounded provider prose, so it alone is clamped and
+  // given a tooltip; every other line is short enough to render whole.
+  const failureReason =
+    catalog?.cause === "failed" ? catalog.reason : undefined;
+  // Each fallback route reads differently to a user, and the predicates are
+  // heterogeneous (provider kind, then query state, then the catalog's own
+  // cause) — a saved-but-rejected key must never be told to save a key.
+  const hint = ((): string => {
+    switch (true) {
+      // Derived, not a provider literal: a CLI with a live catalog (opencode)
+      // falls through to the loading/live branches like an HTTP provider — and
+      // a failed probe falls through so its reason surfaces.
+      case isCli &&
+        catalog?.live !== true &&
+        catalog?.cause !== "failed" &&
+        !availableModels.isFetching:
+        return t("settingsAdvanced.modelCliDefault");
+      // A settled live list outranks an in-flight refetch: an HTTP provider's
+      // background refetch (staleTime + focus refetch) keeps its `live` data, so
+      // "Loading…" must not flash over the shown count. First load and a provider
+      // switch both change the query key, so `live` is false on the placeholder
+      // and the loading case still wins there.
+      case catalog?.live === true:
+        return t("aiSettings.modelCount", { count: models.length, provider: PROVIDER_LABELS[value.provider] });
+      case availableModels.isFetching:
+        return t("settingsAdvanced.modelLoading");
+      case failureReason !== undefined:
+        return t("aiSettings.liveListFailed", { reason: failureReason });
+      case catalog?.cause === "empty":
+        return t("aiSettings.noModelsReturned");
+      case catalog?.cause === "no-base":
+        return t("aiSettings.setBaseUrlForModels");
+      case catalog?.cause === "no-key":
+        return t("aiSettings.saveKeyForModels");
+      default:
+        return t("settingsAdvanced.providerModelsUnavailable");
+    }
+  })();
+
+  function switchProvider(provider: AiProviderId) {
+    modelMemory.current[value.provider] = value.model;
+    onChange({
+      ...value,
+      provider,
+      model: modelMemory.current[provider] ?? defaultModelForProvider(provider),
+    });
+  }
+
+  return (
+    <div className="grid grid-cols-2 gap-4">
+      <div className="space-y-2">
+        <Label htmlFor={`${idPrefix}-provider`}>{t("settings.provider")}</Label>
+        <Select
+          items={PROVIDER_LABELS}
+          value={value.provider}
+          onValueChange={(v) => {
+            if (v) switchProvider(v as AiProviderId);
+          }}
+        >
+          <SelectTrigger id={`${idPrefix}-provider`} className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {providerIds.map((id) => (
+              <SelectItem key={id} value={id}>
+                {PROVIDER_LABELS[id]}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      <div className="space-y-2">
+        <Label htmlFor={`${idPrefix}-model`}>{t("settings.model")}</Label>
+        <Combobox
+          items={models}
+          inputValue={value.model}
+          onInputValueChange={(model) => onChange({ ...value, model })}
+          // UNCLAMPED on purpose: Base UI syncs the input to the selected item's
+          // label as the popup finishes closing, and a null selection syncs it
+          // to "" — clamping to the catalog would wipe a typed id on close.
+          value={value.model || null}
+          onValueChange={(model) => {
+            if (model) onChange({ ...value, model });
+          }}
+          openOnInputClick
+          onOpenChange={(open) => {
+            if (open) setModelsWanted(true);
+          }}
+        >
+          <ComboboxInput
+            id={`${idPrefix}-model`}
+            className="w-full"
+            placeholder={
+              defaultModelForProvider(value.provider) || t("aiSettings.accountDefault")
+            }
+            onFocus={() => setModelsWanted(true)}
+          />
+          <ComboboxContent>
+            <ComboboxEmpty>
+              {modelPickerEmptyText(availableModels.isFetching)}
+            </ComboboxEmpty>
+            <ComboboxList>
+              {(item: string) => (
+                <ComboboxItem key={item} value={item}>
+                  <span className="truncate font-mono">{item}</span>
+                </ComboboxItem>
+              )}
+            </ComboboxList>
+          </ComboboxContent>
+        </Combobox>
+        <p
+          className={cn(
+            "text-xs text-muted-foreground",
+            failureReason !== undefined && "line-clamp-2",
+          )}
+          title={failureReason !== undefined ? hint : undefined}
+        >
+          {hint}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Detection + optional binary-path override for a CLI provider (generation or
+ * review). Shows whether the CLI is installed and signed in, since there's no
+ * API key to save. `idPrefix` keeps the input id unique when both the generation
+ * and review pickers have a CLI selected — load-bearing for ARIA correctness
+ * (duplicate DOM ids), so never default or remove it; `description` carries the
+ * surface-specific footer copy.
+ */
+function CliProviderConfig({
+  idPrefix,
+  value,
+  onChange,
+  description,
+}: {
+  idPrefix: string;
+  value: AiSettings;
+  onChange: (next: AiSettings) => void;
+  description: ReactNode;
+}) {
+  const { t } = useTranslation();
+  const kind = providerKind(value.provider);
+  const detect = useQuery({
+    queryKey: ["agent-detect", value.provider, value.cliPath ?? ""],
+    queryFn: () => detectAgentCli(kind!, value.cliPath),
+    enabled: Boolean(kind),
+    staleTime: 60_000,
+    // A local CLI probe: react-query's default "online" mode would park it offline.
+    networkMode: "always",
+  });
+  const info = detect.data;
+  const version = info?.version ? ` (${info.version})` : "";
+
+  return (
+    <div className="space-y-2">
+      <Label htmlFor={`${idPrefix}-cli-path`}>
+        {t("aiProviderText.cliPath")}{" "}
+        <span className="font-normal text-muted-foreground">{t("aiProviderText.optional")}</span>
+      </Label>
+      <Input
+        id={`${idPrefix}-cli-path`}
+        autoComplete="off"
+        placeholder={t("settingsAdvanced.modelAutoDetectPath")}
+        value={value.cliPath ?? ""}
+        onChange={(e) => onChange({ ...value, cliPath: e.target.value })}
+      />
+      <div className="text-xs">
+        {detect.isPending ? (
+          <span className="text-muted-foreground">
+            {t("aiProviderText.checking", { provider: PROVIDER_LABELS[value.provider] })}
+          </span>
+        ) : info?.found && info.authed === "notAuthed" ? (
+          <span className="flex items-center gap-1 text-warning">
+            <XCircleIcon className="size-4 shrink-0" />
+            {t("aiProviderText.cliFoundUnauthed", { version, command: LOGIN_COMMAND[kind ?? "claude"] })}
+          </span>
+        ) : info?.found ? (
+          <span className="flex items-center gap-1 text-success">
+            <CheckCircleIcon className="size-4 shrink-0" />
+            {t("aiProviderText.cliFound", { version })}
+            {info.authed === "authed" ? t("aiProviderText.signedIn") : ""}
+          </span>
+        ) : (
+          <span className="flex items-center gap-1 text-destructive">
+            <XCircleIcon className="size-4 shrink-0" />
+            {t("aiProviderText.cliMissing")}
+          </span>
+        )}
+      </div>
+      <p className="text-xs text-muted-foreground">{description}</p>
+    </div>
+  );
+}
+
+/** Labels for the OpenAI-compatible preset select — the presets plus the manual
+ *  "Custom…" escape. Trigger and popup both render from here, so the two can
+ *  never drift. */
+type DefaultAgentId = (typeof DEFAULT_AGENT_IDS)[number];
+type DefaultAgentChoice = "auto" | DefaultAgentId;
+
+/** Ollama base-URL field — the URL the local/LAN Ollama server is reached at. */
+function OllamaConfig({
+  idPrefix,
+  value,
+  onChange,
+  allowedHosts,
+  onAllowHost,
+}: {
+  idPrefix: string;
+  value: AiSettings;
+  onChange: (next: AiSettings) => void;
+  allowedHosts: string[];
+  onAllowHost: (url: string) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="space-y-2">
+      <Label htmlFor={`${idPrefix}-ollama-url`}>{t("settingsAdvanced.ollamaUrl")}</Label>
+      <Input
+        id={`${idPrefix}-ollama-url`}
+        autoComplete="off"
+        placeholder="http://localhost:11434"
+        value={value.ollamaBaseUrl}
+        onChange={(e) => onChange({ ...value, ollamaBaseUrl: e.target.value })}
+      />
+      <HostAllowNote
+        url={value.ollamaBaseUrl}
+        allowedHosts={allowedHosts}
+        onAllowHost={onAllowHost}
+        defaultNote={t("aiSettings.ollamaDefaultNote")}
+      />
+    </div>
+  );
+}
+
+/**
+ * Base-URL + preset picker for the `openai-compatible` provider. Choosing a preset
+ * fills the base URL (and a default model); the URL stays editable for any other
+ * OpenAI-compatible endpoint. A host outside the built-in presets must be allowed.
+ */
+function OpenAiCompatibleConfig({
+  idPrefix,
+  value,
+  onChange,
+  allowedHosts,
+  onAllowHost,
+}: {
+  idPrefix: string;
+  value: AiSettings;
+  onChange: (next: AiSettings) => void;
+  allowedHosts: string[];
+  onAllowHost: (url: string) => void;
+}) {
+  const { t } = useTranslation();
+  const presetItems: Record<string, string> = {
+    ...Object.fromEntries(OPENAI_COMPATIBLE_PRESETS.map((p) => [p.id, p.label])),
+    custom: t("editorSettings.custom"),
+  };
+  const base = value.openaiCompatibleBaseUrl.replace(/\/$/, "");
+  const current = OPENAI_COMPATIBLE_PRESETS.find((p) => p.baseUrl === base);
+  const presetId = current?.id ?? "custom";
+
+  return (
+    <div className="grid grid-cols-2 gap-4">
+      <div className="space-y-2">
+        <Label htmlFor={`${idPrefix}-oai-compat-preset`}>{t("settingsAdvanced.service")}</Label>
+        <Select
+          items={presetItems}
+          value={presetId}
+          onValueChange={(id) => {
+            const p = OPENAI_COMPATIBLE_PRESETS.find((x) => x.id === id);
+            if (p) {
+              onChange({
+                ...value,
+                openaiCompatibleBaseUrl: p.baseUrl,
+                model: p.models[0] ?? value.model,
+              });
+            }
+          }}
+        >
+          <SelectTrigger
+            id={`${idPrefix}-oai-compat-preset`}
+            className="w-full"
+          >
+            <SelectValue placeholder={t("settingsAdvanced.custom")} />
+          </SelectTrigger>
+          <SelectContent>
+            {Object.entries(presetItems).map(([id, label]) => (
+              <SelectItem key={id} value={id}>
+                {label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      <div className="space-y-2">
+        <Label htmlFor={`${idPrefix}-oai-compat-url`}>{t("settingsAdvanced.baseUrl")}</Label>
+        <Input
+          id={`${idPrefix}-oai-compat-url`}
+          autoComplete="off"
+          placeholder="https://…/v1"
+          value={value.openaiCompatibleBaseUrl}
+          onChange={(e) =>
+            onChange({ ...value, openaiCompatibleBaseUrl: e.target.value })
+          }
+        />
+      </div>
+
+      <div className="col-span-2">
+        <HostAllowNote
+          url={value.openaiCompatibleBaseUrl}
+          allowedHosts={allowedHosts}
+          onAllowHost={onAllowHost}
+          defaultNote={
+            <>
+              {t("aiProviderText.openAiCompatibleHelp", { endpoint: "/chat/completions" })}{" "}
+              {current?.keysUrl
+                ? `Get an API key at ${current.keysUrl}.`
+                : null}
+            </>
+          }
+        />
+      </div>
+    </div>
+  );
+}
+
+/** The provider-specific URL config (Ollama URL or OpenAI-compatible base URL),
+ *  shared by the generation and review model blocks. Renders nothing for a
+ *  provider with a fixed host. */
+function ProviderUrlConfig({
+  idPrefix,
+  value,
+  onChange,
+  allowedHosts,
+  onAllowHost,
+}: {
+  idPrefix: string;
+  value: AiSettings;
+  onChange: (next: AiSettings) => void;
+  allowedHosts: string[];
+  onAllowHost: (url: string) => void;
+}) {
+  if (value.provider === "ollama") {
+    return (
+      <OllamaConfig
+        idPrefix={idPrefix}
+        value={value}
+        onChange={onChange}
+        allowedHosts={allowedHosts}
+        onAllowHost={onAllowHost}
+      />
+    );
+  }
+  if (value.provider === "openai-compatible") {
+    return (
+      <OpenAiCompatibleConfig
+        idPrefix={idPrefix}
+        value={value}
+        onChange={onChange}
+        allowedHosts={allowedHosts}
+        onAllowHost={onAllowHost}
+      />
+    );
+  }
+  return null;
+}
+
+/**
+ * Manage the AI host allowlist — add a `host[:port]`, remove one. Built-in
+ * provider hosts and localhost are always allowed and aren't listed. The list
+ * is the effective gate for which custom servers the app will talk to (the Tauri
+ * HTTP capability is opened broadly as a backstop), so it's worth keeping tight.
+ */
+function AllowedHostsField({
+  hosts,
+  activeUrls,
+  onChange,
+}: {
+  hosts: string[];
+  /** URLs the currently-selected Ollama/OpenAI-compatible providers point at, so
+   *  a host that's keeping one reachable can be flagged before it's removed. */
+  activeUrls: string[];
+  onChange: (next: string[]) => void;
+}) {
+  const { t } = useTranslation();
+  const [draft, setDraft] = useState("");
+  const [warn, setWarn] = useState<{ text: string; sig: string } | null>(null);
+  /** A warning is valid on two axes. The hosts-draft axis rides this signature —
+   *  a mismatch retires the warning outright, so restoring the hosts can't
+   *  resurrect it — covering the footer's Discard, which form.reset()s while this
+   *  field stays mounted, and allow-list writes from elsewhere; the input axis
+   *  rides the typing and Escape clears below. */
+  const hostsSig = JSON.stringify(hosts);
+  // Set during render of the component that owns the state: React's derived-state
+  // reset, re-rendered before commit with no cross-component warning. An effect
+  // would commit a stale warning for a frame first.
+  if (warn && warn.sig !== hostsSig) setWarn(null);
+  const visibleWarn = warn && warn.sig === hostsSig ? warn.text : null;
+
+  function add() {
+    const host = normalizeHost(draft);
+    if (!host) {
+      setWarn({ text: t("aiSettings.enterHostExample"), sig: hostsSig });
+      return;
+    }
+    // isHostAllowed also covers built-in/local hosts and a port already covered
+    // by a no-port entry, so this blocks adding a redundant or always-allowed one.
+    if (isHostAllowed(`http://${host}`, hosts)) {
+      setWarn({ text: t("aiSettings.hostAlreadyAllowed", { host }), sig: hostsSig });
+      return;
+    }
+    onChange([...hosts, host]);
+    setDraft("");
+  }
+
+  return (
+    <div className="space-y-3 border-t pt-4">
+      <div>
+        <h3 className="text-sm font-medium">{t("settings.allowedHosts")}</h3>
+        <p className="text-xs text-muted-foreground">
+          {t("aiProviderText.allowedHostsHelp")}
+        </p>
+      </div>
+      <div className="flex items-start gap-2">
+        <div className="flex-1 space-y-1">
+          <Input
+            aria-label={t("settings.hostToAllow")}
+            autoComplete="off"
+            placeholder="192.168.1.50:11434"
+            value={draft}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              setWarn(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                add();
+              } else if (e.key === "Escape") {
+                setDraft("");
+                setWarn(null);
+              }
+            }}
+          />
+          {visibleWarn && <p className="text-xs text-warning">{visibleWarn}</p>}
+        </div>
+        <Button
+          type="button"
+          variant="outline"
+          onClick={add}
+          disabled={!draft.trim()}
+        >
+          <PlusIcon data-icon="inline-start" />
+          {t("aiProviderText.addHost")}
+        </Button>
+      </div>
+      {hosts.length > 0 ? (
+        <ul className="space-y-1">
+          {hosts.map((h) => {
+            const inUse = activeUrls.some((u) => entryMatchesUrl(h, u));
+            return (
+              <li
+                key={h}
+                className="flex items-center justify-between gap-2 border px-3 py-1.5"
+              >
+                <span className="flex min-w-0 items-center gap-2">
+                  <span className="truncate font-mono text-xs">{h}</span>
+                  {inUse && (
+                    <span className="shrink-0 text-[11px] text-muted-foreground">
+                      {t("aiProviderText.inUse")}
+                    </span>
+                  )}
+                </span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={t("aiProviderText.removeHost", { host: h })}
+                  onClick={() => onChange(hosts.filter((x) => x !== h))}
+                >
+                  <XIcon />
+                </Button>
+              </li>
+            );
+          })}
+        </ul>
+      ) : (
+        <p className="text-xs text-muted-foreground">
+          {t("aiProviderText.noCustomHosts")}
+        </p>
+      )}
+    </div>
+  );
+}
+
+export const AiProviderSection = withForm({
+  ...settingsFormOpts,
+  render: function AiProviderSectionRender({ form }) {
+    const { t } = useTranslation();
+    const reviewContextItems: Record<ReviewContextSize, string> = {
+      auto: t("aiSettings.contextAuto"),
+      small: t("aiSettings.contextCompact"),
+      medium: t("aiSettings.contextStandard"),
+      large: t("aiSettings.contextExpanded"),
+    };
+    const reviewTimeoutItems: Record<ReviewTimeout, string> = {
+      auto: t("aiSettings.timeoutAuto"),
+      "10": t("aiSettings.timeoutMinutes", { count: 10 }),
+      "15": t("aiSettings.timeoutMinutes", { count: 15 }),
+      "20": t("aiSettings.timeoutMinutes", { count: 20 }),
+      "30": t("aiSettings.timeoutMinutes", { count: 30 }),
+      "45": t("aiSettings.timeoutMinutes", { count: 45 }),
+      "60": t("aiSettings.timeoutMinutes", { count: 60 }),
+    };
+    const reviewEffortItems: Record<ReviewEffort, string> = {
+      auto: t("aiSettings.effortDefault"),
+      low: t("aiSettings.effortLow"),
+      medium: t("aiSettings.effortMedium"),
+      high: t("aiSettings.effortHigh"),
+      xhigh: t("aiSettings.effortMax"),
+    };
+    const defaultAgentItems: Record<DefaultAgentChoice, string> = {
+      auto: t("aiSettings.agentAuto"),
+      claude: "Claude",
+      codex: "Codex",
+      copilot: "GitHub Copilot",
+      opencode: "opencode",
+    };
+    const queryClient = useQueryClient();
+    const ai = useSelector(form.store, (s) => s.values.ai);
+    const reviewAi = useSelector(form.store, (s) => s.values.reviewAi);
+    // Optional dedicated security-audit config. `undefined` = off (security
+    // audits use `reviewAi`); an object = the toggle is on and its trio shows.
+    const securityReviewAi = useSelector(
+      form.store,
+      (s) => s.values.securityReviewAi,
+    );
+    const reviewContextSize = useSelector(
+      form.store,
+      (s) => s.values.reviewContextSize ?? "auto",
+    );
+    const reviewTimeout = useSelector(
+      form.store,
+      (s) => s.values.reviewTimeout ?? "auto",
+    );
+    const reviewEffort = useSelector(
+      form.store,
+      (s) => s.values.reviewEffort ?? "auto",
+    );
+    // `undefined` = Auto (no explicit default; new runs follow `ai.provider`).
+    const defaultAgent = useSelector(form.store, (s) => s.values.defaultAgent);
+    const agentIsolation = useSelector(
+      form.store,
+      (s) => s.values.agentIsolation,
+    );
+    const agentImageNodeVersion = useSelector(
+      form.store,
+      (s) => s.values.agentImageNodeVersion,
+    );
+    const agentImageProviders = useSelector(
+      form.store,
+      (s) => s.values.agentImageProviders,
+    );
+    const repoPath = useUiStore((s) => s.repoPath);
+    const allowedHosts = useSelector(
+      form.store,
+      (s) => s.values.aiAllowedHosts,
+    );
+    const provider = ai.provider;
+    const needsKey = PROVIDERS_REQUIRING_KEY.includes(provider);
+    const keyPreview = useSecretPreview(provider);
+    // The Allowed-hosts manager is only relevant to the providers that take a
+    // custom URL; keep it out of the way for the cloud-only majority.
+    const showAllowedHosts = [
+      ai.provider,
+      reviewAi.provider,
+      securityReviewAi?.provider,
+    ].some((p) => p === "ollama" || p === "openai-compatible");
+    // The URLs the selected custom-host providers point at — so a host that's
+    // keeping one reachable shows an "in use" hint before it's removed.
+    const activeProviderUrls = [
+      ai.provider === "ollama" && ai.ollamaBaseUrl,
+      ai.provider === "openai-compatible" && ai.openaiCompatibleBaseUrl,
+      reviewAi.provider === "ollama" && reviewAi.ollamaBaseUrl,
+      reviewAi.provider === "openai-compatible" &&
+        reviewAi.openaiCompatibleBaseUrl,
+      securityReviewAi?.provider === "ollama" && securityReviewAi.ollamaBaseUrl,
+      securityReviewAi?.provider === "openai-compatible" &&
+        securityReviewAi.openaiCompatibleBaseUrl,
+    ].filter((u): u is string => Boolean(u));
+
+    const [confirmClear, setConfirmClear] = useState(false);
+    const [testing, setTesting] = useState(false);
+    const [testResult, setTestResult] = useState<{
+      ok: boolean;
+      message?: string;
+      /** The draft signature this verdict was produced under (see testConfig). */
+      config: string;
+    } | null>(null);
+    /** Signature over every DRAFT input testConnection reads. The verdict renders
+     *  only while the current signature still matches the one it was produced
+     *  under, so any route that changes the draft — including the footer's Discard,
+     *  which form.reset()s while this section stays mounted, and allow-list writes
+     *  from other sections — retires it without needing to know to clear it. A
+     *  key-order difference could only hide a verdict early, never keep a stale one. */
+    const testConfig = JSON.stringify({ ai, allowedHosts });
+    /** Generation for the in-flight connection test. Bumping it makes a running
+     *  test discard its own outcome — used for saved-key changes, which the draft
+     *  signature can't see (keys live in the keychain, not the form). */
+    const testRun = useRef(0);
+
+    function discardTestResult() {
+      testRun.current += 1;
+      setTestResult(null);
+    }
+
+    // Keys save immediately to the OS keychain (they're not part of the
+    // settings draft), so they get their own little form.
+    const keyForm = useAppForm({
+      defaultValues: { key: "" },
+      onSubmit: async ({ value }) => {
+        try {
+          await setSecret(provider, value.key.trim());
+          keyForm.reset({ key: "" });
+          // The old result described the old key, so leaving it up makes a fixed
+          // setup look broken.
+          discardTestResult();
+          queryClient.invalidateQueries({
+            queryKey: settingsKeys.secret(provider),
+          });
+          // The models query keys on a BOOLEAN "a key is saved", which doesn't move
+          // when a bad key is replaced — without this the picker keeps serving the
+          // failed fetch's suggestions for the rest of its 5-minute staleTime.
+          queryClient.invalidateQueries({ queryKey: ["models"] });
+          toast.success(
+            `${PROVIDER_LABELS[provider]} key saved to OS keychain`,
+          );
+        } catch (e) {
+          toastError(e);
+        }
+      },
+    });
+
+    function setAi(next: AiSettings) {
+      form.setFieldValue("ai", next);
+    }
+
+    /** Add a URL's host to the draft allowlist (dedup'd) — the one-click fix
+     *  behind the contextual "Allow host" affordance on the URL fields. */
+    function allowHost(url: string) {
+      const host = normalizeHost(url);
+      if (host && !allowedHosts.includes(host)) {
+        form.setFieldValue("aiAllowedHosts", [...allowedHosts, host]);
+      }
+    }
+
+    async function clearKey() {
+      try {
+        await deleteSecret(provider);
+        queryClient.invalidateQueries({
+          queryKey: settingsKeys.secret(provider),
+        });
+        queryClient.invalidateQueries({ queryKey: ["models"] });
+        setConfirmClear(false);
+        discardTestResult();
+        toast.success(t("aiSettings.keyRemoved"));
+      } catch (e) {
+        toastError(e);
+      }
+    }
+
+    async function testConnection() {
+      const run = ++testRun.current;
+      // Captured before the first await: the verdict must carry the signature it
+      // was produced under, not whatever the draft holds when it resolves.
+      const config = testConfig;
+      setTesting(true);
+      setTestResult(null);
+      try {
+        // Use a typed-but-unsaved key and the unsaved allow list, so you can
+        // test a just-added host/key before saving the settings draft.
+        const client = await createAiClient(
+          ai,
+          keyForm.getFieldValue("key"),
+          allowedHosts,
+        );
+        const result = await client.testConnection();
+        if (run !== testRun.current) return;
+        setTestResult(
+          result.ok
+            ? { ok: true, config }
+            : { ok: false, message: result.message, config },
+        );
+      } catch (e) {
+        if (run !== testRun.current) return;
+        setTestResult({ ok: false, message: errorMessage(e), config });
+      } finally {
+        // Always released: the button is disabled while testing, so no newer run
+        // can own this flag — a superseded run still has to hand it back.
+        setTesting(false);
+      }
+    }
+
+    return (
+      <section className="space-y-4">
+        <div>
+          <h2 className="text-sm font-medium">{t("settings.aiProvider")}</h2>
+          <p className="text-xs text-muted-foreground">
+            {t("aiProviderText.generationHelp")}
+          </p>
+        </div>
+
+        <ModelPicker
+          idPrefix="ai"
+          value={ai}
+          onChange={setAi}
+          providerIds={GENERATION_PROVIDER_IDS}
+          allowedHosts={allowedHosts}
+        />
+
+        <ProviderUrlConfig
+          idPrefix="ai"
+          value={ai}
+          onChange={setAi}
+          allowedHosts={allowedHosts}
+          onAllowHost={allowHost}
+        />
+
+        {isCliProvider(ai.provider) && (
+          <CliProviderConfig
+            idPrefix="ai"
+            value={ai}
+            onChange={setAi}
+            description={
+              <>
+                {t("aiProviderText.cliGenerationHelp")}
+              </>
+            }
+          />
+        )}
+
+        {needsKey && (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              keyForm.handleSubmit();
+            }}
+          >
+            <div className="space-y-2">
+              <Label htmlFor="ai-api-key">
+                {t("aiProviderText.apiKey")}{" "}
+                <span className="font-normal text-muted-foreground">
+                  {keyPreview.data
+                    ? t("aiProviderText.savedKey", { masked: keyPreview.data.masked, length: keyPreview.data.length })
+                    : t("aiProviderText.noKeySaved")}
+                </span>
+              </Label>
+              <div className="flex items-start gap-2">
+                <div className="flex-1">
+                  <keyForm.AppField
+                    name="key"
+                    validators={{ onChange: ({ value }) => required(value) }}
+                  >
+                    {(field) => (
+                      <field.TextField
+                        id="ai-api-key"
+                        type="password"
+                        placeholder={
+                          keyPreview.data
+                            ? t("aiSettings.replaceSavedKey")
+                            : t("aiSettings.pasteApiKey")
+                        }
+                        warning={(value) => keyShapeWarning(provider, value)}
+                      />
+                    )}
+                  </keyForm.AppField>
+                </div>
+                <keyForm.AppForm>
+                  <keyForm.SubmitButton>{t("settingsAdvanced.save")}</keyForm.SubmitButton>
+                </keyForm.AppForm>
+                {keyPreview.data && (
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    onClick={() => setConfirmClear(true)}
+                  >
+                    {t("aiProviderText.clear")}
+                  </Button>
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                    {t("aiSettings.keyUsageDescription")}{" "}
+                {provider === "google" && (
+                  <>
+                    {t("aiSettings.getGoogleApiKeyAt")}{" "}
+                    <button
+                      type="button"
+                      className="cursor-pointer underline underline-offset-2"
+                      onClick={() => openUrl(GOOGLE_AI_STUDIO_KEYS_URL)}
+                    >
+                      aistudio.google.com
+                    </button>
+                    .
+                  </>
+                )}
+              </p>
+            </div>
+          </form>
+        )}
+
+        <div className="flex items-center gap-3">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={testConnection}
+            disabled={testing}
+          >
+            {testing && <Spinner data-icon="inline-start" />}
+            {t("aiSettings.testConnection")}
+          </Button>
+          {testResult?.ok && testResult.config === testConfig && (
+            <span className="flex items-center gap-1 text-xs text-success">
+              <CheckCircleIcon className="size-4" /> {t("aiSettings.connected")}
+            </span>
+          )}
+          {testResult && !testResult.ok && testResult.config === testConfig && (
+            <span className="flex min-w-0 items-center gap-1 text-xs text-destructive">
+              <XCircleIcon className="size-4 shrink-0" />
+              <span className="line-clamp-2">{testResult.message}</span>
+              <CopyIconButton
+                text={testResult.message ?? ""}
+                label={t("settingsAdvanced.copyErrorMessage")}
+                toast={t("aiSettings.errorCopied")}
+              />
+            </span>
+          )}
+        </div>
+
+        <div className="space-y-4 border-t pt-4">
+          <div>
+            <h3 className="text-sm font-medium">{t("settings.reviewModel")}</h3>
+            <p className="text-xs text-muted-foreground">
+              {t("aiProviderText.reviewHelp")}
+            </p>
+          </div>
+          <ModelPicker
+            idPrefix="review"
+            value={reviewAi}
+            onChange={(next) => form.setFieldValue("reviewAi", next)}
+            providerIds={ALL_PROVIDER_IDS}
+            allowedHosts={allowedHosts}
+          />
+          {isCliProvider(reviewAi.provider) && (
+            <CliProviderConfig
+              idPrefix="review"
+              value={reviewAi}
+              onChange={(next) => form.setFieldValue("reviewAi", next)}
+              description={
+                <>
+                  {t("aiProviderText.cliReviewHelp")}
+                </>
+              }
+            />
+          )}
+          <ProviderUrlConfig
+            idPrefix="review"
+            value={reviewAi}
+            onChange={(next) => form.setFieldValue("reviewAi", next)}
+            allowedHosts={allowedHosts}
+            onAllowHost={allowHost}
+          />
+          <div className="space-y-1.5">
+            <label className="flex cursor-pointer items-center gap-2 text-xs">
+              <Switch
+                checked={Boolean(securityReviewAi)}
+                onCheckedChange={(checked) =>
+                  form.setFieldValue(
+                    "securityReviewAi",
+                    // Seed from the CURRENT DRAFT review config so the audit
+                    // model starts where the review model is; clear to undefined
+                    // (not a stale object) so the field is truly absent when off.
+                    checked ? { ...reviewAi } : undefined,
+                  )
+                }
+              />
+              {t("aiProviderText.securityDifferentModel")}
+            </label>
+            {!securityReviewAi && (
+              <p className="text-xs text-muted-foreground">
+                {t("aiProviderText.securitySameModel")}
+              </p>
+            )}
+          </div>
+          {securityReviewAi && (
+            <div className="space-y-4">
+              <ModelPicker
+                idPrefix="security-review"
+                value={securityReviewAi}
+                onChange={(next) =>
+                  form.setFieldValue("securityReviewAi", next)
+                }
+                providerIds={ALL_PROVIDER_IDS}
+                allowedHosts={allowedHosts}
+              />
+              {isCliProvider(securityReviewAi.provider) && (
+                <CliProviderConfig
+                  idPrefix="security-review"
+                  value={securityReviewAi}
+                  onChange={(next) =>
+                    form.setFieldValue("securityReviewAi", next)
+                  }
+                  description={
+                    <>
+                      {t("aiProviderText.cliSecurityHelp")}
+                    </>
+                  }
+                />
+              )}
+              <ProviderUrlConfig
+                idPrefix="security-review"
+                value={securityReviewAi}
+                onChange={(next) =>
+                  form.setFieldValue("securityReviewAi", next)
+                }
+                allowedHosts={allowedHosts}
+                onAllowHost={allowHost}
+              />
+            </div>
+          )}
+          <div className="space-y-2">
+            <Label htmlFor="review-context-size">{t("settings.reviewContext")}</Label>
+            <Select
+              items={reviewContextItems}
+              value={reviewContextSize}
+              onValueChange={(v) => {
+                if (v)
+                  form.setFieldValue(
+                    "reviewContextSize",
+                    v as ReviewContextSize,
+                  );
+              }}
+            >
+              <SelectTrigger id="review-context-size" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {REVIEW_CONTEXT_SIZES.map((id) => (
+                  <SelectItem key={id} value={id}>
+                    {reviewContextItems[id]}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              {t("aiSettings.reviewContextDescription")}
+            </p>
+          </div>
+          {/* Effort rides each CLI's own reasoning lever, so the row shows only
+              when an effort-capable CLI (see reviewEffortCapable) drives
+              reviews or security audits. */}
+          {(reviewEffortCapable(reviewAi.provider) ||
+            (securityReviewAi &&
+              reviewEffortCapable(securityReviewAi.provider))) && (
+            <div className="space-y-2">
+              <Label htmlFor="review-effort">{t("settings.reviewEffort")}</Label>
+              <Select
+                items={reviewEffortItems}
+                value={reviewEffort}
+                onValueChange={(v) => {
+                  if (v) form.setFieldValue("reviewEffort", v as ReviewEffort);
+                }}
+              >
+                <SelectTrigger id="review-effort" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {REVIEW_EFFORTS.map((id) => (
+                    <SelectItem key={id} value={id}>
+                      {reviewEffortItems[id]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {t("aiSettings.reviewEffortDescription")}
+              </p>
+            </div>
+          )}
+          {/* Only the agent-CLI providers run under a kill timeout, so the row
+              shows when a CLI drives reviews or security audits. */}
+          {(isCliProvider(reviewAi.provider) ||
+            (securityReviewAi && isCliProvider(securityReviewAi.provider))) && (
+            <div className="space-y-2">
+              <Label htmlFor="review-timeout">{t("settings.reviewTimeout")}</Label>
+              <Select
+                items={reviewTimeoutItems}
+                value={reviewTimeout}
+                onValueChange={(v) => {
+                  if (v)
+                    form.setFieldValue("reviewTimeout", v as ReviewTimeout);
+                }}
+              >
+                <SelectTrigger id="review-timeout" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {REVIEW_TIMEOUTS.map((id) => (
+                    <SelectItem key={id} value={id}>
+                      {reviewTimeoutItems[id]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {t("aiSettings.reviewTimeoutDescription")}
+              </p>
+            </div>
+          )}
+        </div>
+
+        {showAllowedHosts && (
+          <AllowedHostsField
+            hosts={allowedHosts}
+            activeUrls={activeProviderUrls}
+            onChange={(next) => form.setFieldValue("aiAllowedHosts", next)}
+          />
+        )}
+
+        <div className="space-y-3 border-t pt-4">
+          <div>
+            <h3 className="text-sm font-medium">{t("settings.agentSessions")}</h3>
+            <p className="text-xs text-muted-foreground">
+              {t("aiSettings.agentSessionsDescription")}
+            </p>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="default-agent">{t("settings.defaultAgent")}</Label>
+            <Select
+              items={defaultAgentItems}
+              value={defaultAgent ?? "auto"}
+              onValueChange={(v) => {
+                if (!v) return;
+                // Clear to undefined (not an "auto" sentinel) so the field is
+                // truly absent and the resolver falls through to the provider.
+                form.setFieldValue(
+                  "defaultAgent",
+                  v === "auto" ? undefined : (v as DefaultAgentId),
+                );
+              }}
+            >
+              <SelectTrigger id="default-agent" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {(Object.keys(defaultAgentItems) as DefaultAgentChoice[]).map(
+                  (id) => (
+                    <SelectItem key={id} value={id}>
+                      {defaultAgentItems[id]}
+                    </SelectItem>
+                  ),
+                )}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              {defaultAgent
+                ? t("aiSettings.defaultAgentFixed", { agent: defaultAgentItems[defaultAgent] })
+                : t("aiSettings.defaultAgentAuto", { agent: defaultAgentItems[providerKind(ai.provider) ?? "claude"] })}
+            </p>
+          </div>
+          <div className="space-y-2">
+            {/* Sized below the section h3 so the sandbox controls read as its
+                subordinate group, not a second section. */}
+            <h4 className="text-xs font-medium">{t("settings.isolation")}</h4>
+            <AgentSandboxField
+              value={agentIsolation}
+              onChange={(v) => form.setFieldValue("agentIsolation", v)}
+              nodeVersion={agentImageNodeVersion}
+              onNodeVersion={(v) =>
+                form.setFieldValue("agentImageNodeVersion", v)
+              }
+              providers={agentImageProviders}
+              onProviders={(v) => form.setFieldValue("agentImageProviders", v)}
+              repoPath={repoPath}
+            />
+          </div>
+        </div>
+
+        <Dialog open={confirmClear} onOpenChange={setConfirmClear}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>{t("settings.removeSavedKey")}</DialogTitle>
+              <DialogDescription>
+                {t("aiProviderText.clearKeyDescription", { provider: PROVIDER_LABELS[provider] })}
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setConfirmClear(false)}>
+                {t("aiProviderText.cancel")}
+              </Button>
+              <Button variant="destructive" onClick={clearKey}>
+                {t("aiProviderText.removeKey")}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </section>
+    );
+  },
+});

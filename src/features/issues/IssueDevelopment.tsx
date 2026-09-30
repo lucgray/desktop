@@ -1,0 +1,253 @@
+import {
+  ArrowSquareOutIcon,
+  GitBranchIcon,
+  GitMergeIcon,
+  GitPullRequestIcon,
+  PlusIcon,
+} from "@phosphor-icons/react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { useState } from "react";
+import { useTranslation } from "@/lib/i18n";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Spinner } from "@/components/ui/spinner";
+import { useCreateLinkedBranch, useIssueDevelopment } from "@/lib/git/queries";
+import type { RemoteLens } from "@/lib/git/types";
+import { repoNameFromPath } from "@/lib/stores/notifications";
+import { useUiStore } from "@/lib/stores/ui";
+import { toastError } from "@/lib/toast";
+import { cn } from "@/lib/utils";
+
+/** Icon + tone for a linked PR, so state isn't conveyed by color alone. */
+function prPresentation(state: string): {
+  Icon: typeof GitPullRequestIcon;
+  tone: string;
+} {
+  if (state === "MERGED") {
+    return {
+      Icon: GitMergeIcon,
+      tone: "text-merged",
+    };
+  }
+  if (state === "CLOSED") {
+    return {
+      Icon: GitPullRequestIcon,
+      tone: "text-destructive",
+    };
+  }
+  return {
+    Icon: GitPullRequestIcon,
+    tone: "text-success",
+  };
+}
+
+/** GitHub's default linked-branch name: `<number>-<slugified title>`. */
+function defaultBranchName(number: number, title: string): string {
+  const slug = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-+|-+$)/g, "")
+    .slice(0, 60);
+  return slug ? `${number}-${slug}` : `${number}-branch`;
+}
+
+/**
+ * GitHub's issue "Development" section: the PRs that close/reference the issue
+ * and the branches linked to it. Clicking a PR opens it in the Pulls tab.
+ * "Create a branch" makes a new remote branch linked to the issue; linking an
+ * existing PR/branch has no public mutation, so it links out to GitHub. A
+ * meta-sidebar section (shows an empty state rather than hiding).
+ */
+export function IssueDevelopment({
+  repoPath,
+  number,
+  issueId,
+  issueTitle,
+  issueUrl,
+  lens,
+  disabledReason,
+}: {
+  repoPath: string;
+  number: number;
+  issueId: string;
+  issueTitle: string;
+  issueUrl: string;
+  /** The origin|upstream lens the parent issue view resolved. */
+  lens: RemoteLens;
+  /** Set when the viewer may not push: creating a linked branch is a remote
+   *  branch write, so that item disables and appends this text to its label (a
+   *  disabled menu item drops pointer events, so a tooltip never shows).
+   *  Callers pass the compact write-axis reason; the link-out stays live. */
+  disabledReason?: string;
+}) {
+  const { t } = useTranslation();
+  const dev = useIssueDevelopment(repoPath, number, lens);
+  const createBranch = useCreateLinkedBranch(repoPath, lens);
+  const openPr = useUiStore((s) => s.openPr);
+  const repoName = useUiStore((s) => s.repoName);
+  const [branchOpen, setBranchOpen] = useState(false);
+  const [branchName, setBranchName] = useState("");
+
+  const prs = dev.data?.prs ?? [];
+  const branches = dev.data?.branches ?? [];
+  const loaded = dev.data !== undefined;
+
+  function openLinkedPr(n: number) {
+    // Through the store's navigator: the PRs listed here are usually the ones
+    // that CLOSED the issue, so the Pulls list has to align its open/closed tab
+    // with the PR's real state rather than land on whichever tab was showing.
+    // The numbers come from `dev`, read under this view's live `lens`, so they
+    // resolve under the lens that produced them without a lens write.
+    openPr({
+      kind: "remote",
+      repoPath,
+      repoName: repoName ?? repoNameFromPath(repoPath),
+      ref: String(n),
+      section: null,
+    });
+  }
+
+  async function submitBranch() {
+    const name = branchName.trim();
+    if (!name) return;
+    try {
+      await createBranch.mutateAsync({ issueId, name });
+    } catch (e) {
+      toastError(e);
+      return;
+    }
+    toast.success(`Created branch ${name}`, {
+      description: t("issueDetail.fetchBranchLocally"),
+    });
+    setBranchOpen(false);
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center gap-2">
+        <p className="text-xs font-medium text-muted-foreground">{t("issues.development")}</p>
+        <span className="flex-1" />
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={
+              <Button
+                variant="ghost"
+                size="xs"
+                aria-label={t("issueDetail.developmentActions")}
+              />
+            }
+          >
+            <PlusIcon />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-56">
+            <DropdownMenuItem
+              disabled={!!disabledReason}
+              onClick={() => {
+                setBranchName(defaultBranchName(number, issueTitle));
+                setBranchOpen(true);
+              }}
+            >
+              {t("issues.createBranch")}…
+              {disabledReason ? ` — ${disabledReason}` : ""}
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => openUrl(issueUrl)}>
+              <ArrowSquareOutIcon />
+              {t("issueDetail.linkPullOrBranchGitHub")}…
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+
+      {prs.map((pr) => {
+        const { Icon, tone } = prPresentation(pr.state);
+        return (
+          <button
+            key={pr.number}
+            type="button"
+            onClick={() => openLinkedPr(pr.number)}
+            className="flex w-full cursor-pointer items-center gap-1.5 text-left text-xs hover:underline"
+            title={`#${pr.number} ${pr.title}`}
+          >
+            <Icon className={cn("size-3.5 shrink-0", tone)} />
+            <span className="text-muted-foreground">#{pr.number}</span>
+            <span className="min-w-0 flex-1 truncate">{pr.title}</span>
+          </button>
+        );
+      })}
+      {branches.map((b) => (
+        <div
+          key={b}
+          className="flex items-center gap-1.5 text-xs text-muted-foreground"
+          title={b}
+        >
+          <GitBranchIcon className="size-3.5 shrink-0" />
+          <span className="min-w-0 flex-1 truncate font-mono">{b}</span>
+        </div>
+      ))}
+      {loaded && prs.length === 0 && branches.length === 0 && (
+        <p className="text-[11px] text-muted-foreground">
+          {t("issueDetail.noLinkedPullRequestsOrBranches")}
+        </p>
+      )}
+
+      <Dialog open={branchOpen} onOpenChange={setBranchOpen}>
+        <DialogContent>
+          <form
+            className="space-y-4"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void submitBranch();
+            }}
+          >
+            <DialogHeader>
+              <DialogTitle>{t("issues.createBranch")}</DialogTitle>
+              <DialogDescription>
+                {t("issueDetail.createLinkedBranchDescription", { number })}
+              </DialogDescription>
+            </DialogHeader>
+            <Input
+              autoFocus
+              value={branchName}
+              onChange={(e) => setBranchName(e.target.value)}
+              placeholder="branch-name"
+              autoComplete="off"
+              spellCheck={false}
+              className="font-mono"
+            />
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setBranchOpen(false)}
+              >
+                {t("common.cancel")}
+              </Button>
+              <Button
+                type="submit"
+                disabled={!branchName.trim() || createBranch.isPending}
+              >
+                {createBranch.isPending && <Spinner data-icon="inline-start" />}
+                {t("issues.createBranch")}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

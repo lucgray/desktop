@@ -1,0 +1,3016 @@
+import { Popover } from "@base-ui/react/popover";
+import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  CaretDownIcon,
+  CheckIcon,
+  CloudArrowDownIcon,
+  CloudSlashIcon,
+  CloudXIcon,
+  GitBranchIcon,
+  GitPullRequestIcon,
+  TreeStructureIcon,
+} from "@phosphor-icons/react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
+import { ConfirmDialog } from "@/components/confirm-dialog";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { RelativeTime } from "@/components/relative-time";
+import { Badge } from "@/components/ui/badge";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
+import { Input } from "@/components/ui/input";
+import {
+  isDeletionBlocked,
+  isMergeMethodAllowed,
+  isPromotionBranch,
+  requiresPullRequest,
+} from "@/lib/branch-rules/match";
+import {
+  useEffectiveBranchRules,
+  useEffectiveBranchRulesSettling,
+} from "@/lib/branch-rules/queries";
+import { clipTitle } from "@/lib/clip-title";
+import { copyText } from "@/lib/clipboard";
+import { isDirtyTreeRefusal } from "@/lib/error-summary";
+import { forgeDetectForkPrForBranch } from "@/lib/git/api";
+import { normPath } from "@/lib/git/path";
+import {
+  branchRewriteStatusOptions,
+  forgeFeatureReady,
+  useBranchAhead,
+  useBranchDivergence,
+  useBranches,
+  useBranchResetToUpstream,
+  useBranchRewriteStatus,
+  useCheckoutBranch,
+  useCheckoutRemoteBranch,
+  useDefaultBranch,
+  useDeleteBranch,
+  useDeleteRemoteBranch,
+  useDiscardAll,
+  useForgeStatus,
+  useHardResetToCommit,
+  useMergeBranch,
+  usePrList,
+  usePush,
+  useRebaseBranch,
+  useRebaseOnto,
+  useRemoteBranches,
+  useRemotes,
+  useRepoStatus,
+  userWorktreesOptions,
+  useSetBranchArchived,
+  useStashAll,
+  useStashCount,
+  useStashPop,
+  useSwitchAutostash,
+  useUnlockUserWorktree,
+  useUpdateBranchFrom,
+  useUserWorktrees,
+} from "@/lib/git/queries";
+import type { Branch, ForkPrMatch, RemoteBranch } from "@/lib/git/types";
+import { listUserWorktrees, type UserWorktree } from "@/lib/git/worktree";
+import { secondaryClickLabel } from "@/lib/hotkeys/binding";
+import { dispatchAction, useHotkeyAction } from "@/lib/hotkeys/hotkeys";
+import { listKeyboardNav } from "@/lib/list-keyboard-nav";
+import {
+  LOCAL_AUDIT_STATE,
+  PR_AUDIT_TONE,
+  PR_RANK,
+  type PrAuditState,
+  REMOTE_AUDIT_STATE,
+} from "@/lib/pulls/audit";
+import { useLocalPrs } from "@/lib/pulls/queries";
+import { useSetRepoLens } from "@/lib/repo-lens/queries";
+import {
+  useAiConfigured,
+  useAiEnabled,
+  useSaveSettings,
+  useSettings,
+} from "@/lib/settings/queries";
+import { useConfirm } from "@/lib/stores/confirm";
+import { repoNameFromPath } from "@/lib/stores/notifications";
+import { type SelectedPr, useUiStore } from "@/lib/stores/ui";
+import {
+  isWorktreePromoting,
+  promotionBlocksCheckout,
+  useWorktreeRemovalStore,
+  useWorktreeRemovals,
+} from "@/lib/stores/worktree-removal";
+import { toastError } from "@/lib/toast";
+import { useTranslation } from "@/lib/i18n";
+import {
+  ARIA_DISABLED_CLASS,
+  useDisabledReason,
+} from "@/lib/use-disabled-reason";
+import { useRetained } from "@/lib/use-retained";
+import { cn } from "@/lib/utils";
+import {
+  BranchMergePickerDialog,
+  type MergeRunOptions,
+  type PickerMode,
+} from "./BranchMergePickerDialog";
+import {
+  CleanupBranchesDialog,
+  prCheckStateFrom,
+  worktreeCheckStateFrom,
+} from "./CleanupBranchesDialog";
+import { CreateBranchDialog } from "./CreateBranchDialog";
+import {
+  baseName,
+  PROMOTION_BLOCKS_CHECKOUT,
+  rowCheckoutCopy,
+} from "./checkout-copy";
+import { DeleteWorktreeDialog } from "./DeleteWorktreeDialog";
+import { ForkPrPublishGuard } from "./ForkPrPublishGuard";
+import { OperationHistoryDialog } from "./OperationHistoryDialog";
+import { PromoteWorktreeDialog } from "./PromoteWorktreeDialog";
+import { RebaseOntoDialog } from "./RebaseOntoDialog";
+import { RenameBranchDialog } from "./RenameBranchDialog";
+import { StashesDialog } from "./StashesDialog";
+import { SwitchWithChangesDialog } from "./SwitchWithChangesDialog";
+import { useOpenWorktree } from "./useOpenRepoByPath";
+import {
+  reportAutostashOutcome,
+  useStashReapplyRecovery,
+} from "./useStashReapplyRecovery";
+import {
+  LockWorktreeDialog,
+  RenameWorktreeDialog,
+  refuseWhileLeaving,
+  worktreeItemLabel,
+} from "./WorktreesDialog";
+
+/** Sentence-initial form of the platform's secondary-click word — for
+ *  status-icon hints where the phrase leads a sentence. */
+const secondaryClickCapitalized =
+  secondaryClickLabel.charAt(0).toUpperCase() + secondaryClickLabel.slice(1);
+
+/** How many closed PRs the branch surfaces scan. Merged state lives only in the
+ *  closed list, and gh's default 30 covers too little history for the cleanup
+ *  dialog's merged badge. The open list keeps the default so it goes on sharing a
+ *  cache entry with the session PR audit. */
+const CLOSED_PR_SCAN_LIMIT = 100;
+
+/** How many diverged rows get their rewrite status warmed when the popover opens.
+ *  The prefetch exists to keep a right-click from painting a slot whose identity
+ *  is still in flight; each entry costs several rev-list spawns, so it is capped
+ *  rather than run per branch. Rows past the cap fall back to the waiting slot. */
+const MAX_REWRITE_PREFETCH = 4;
+
+interface BranchPr {
+  state: PrAuditState;
+  /** "#123" for a remote PR, "local" for a local-only one. */
+  label: string;
+  /** The branch this PR targets. A merge into anything but the default branch
+   *  can't stand in for "merged into the default branch". */
+  base: string;
+  select: SelectedPr;
+}
+/** Sentence-initial state words for the badge's own hint — the audit chip's
+ *  labels lead with "PR", which reads wrong mid-sentence here. */
+const PR_STATE_LABEL: Record<PrAuditState, string> = {
+  open: "Open",
+  draft: "Draft",
+  merged: "Merged",
+  closed: "Closed",
+};
+
+function MenuRow({
+  disabled,
+  reason,
+  onClick,
+  children,
+}: {
+  disabled?: boolean;
+  /** Why the row is held. Absent leaves an ordinary native disable — used where
+   *  the label already states the reason. */
+  reason?: string | null;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  const { blockedReason, reasonId, wrapperTitle, describedBy, nativeProps } =
+    useDisabledReason({ disabled, reason, onClick });
+  return (
+    // Block, not the span default: the row's `w-full` needs a full-width parent
+    // to size against inside the menu's block container.
+    <span
+      className={cn("block w-full", blockedReason && "cursor-not-allowed")}
+      title={wrapperTitle}
+    >
+      <button
+        {...nativeProps}
+        type="button"
+        aria-describedby={describedBy}
+        className={cn(
+          "flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50",
+          ARIA_DISABLED_CLASS,
+        )}
+      >
+        {children}
+      </button>
+      {blockedReason ? (
+        <span id={reasonId} className="sr-only">
+          {blockedReason}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+export function BranchSwitcher({ repoPath }: { repoPath: string }) {
+  const { t } = useTranslation();
+  const status = useRepoStatus(repoPath);
+  const branches = useBranches(repoPath);
+  const defaultBranch = useDefaultBranch(repoPath);
+  const stashCount = useStashCount(repoPath);
+  const checkout = useCheckoutBranch(repoPath);
+  const checkoutRemote = useCheckoutRemoteBranch(repoPath);
+  const deleteBranch = useDeleteBranch(repoPath);
+  const deleteRemoteBranch = useDeleteRemoteBranch(repoPath);
+  const discardAll = useDiscardAll(repoPath);
+  const stashAll = useStashAll(repoPath);
+  const stashPop = useStashPop(repoPath);
+  const switchAutostash = useSwitchAutostash(repoPath);
+  const mergeBranch = useMergeBranch(repoPath);
+  const rebaseBranch = useRebaseBranch(repoPath);
+  const rebaseOnto = useRebaseOnto(repoPath);
+  const updateBranchFrom = useUpdateBranchFrom(repoPath);
+  const resetToUpstream = useBranchResetToUpstream(repoPath);
+  const hardReset = useHardResetToCommit(repoPath);
+  const push = usePush(repoPath);
+  const remotes = useRemotes(repoPath);
+  const setBranchArchived = useSetBranchArchived(repoPath);
+  const openWorktree = useOpenWorktree();
+  const unlockWorktree = useUnlockUserWorktree(repoPath);
+  const recovery = useStashReapplyRecovery(repoPath);
+  const settings = useSettings();
+  const saveSettings = useSaveSettings();
+  const rulesConfig = useEffectiveBranchRules(repoPath);
+  // While either rules scope is on its first read the effective config stands in
+  // as empty, so every protection check reads not-blocked — the delete surfaces
+  // hold on this rather than acting on that stand-in.
+  const rulesSettling = useEffectiveBranchRulesSettling(repoPath);
+  const amendingHash = useUiStore((s) => s.amendingHash);
+  const openSettings = useUiStore((s) => s.openSettings);
+  const aiEnabled = useAiEnabled();
+  const aiConfigured = useAiConfigured();
+
+  const [open, setOpen] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
+  // Remote-only branches show expanded by default (the point is to see them);
+  // archived shows collapsed (it's intentionally-hidden clutter).
+  const [showRemote, setShowRemote] = useState(true);
+  const [branchFilter, setBranchFilter] = useState("");
+  // The branch row the keyboard nav last landed on (drives arrow-key movement).
+  const [activeBranch, setActiveBranch] = useState<string | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const shownDeleteTarget = useRetained(deleteTarget);
+  // The worktree a branch row offers to remove (resolved from `userWorktrees`).
+  const [removeWorktreeTarget, setRemoveWorktreeTarget] =
+    useState<UserWorktree | null>(null);
+  // The remote-only branch pending a server-side delete confirm.
+  const [remoteDeleteTarget, setRemoteDeleteTarget] = useState<{
+    remote: string;
+    name: string;
+  } | null>(null);
+  const shownRemoteDeleteTarget = useRetained(remoteDeleteTarget);
+  const [discardAllOpen, setDiscardAllOpen] = useState(false);
+  const [stashAllOpen, setStashAllOpen] = useState(false);
+  const [stashPopOpen, setStashPopOpen] = useState(false);
+  const [stashesOpen, setStashesOpen] = useState(false);
+  // Which view the Stashes dialog opens to — "recoverable" for "Recover lost
+  // work…" and its palette action, "stashes" otherwise.
+  const [stashesView, setStashesView] = useState<"stashes" | "recoverable">(
+    "stashes",
+  );
+  const [opHistoryOpen, setOpHistoryOpen] = useState(false);
+  const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [pickerMode, setPickerMode] = useState<PickerMode | null>(null);
+  const [rebaseOntoOpen, setRebaseOntoOpen] = useState(false);
+  // The publish intercepted by the fork-PR guard, with everything needed to
+  // resume it verbatim if the user publishes anyway.
+  const [forkGuard, setForkGuard] = useState<{
+    match: ForkPrMatch;
+    branch: Branch;
+    remote?: string;
+  } | null>(null);
+  // A fork-PR detection in flight — rides `busy`, so the menu items that started
+  // it can't fire twice.
+  const [detecting, setDetecting] = useState(false);
+  // The pending switch target. `remote` is set only for remote-only rows, which
+  // check out via `--track <remote>/<name>` (honoring the row's promised remote
+  // + dodging multi-remote DWIM ambiguity); local switches leave it null.
+  const [switchTarget, setSwitchTarget] = useState<{
+    name: string;
+    remote: string | null;
+  } | null>(null);
+  // "Reapply after switching" — seeded from the saved preference each time the
+  // dialog opens fresh, and persisted back when the user changes it.
+  const [reapplyOnSwitch, setReapplyOnSwitch] = useState(false);
+  // Whether the user touched that checkbox since the dialog last opened. A ref
+  // because the dirty-tree refusal branch reads it after an await. It gates two
+  // things: the auto-tick there (an explicit untick is the user's call and is
+  // never overridden) and the persist below, so an auto-tick stays session-only.
+  const reapplyTouchedRef = useRef(false);
+  // Why a first switch attempt didn't work, shown when the dialog re-opens.
+  const [switchHint, setSwitchHint] = useState<string | null>(null);
+  // The worktree pending a "Promote to main workspace" confirm — set by the
+  // palette action and the branch row's worktree menu (the Worktrees dialog
+  // hosts its own promote flow).
+  const [promoteTarget, setPromoteTarget] = useState<UserWorktree | null>(null);
+  // Branch-row worktree menu targets — the rename and lock flows reuse the
+  // Worktrees dialog's own dialogs.
+  const [renameWorktreeTarget, setRenameWorktreeTarget] =
+    useState<UserWorktree | null>(null);
+  const [lockWorktreeTarget, setLockWorktreeTarget] =
+    useState<UserWorktree | null>(null);
+
+  const head = status.data?.branch;
+  const currentName = head?.name ?? null;
+  // The live branch name, readable AFTER an await. A handler's closure still holds
+  // the `currentName` of the render that created it, and `status.data` read inside
+  // one is that same render's snapshot — neither can tell whether HEAD moved
+  // during a confirmation the user left open. Same ref pattern SyncControls uses
+  // to guard its reset. Load-bearing for `git reset --hard`, which carries no
+  // branch identity: it rewrites whatever HEAD points at now.
+  const currentNameRef = useRef(currentName);
+  useEffect(() => {
+    currentNameRef.current = currentName;
+  }, [currentName]);
+  const currentLabel = head?.detached
+    ? `detached @ ${head.oid?.slice(0, 7) ?? "?"}`
+    : (currentName ?? "…");
+  // Agent-session branches (`gd/session/*`) are app-internal — never list or act
+  // on them in the switcher. Critically, a *kept* session's worktree is removed
+  // but its branch persists, so without this filter its branch would show here
+  // with Delete enabled, and `git branch -D` would destroy a branch the sessions
+  // registry still needs to Resume. (Worktrees-side exclusion doesn't cover the
+  // branch list, which comes straight from `git for-each-ref`.)
+  const allBranches = (branches.data ?? []).filter(
+    (b) => !b.name.startsWith("gd/session/"),
+  );
+  // Archived branches are hidden from the list and the merge picker.
+  const otherBranches = allBranches.filter((b) => !b.isCurrent && !b.archived);
+  const defaultName = defaultBranch.data ?? null;
+  // Merge-into-current is gated by the current branch's protection: a
+  // "require pull request" rule blocks all direct merges, and a merge-method
+  // restriction blocks the disallowed methods.
+  const lockCurrent = currentName
+    ? requiresPullRequest(rulesConfig, currentName)
+    : false;
+  // A promotion branch takes its changes through promotions, so the one-click
+  // update from the default branch is withheld (the current-branch twin of the
+  // per-row `rowPromotion`).
+  const currentPromotion = Boolean(
+    currentName && isPromotionBranch(rulesConfig, currentName),
+  );
+  const canMergeIntoCurrent =
+    !lockCurrent &&
+    (currentName
+      ? isMergeMethodAllowed(rulesConfig, currentName, "merge")
+      : true);
+  const canSquashIntoCurrent =
+    !lockCurrent &&
+    (currentName
+      ? isMergeMethodAllowed(rulesConfig, currentName, "squash")
+      : true);
+  // Ahead/behind vs. the default branch, fetched only while the menu is open.
+  const divergence = useBranchDivergence(repoPath, defaultName, open);
+  const divByName = useMemo(
+    () => new Map((divergence.data ?? []).map((d) => [d.name, d] as const)),
+    [divergence.data],
+  );
+
+  // The row whose context menu is open, when that row is DIVERGED from its own
+  // upstream — the only case worth several rev-list spawns. One slot is enough:
+  // a context menu is singular, so the probe follows whichever row was opened
+  // last and every other row renders as it always has.
+  const [rewriteProbe, setRewriteProbe] = useState<string | null>(null);
+  const rewrite = useBranchRewriteStatus(repoPath, rewriteProbe, {
+    enabled: rewriteProbe !== null,
+  });
+  const queryClient = useQueryClient();
+
+  // Warm those probes when the POPOVER opens, so a right-click a moment later
+  // paints its final identity instead of the disabled waiting slot swapping
+  // under the pointer. The probe is fast enough locally that the swap lands
+  // AFTER the menu paints, which reads as a flash; the only way to remove it is
+  // to have the answer before the menu exists. The waiting slot stays as the
+  // fallback for a genuinely slow probe.
+  //
+  // A newline-joined signature, not the array: `allBranches` gets a new identity
+  // on every branches refetch, and this must re-run when the diverged SET
+  // changes, not when its container does. Git forbids control characters in a
+  // ref name, so `\n` can't appear inside one.
+  //
+  // Capped: each entry is several rev-list spawns, and a repo where many branches
+  // are BOTH ahead and behind would otherwise fan out one probe per branch on
+  // every popover open. The rows past the cap keep the waiting slot, which is
+  // exactly what it is for. Four covers the ordinary 0-2 and leaves headroom
+  // without turning an open into a burst.
+  const divergedSignature = allBranches
+    .filter((b) => b.upstreamAhead > 0 && b.upstreamBehind > 0)
+    .slice(0, MAX_REWRITE_PREFETCH)
+    .map((b) => b.name)
+    .join("\n");
+  useEffect(() => {
+    if (!open || divergedSignature === "") return;
+    for (const name of divergedSignature.split("\n")) {
+      // `prefetchQuery` honors the options' staleTime, so a still-fresh entry
+      // costs nothing and a reopen inside 30s spawns no git at all.
+      void queryClient.prefetchQuery(
+        branchRewriteStatusOptions(repoPath, name),
+      );
+    }
+  }, [open, divergedSignature, repoPath, queryClient]);
+
+  // Per-branch PR badge: remote PRs (open + closed, the latter carrying merged)
+  // fetched while the menu OR the cleanup dialog is open AND the repo's forge
+  // reports pull-request support — mirrors the divergence gate above. The cleanup
+  // hotkey closes the menu on its way to the dialog, so gating on `open` alone
+  // would leave that dialog's merged badges permanently empty. Local PRs are not
+  // gated. Both reads are forge-neutral: they work for GitHub and GitLab alike.
+  const gh = useForgeStatus(repoPath);
+  const canGh = forgeFeatureReady(gh.data, "pullRequests");
+  const prsWanted = canGh && (open || cleanupOpen);
+  // Origin lens: the branch popover lists the FORK's own branch PRs; the
+  // fork/upstream lens is a Pulls/Issues-tab affordance.
+  const openPrs = usePrList(repoPath, prsWanted, "open", undefined, "origin");
+  const closedPrs = usePrList(
+    repoPath,
+    prsWanted,
+    "closed",
+    CLOSED_PR_SCAN_LIMIT,
+    "origin",
+  );
+  const localPrs = useLocalPrs(repoPath);
+  const openPr = useUiStore((s) => s.openPr);
+  const repoName = useUiStore((s) => s.repoName);
+  const setLens = useSetRepoLens(repoPath);
+
+  const prByBranch = useMemo(() => {
+    const map = new Map<string, BranchPr>();
+    const consider = (branchName: string, cand: BranchPr) => {
+      const cur = map.get(branchName);
+      if (!cur || PR_RANK[cand.state] > PR_RANK[cur.state]) {
+        map.set(branchName, cand);
+      }
+    };
+    // Remote PRs first, so they win ties against a local PR of equal state.
+    for (const pr of [...(openPrs.data ?? []), ...(closedPrs.data ?? [])]) {
+      // A cross-repository PR's head lives in a contributor's fork, so it must not
+      // badge a same-named local branch. Safe as a blanket skip only because both
+      // lists above are origin-pinned. A deliberately checked-out fork-PR head
+      // loses its badge too: accepted over-hide, since by name alone the two
+      // cases are indistinguishable.
+      if (pr.crossRepository) continue;
+      const state: PrAuditState =
+        pr.isDraft && pr.state === "OPEN"
+          ? "draft"
+          : (REMOTE_AUDIT_STATE[pr.state] ?? "open");
+      consider(pr.headRefName, {
+        state,
+        label: `#${pr.number}`,
+        base: pr.baseRefName,
+        select: { kind: "remote", id: String(pr.number) },
+      });
+    }
+    for (const pr of localPrs.data ?? []) {
+      const state: PrAuditState = LOCAL_AUDIT_STATE[pr.status];
+      consider(pr.head, {
+        state,
+        label: "local",
+        base: pr.base,
+        select: { kind: "local", id: pr.id },
+      });
+    }
+    return map;
+  }, [openPrs.data, closedPrs.data, localPrs.data]);
+
+  // Branch name → the merged PR that carries it, for the cleanup dialog. Remote
+  // PRs only: a local PR's merge is a real git merge, which divergence already
+  // sees, and it has no PR number to attribute the badge to. The base must be the
+  // default branch — a PR merged into a release branch or a stack parent says
+  // nothing about the default branch, which is what that dialog is about. A null
+  // `defaultName` matches nothing, so an unresolved default badges nothing.
+  const mergedPrByBranch = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const [name, pr] of prByBranch) {
+      if (
+        pr.state === "merged" &&
+        pr.select.kind === "remote" &&
+        pr.base === defaultName
+      )
+        map.set(name, pr.label);
+    }
+    return map;
+  }, [prByBranch, defaultName]);
+
+  const openPrChip = (select: SelectedPr) => {
+    // Through the store's navigator rather than a bare select + tab switch: these
+    // chips badge merged and closed PRs too, and only this door arms the align
+    // that moves the Pulls list to the tab the PR is actually on.
+    openPr({
+      kind: select.kind,
+      repoPath,
+      repoName: repoName ?? repoNameFromPath(repoPath),
+      ref: select.id,
+      section: null,
+      // A remote PR here is a fork (origin) PR — force the origin lens (which also
+      // clears any stale upstream remote selection) before navigating to it. Inside
+      // the navigator's callback, so the lens and the selection land together.
+      beforeSelect:
+        select.kind === "remote" ? () => setLens("origin") : undefined,
+    });
+    setOpen(false);
+  };
+
+  // Branches checked out in *another* worktree → that worktree's path. Git
+  // forbids the same branch in two worktrees, so these can't be checked out
+  // here; the row opens that worktree instead. The active repo's own branch is
+  // excluded (it's the one you're on). Fetched while the menu OR the cleanup
+  // dialog is open: that dialog's archive and delete exclusions read this map,
+  // and the cleanup hotkey closes the menu on its way to it.
+  const userWorktrees = useUserWorktrees(repoPath, open || cleanupOpen);
+  const activeNorm = normPath(repoPath);
+  const worktreeByBranch = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const w of userWorktrees.data ?? []) {
+      if (w.branch && normPath(w.path) !== activeNorm)
+        map.set(w.branch, w.path);
+    }
+    return map;
+  }, [userWorktrees.data, activeNorm]);
+  // Cross-worktree state (same fetch as the map above): the main workspace the
+  // banner links to, the count the Worktrees row shows, and whether you're
+  // currently in a linked (non-main) worktree — where a branch checkout lands
+  // here, not in main.
+  const worktreeList = userWorktrees.data ?? [];
+  const currentWorktree = worktreeList.find(
+    (w) => normPath(w.path) === activeNorm,
+  );
+  const mainWorktree = worktreeList.find((w) => w.isMain);
+  // Linked ones only: the main workspace isn't a "worktree" in user vocabulary,
+  // and this is the set the dialog's own empty state keys on.
+  const linkedWorktreeCount = worktreeList.filter((w) => !w.isMain).length;
+  const inLinkedWorktree = Boolean(currentWorktree && !currentWorktree.isMain);
+  // A worktree whose folder is being removed still lists (the removal outlives
+  // the dialog that started it), but nothing may act on it until it settles.
+  // Raw paths on both sides: these and the removals' come from listUserWorktrees.
+  const removals = useWorktreeRemovals(repoPath);
+  const removingPaths = new Set(removals.map((r) => r.path));
+  const currentWorktreeName = currentWorktree
+    ? baseName(currentWorktree.path)
+    : "";
+  // Default branch pinned on top, then the rest by most recently committed.
+  // Memoized: the compiler won't hoist the `.sort()` copy or the filter
+  // allocations, and these recompute on every filter keystroke otherwise.
+  const sortedBranches = useMemo(
+    () =>
+      [...allBranches].sort((a, b) => {
+        if (a.name === defaultName) return -1;
+        if (b.name === defaultName) return 1;
+        return b.lastCommitDate.localeCompare(a.lastCommitDate);
+      }),
+    [allBranches, defaultName],
+  );
+  const bq = branchFilter.trim().toLowerCase();
+  const visibleBranches = useMemo(
+    () =>
+      sortedBranches.filter(
+        (b) => !b.archived && (!bq || b.name.toLowerCase().includes(bq)),
+      ),
+    [sortedBranches, bq],
+  );
+  const archivedBranches = useMemo(
+    () =>
+      sortedBranches.filter(
+        (b) => b.archived && (!bq || b.name.toLowerCase().includes(bq)),
+      ),
+    [sortedBranches, bq],
+  );
+  // Both dialogs stay mounted, so the name-generation queries gate on one being
+  // open AND on AI being usable at all — otherwise a Hide-AI or unconfigured
+  // user pays for `git branch -r` plus two `git log` walks feeding a button that
+  // never renders.
+  const branchDialogOpen =
+    (createOpen || renameTarget !== null) && aiEnabled && aiConfigured;
+  // Remote-only branches, fetched while the menu is open or a branch dialog is
+  // (the dialog resolves the committed-work base off this list, and the palette
+  // can open it without the menu ever opening). Drop ones a local branch already
+  // represents (that row shows ahead/behind + PR) and gd/session/* branches;
+  // dedupe a branch on multiple remotes to one row.
+  const remoteBranchesQuery = useRemoteBranches(
+    repoPath,
+    open || branchDialogOpen,
+  );
+  const localNames = useMemo(
+    () => new Set(allBranches.map((b) => b.name)),
+    [allBranches],
+  );
+  const remoteOnly = useMemo(() => {
+    const seen = new Set<string>();
+    return (remoteBranchesQuery.data ?? [])
+      .filter(
+        (b) =>
+          !b.name.startsWith("gd/session/") &&
+          !localNames.has(b.name) &&
+          (!bq || b.name.toLowerCase().includes(bq)),
+      )
+      .filter((b) => (seen.has(b.name) ? false : (seen.add(b.name), true)))
+      .sort((a, b) => b.lastCommitDate.localeCompare(a.lastCommitDate));
+  }, [remoteBranchesQuery.data, localNames, bq]);
+  // The ref being named, whose committed work the AI fallback describes: the
+  // rename target (which need NOT be checked out) or the checked-out branch for
+  // a create; null ⇒ both closed. Create names the BRANCH, not the literal
+  // "HEAD", so the comparison's cache key changes when you switch branches —
+  // keyed on "HEAD" a fast Generate would serve the previous branch's commits.
+  // A detached HEAD has no branch name to key on and keeps the literal.
+  const namedRef =
+    renameTarget ?? (createOpen ? (currentName ?? "HEAD") : null);
+  // Until the remote list settles, a missing `origin/<default>` means "not
+  // loaded yet", not "absent" — falling back to the local default there is
+  // exactly the stale ref this base resolution exists to avoid.
+  const remoteBranchesSettled = !remoteBranchesQuery.isPending;
+  // The default branch names the comparison base, so its own lookup gates the
+  // fallback too: a null `defaultName` while it's still loading must not read as
+  // "this repo has no default branch".
+  const defaultBranchSettled = !defaultBranch.isPending;
+  // Base for the fallback. Prefer the remote-tracking ref: a stale local default
+  // skews the three-dot diff, and when origin/HEAD resolved the default name the
+  // local twin may not even exist. Null (⇒ no fallback) when neither side has it.
+  const committedBase = useMemo(() => {
+    // An errored remote list can't be trusted as a base either: no base ⇒ no
+    // fallback ⇒ the error state below renders instead of a silent local default.
+    if (
+      !branchDialogOpen ||
+      !defaultName ||
+      !remoteBranchesSettled ||
+      remoteBranchesQuery.isError
+    )
+      return null;
+    const onOrigin = (remoteBranchesQuery.data ?? []).some(
+      (b) => b.remote === "origin" && b.name === defaultName,
+    );
+    if (onOrigin) return `origin/${defaultName}`;
+    return localNames.has(defaultName) ? defaultName : null;
+  }, [
+    branchDialogOpen,
+    defaultName,
+    remoteBranchesSettled,
+    remoteBranchesQuery.isError,
+    remoteBranchesQuery.data,
+    localNames,
+  ]);
+  // Commits the named ref has that the default doesn't. A null base leaves the
+  // query disabled (both dialogs closed, or no resolvable default).
+  const committedCompare = useBranchAhead(repoPath, committedBase, namedRef);
+  // Mirrors `useBranchAhead`'s own enabled condition — a query that never
+  // runs (base === compare: naming the local default with no `origin/<default>`)
+  // must not read as "still loading" forever.
+  const comparing =
+    committedBase !== null && namedRef !== null && committedBase !== namedRef;
+  // Never let the affordance claim there's no committed work on evidence it
+  // doesn't have: while any input is in flight say so, and say so distinctly
+  // when the lookup failed outright.
+  const committedStatus: "ready" | "pending" | "error" = !branchDialogOpen
+    ? "ready"
+    : !defaultBranchSettled ||
+        (Boolean(defaultName) && !remoteBranchesSettled) ||
+        (comparing && committedCompare.isPending)
+      ? "pending"
+      : defaultBranch.isError ||
+          remoteBranchesQuery.isError ||
+          (comparing && committedCompare.isError)
+        ? "error"
+        : "ready";
+  const committedFallback = useMemo(() => {
+    const ahead = committedCompare.data ?? [];
+    if (!committedBase || !namedRef || ahead.length === 0) return null;
+    // `ahead` is newest-first (plain `git log base..<ref>`); cap the subjects.
+    return {
+      base: committedBase,
+      compare: namedRef,
+      subjects: ahead.slice(0, 30).map((c) => c.subject),
+    };
+  }, [committedBase, namedRef, committedCompare.data]);
+  // Only label rows with their remote when there's more than one to disambiguate.
+  const multipleRemotes = useMemo(
+    () =>
+      new Set((remoteBranchesQuery.data ?? []).map((b) => b.remote)).size > 1,
+    [remoteBranchesQuery.data],
+  );
+  // Arrow-key nav over the visible rows (+ archived/remote when expanded); Enter
+  // on the focused row checks out via the row button's native click.
+  const navBranches: { name: string }[] = [
+    ...visibleBranches,
+    ...(showArchived ? archivedBranches : []),
+    ...(showRemote ? remoteOnly : []),
+  ];
+  const onBranchKeyDown = listKeyboardNav({
+    items: navBranches,
+    activeIndex: navBranches.findIndex((b) => b.name === activeBranch),
+    onActivate: (b) => setActiveBranch(b.name),
+    rowKey: (b) => b.name,
+  });
+  const stashes = stashCount.data ?? 0;
+  const hasChanges = (status.data?.entries.length ?? 0) > 0;
+  // Which switch attempt is current. `switchTo` can suspend on the worktree
+  // lookup, and the popover reopens long before a stalled `git worktree list`
+  // returns — so a later attempt must be able to retire an earlier one rather
+  // than both acting.
+  const switchRequestRef = useRef(0);
+  // The live answer, readable AFTER an await — same pattern as `currentNameRef`.
+  // `switchTo` can resume on a worktree lookup that outlived the render it
+  // started in, and a tree that turned dirty meanwhile must still get the
+  // bring/stash choice instead of a silent checkout.
+  const hasChangesRef = useRef(hasChanges);
+  useEffect(() => {
+    hasChangesRef.current = hasChanges;
+  }, [hasChanges]);
+  // Rebase refuses only on dirty TRACKED files, so the proactive stash offer
+  // keys on this — an untracked-only tree rebases fine, and stashing it
+  // unasked would move those files into a stash on any replay conflict.
+  const hasTrackedChanges = (status.data?.entries ?? []).some(
+    (e) =>
+      e.staged !== null || (e.unstaged !== null && e.unstaged !== "untracked"),
+  );
+  // Naming a branch from changes needs a commit to diff against; an unborn HEAD
+  // (no commits) has nothing to compare the working tree to.
+  const headExists = Boolean(head?.oid);
+  // You can't amend across branches: amend mode targets a specific commit on
+  // this branch, so switching would strand the in-progress amend and leave its
+  // banner up. Lock the switcher until the user finishes or stops amending.
+  const amending = amendingHash !== null;
+  // The repo's configured remotes — ground truth for resolving a branch's
+  // upstream remote and for the per-remote Publish choices.
+  const remoteNames = remotes.data ?? [];
+
+  const onError = (e: unknown) => toastError(e);
+
+  // Awaited, not per-call callbacks: react-query drops those when the observer
+  // loses its listeners — a hidden `<Activity>` tab or an unmounted host — and
+  // the outcome would never reach the user. Every mutation below follows suit.
+  async function setArchived(name: string, archived: boolean) {
+    try {
+      await setBranchArchived.mutateAsync({ name, archived });
+      toast.success(t(archived ? "branchUi.branchArchived" : "branchUi.branchUnarchived", { branch: name }));
+    } catch (e) {
+      onError(e);
+    }
+  }
+
+  async function doUnlockWorktree(path: string) {
+    try {
+      await unlockWorktree.mutateAsync(path);
+      toast.success(t("branchUi.worktreeUnlocked"));
+    } catch (e) {
+      onError(e);
+    }
+  }
+
+  // Dispatch the actual checkout — remote-only targets track a specific remote,
+  // local targets use plain switch. Both share the guards in `switchTo`. The
+  // failure handler stays per-CALLER: each one recovers differently.
+  async function runCheckout(
+    target: { name: string; remote: string | null },
+    opts?: { onError?: (e: unknown) => void },
+  ) {
+    // Read at fire time: the promote's claim never re-renders anything.
+    if (promotionBlocksCheckout(repoPath)) {
+      toast.info(PROMOTION_BLOCKS_CHECKOUT);
+      return;
+    }
+    try {
+      if (target.remote) {
+        await checkoutRemote.mutateAsync({
+          remote: target.remote,
+          name: target.name,
+        });
+      } else {
+        await checkout.mutateAsync(target.name);
+      }
+    } catch (e) {
+      opts?.onError?.(e);
+    }
+  }
+
+  // Now async: the worktree answer decides whether a row checks out or
+  // navigates, and it can still be in flight when the click lands.
+  async function switchTo(name: string, remote: string | null = null) {
+    if (amending) return; // guarded by the disabled trigger; belt-and-suspenders
+    // Claimed after the amending bail so a no-op click can't retire a real
+    // attempt that is still resolving.
+    const switchRequest = ++switchRequestRef.current;
+    setOpen(false);
+    // A branch checked out in another worktree can't be checked out here (git
+    // forbids it), so the row navigates there instead. No confirm on the badged
+    // path — the chip already says where the branch lives, and opening a folder
+    // is not a destructive act.
+    let wtPath = worktreeByBranch.get(name);
+    let resolvedHere: UserWorktree | undefined;
+    // The open-gated read hasn't answered yet, or is answering again — and only
+    // a NEGATIVE verdict is distrusted: a hit stays a hit (a listed worktree
+    // still exists, and mid-removal is `refuseWhileLeaving`'s job), but a miss
+    // is worthless from a list that is unanswered or in flight, because
+    // react-query serves the previous data through a refetch and every worktree
+    // mutation invalidates this key. (The header's always-on observer keeps the
+    // key warm under the hook's 30s staleTime, so a miss inside that window is
+    // trusted; git's own checkout refusal backstops it.) Routed through
+    // `fetchQuery` on that same key so a click during the refetch JOINS it
+    // instead of racing it with a second `git worktree list`. A failed lookup
+    // falls through to the ordinary checkout, where git refuses with its own
+    // message. Local rows only: a remote-only row's name has no local branch
+    // by construction, so no worktree can hold it and the lookup would only
+    // add a subprocess.
+    if (
+      remote === null &&
+      !wtPath &&
+      !userWorktrees.isError &&
+      (userWorktrees.data === undefined || userWorktrees.isFetching)
+    ) {
+      try {
+        // Shared options, not a second spelling: this key's `networkMode:
+        // "always"` is what keeps an offline read from PARKING forever, and a
+        // parked fetch would hang this await with the popover already closed —
+        // no navigation, no checkout, no toast. `retry: false` drops the
+        // client's one retry plus backoff when this call STARTS the fetch; a
+        // call that joins one already in flight inherits that fetch's options.
+        const wts = await queryClient.fetchQuery({
+          ...userWorktreesOptions(repoPath),
+          retry: false,
+        });
+        resolvedHere = wts.find(
+          (w) => w.branch === name && normPath(w.path) !== activeNorm,
+        );
+        wtPath = resolvedHere?.path;
+      } catch {
+        // fall through
+      }
+      // BELOW the try/catch, so every exit passes it — resolved, rejected, and
+      // found-nothing alike. This await outlives its render and everything past
+      // here is a global write, so every read that GATES that write is re-taken:
+      // the repo (acting would target the one the user left), the attempt (the
+      // popover reopens while a stalled lookup is out, so a later pick already
+      // started its own switch), and amend mode (entered elsewhere meanwhile; a
+      // checkout would strand it) — plus `hasChangesRef` and the removal store
+      // below, which read live. The reapply default stays the click render's
+      // value on purpose: it only seeds a checkbox the user then sees.
+      const live = useUiStore.getState();
+      if (
+        switchRequest !== switchRequestRef.current ||
+        live.repoPath !== repoPath ||
+        live.amendingHash !== null
+      )
+        return;
+    }
+    if (wtPath) {
+      // Its folder is on its way out — opening it would land the app in a
+      // directory mid-deletion.
+      // Read at FIRE time, not from the render's Set: this line can run after
+      // the lookup's await, and a removal that started meanwhile would be
+      // invisible to a pre-await snapshot. `refuseWhileLeaving` already reads
+      // the promote half live; this is its removal twin.
+      if (
+        refuseWhileLeaving(
+          wtPath,
+          Boolean(
+            useWorktreeRemovalStore.getState().byRepo[repoPath]?.[wtPath],
+          ),
+          t,
+        )
+      )
+        return;
+      // Awaited for its verdict: it resolves false both when the open failed
+      // (it toasts that itself) and when the user switched repos mid-validate
+      // (silent by design) — a success toast over either would claim a
+      // navigation that never happened.
+      // The attempt check rides INTO the open: `validateRepo` is a second await
+      // downstream of this function's guard, and a newer pick during it leaves
+      // the repo unchanged, so only the attempt identity can retire this one.
+      const navigated = await openWorktree(
+        wtPath,
+        () => switchRequest === switchRequestRef.current,
+      );
+      // Only when this call resolved the worktree itself: that state is exactly
+      // the one where the map was empty, so the row carried no chip and the whole
+      // app just changed folders with no prior signal. Say so after the fact.
+      if (navigated && resolvedHere)
+        toast.success(rowCheckoutCopy(resolvedHere.isMain).opened(wtPath));
+      return;
+    }
+    // with work in progress, let the user choose to bring or stash it
+    if (hasChangesRef.current) {
+      setSwitchHint(null);
+      setReapplyOnSwitch(settings.data?.reapplyStashOnSwitch ?? false);
+      reapplyTouchedRef.current = false;
+      setSwitchTarget({ name, remote });
+      return;
+    }
+    void runCheckout({ name, remote }, { onError });
+  }
+
+  function bringAndSwitch() {
+    if (!switchTarget) return;
+    // Ahead of closing the dialog, so a refusal keeps it; `runCheckout` re-checks.
+    if (promotionBlocksCheckout(repoPath)) {
+      toast.info(PROMOTION_BLOCKS_CHECKOUT);
+      return;
+    }
+    const target = switchTarget;
+    // Captured with the target: the refusal branch below runs after an await and
+    // must decide from the touched flag as it stood when THIS switch started — a
+    // dialog reopened mid-checkout owns the live values.
+    const touched = reapplyTouchedRef.current;
+    setSwitchTarget(null);
+    void runCheckout(target, {
+      onError: (e) => {
+        // git refused to carry the changes over rather than failing outright —
+        // re-open the choice with stashing pointed out, instead of a dead-end
+        // toast. Reapply is auto-ticked for this switch alone (session-only: the
+        // persist below stays gated on an explicit toggle) so the changes still
+        // come along — unless the user unticked it here, which stands.
+        if (isDirtyTreeRefusal(e)) {
+          if (!touched) setReapplyOnSwitch(true);
+          setSwitchHint(
+            t("branchUi.switchWithStashFailed"),
+          );
+          setSwitchTarget(target);
+          return;
+        }
+        onError(e);
+      },
+    });
+  }
+
+  // One compound (stash → switch → optionally pop) under a single repo lock,
+  // for both checkbox states — the unchecked path just skips the pop.
+  async function stashAndSwitch() {
+    if (!switchTarget) return;
+    // Ahead of every state write, so a refusal keeps the dialog and its choices.
+    if (promotionBlocksCheckout(repoPath)) {
+      toast.info(PROMOTION_BLOCKS_CHECKOUT);
+      return;
+    }
+    const target = switchTarget;
+    const reapply = reapplyOnSwitch;
+    setSwitchTarget(null);
+    if (
+      reapplyTouchedRef.current &&
+      settings.data &&
+      settings.data.reapplyStashOnSwitch !== reapply
+    ) {
+      // Fire-and-forget, and deliberately silent: a preference that didn't
+      // persist must neither delay the switch nor report over its outcome.
+      void saveSettings
+        .mutateAsync({ ...settings.data, reapplyStashOnSwitch: reapply })
+        .catch(() => undefined);
+    }
+    try {
+      const outcome = await switchAutostash.mutateAsync({
+        name: target.name,
+        remote: target.remote,
+        reapply,
+      });
+      reportAutostashOutcome(outcome, {
+        operation: "Switch",
+        reapplied: `Stashed, switched to ${target.name}, and reapplied your changes.`,
+        stashedOnly: `Stashed changes and switched to ${target.name} — "Pop latest stash" restores them`,
+        plain: `Switched to ${target.name}.`,
+        // Names the branch the switch failed to reach — more useful than the
+        // generic didn't-finish line.
+        stashKept: `Couldn't switch to ${target.name} — your changes are safely stashed; pop them when you're ready.`,
+      });
+    } catch (e) {
+      onError(e);
+    }
+  }
+
+  // The dialog seeds its own form field on open; the switcher only flags which
+  // branch is being renamed.
+  function openRename(branch: string) {
+    setOpen(false);
+    // The two branch dialogs are mutually exclusive: their palette actions can
+    // fire while the other is open, and both feed the SAME committed-work
+    // lookup — leaving both open would name a new branch from the rename
+    // target's diff.
+    setCreateOpen(false);
+    setRenameTarget(branch);
+  }
+
+  async function doDelete() {
+    if (!deleteTarget) return;
+    // The guard below reads not-blocked from the stand-in config while the rules
+    // are still loading, so it would pass vacuously — refuse instead of deleting
+    // a branch a settled rule protects.
+    if (rulesSettling) {
+      toast.error(t("branchUi.branchRulesLoading"));
+      setDeleteTarget(null);
+      return;
+    }
+    // Belt-and-suspenders: the menu items are already disabled for protected
+    // branches, but guard here too in case a rule changed under an open dialog.
+    if (isDeletionBlocked(rulesConfig, deleteTarget)) {
+      toast.error(
+        t("branchUi.branchProtected", { branch: deleteTarget }),
+      );
+      setDeleteTarget(null);
+      return;
+    }
+    try {
+      // git refuses to delete the checked-out branch: move off it first — onto a
+      // branch not already occupied by another worktree (that checkout fails too).
+      if (deleteTarget === currentName) {
+        // Fetch occupancy FRESH: `worktreeByBranch` only observes its query
+        // while the popover or cleanup dialog is open, and even a warm cache
+        // (the header keeps one now) can be stale for a guard this destructive.
+        let occupied: Set<string>;
+        try {
+          const wts = await listUserWorktrees(repoPath);
+          occupied = new Set(
+            wts
+              .filter(
+                (w) => w.branch && normPath(w.path) !== normPath(repoPath),
+              )
+              .map((w) => w.branch),
+          );
+        } catch {
+          occupied = new Set(worktreeByBranch.keys());
+        }
+        const free = (b: string | null | undefined): b is string =>
+          Boolean(b) && b !== deleteTarget && !occupied.has(b as string);
+        const fallback = free(defaultName)
+          ? defaultName
+          : otherBranches.find((b) => free(b.name))?.name;
+        if (!fallback) {
+          toast.error(
+            t("branchUi.noFreeBranchCheckout"),
+          );
+          setDeleteTarget(null);
+          return;
+        }
+        // Below the occupancy await, so a promote that started meanwhile counts;
+        // nothing has been written yet, so the delete is refused whole.
+        if (promotionBlocksCheckout(repoPath)) {
+          toast.info(PROMOTION_BLOCKS_CHECKOUT);
+          return;
+        }
+        await checkout.mutateAsync(fallback);
+      }
+      await deleteBranch.mutateAsync(deleteTarget);
+      toast.success(t("branchUi.branchDeleted", { branch: deleteTarget }));
+    } catch (e) {
+      onError(e);
+    } finally {
+      setDeleteTarget(null);
+    }
+  }
+
+  async function doDeleteRemoteBranch() {
+    if (!remoteDeleteTarget) return;
+    const target = remoteDeleteTarget;
+    try {
+      await deleteRemoteBranch.mutateAsync(target);
+      toast.success(t("branchUi.remoteBranchDeletedToast", { branch: target.name, remote: target.remote }));
+    } catch (e) {
+      onError(e);
+    } finally {
+      setRemoteDeleteTarget(null);
+    }
+  }
+
+  async function doDiscardAll() {
+    try {
+      await discardAll.mutateAsync(undefined);
+      toast.success(t("branchUi.changesDiscarded"));
+    } catch (e) {
+      onError(e);
+    } finally {
+      setDiscardAllOpen(false);
+    }
+  }
+
+  async function doStashAll() {
+    try {
+      await stashAll.mutateAsync(undefined);
+      toast.success(t("branchUi.changesStashed"));
+    } catch (e) {
+      onError(e);
+    } finally {
+      setStashAllOpen(false);
+    }
+  }
+
+  async function doStashPop() {
+    try {
+      await stashPop.mutateAsync(undefined);
+      toast.success(t("branchUi.stashRestored"));
+    } catch (e) {
+      onError(e);
+    } finally {
+      setStashPopOpen(false);
+    }
+  }
+
+  // The picker dialog seeds its own branch + options on open; the switcher only
+  // flags which mode is active.
+  function openPicker(mode: PickerMode) {
+    setOpen(false);
+    setPickerMode(mode);
+  }
+
+  // A merge into the current branch touches the working tree, so git refuses it
+  // outright when uncommitted changes are in the way — offer the stash → merge →
+  // reapply compound instead of a dead-end toast. `false` leaves the error to
+  // the caller.
+  function beginMergeRecovery(e: unknown, branch: string) {
+    return recovery.handleError(e, {
+      operationLabel: "merge",
+      detail: branch,
+      reappliedMessage: `Merged ${branch} and reapplied your changes.`,
+      plainMessage: `Merged ${branch}`,
+      run: { op: "merge", ref: branch },
+    });
+  }
+
+  // Rebase refuses on ANY dirty tracked file, not just one the replay would
+  // touch, so this dead-ends more often than the merge above — offer the same
+  // stash → rebase → reapply compound. `false` leaves the error to the caller.
+  function beginRebaseRecovery(e: unknown, branch: string) {
+    return recovery.handleError(e, {
+      operationLabel: "rebase",
+      detail: branch,
+      detailPreposition: "onto",
+      reappliedMessage: `Rebased onto ${branch} and reapplied your changes.`,
+      plainMessage: `Rebased onto ${branch}`,
+      run: { op: "rebase", ref: branch },
+    });
+  }
+
+  // The dialog collects the branch + options; the switcher owns the mutations
+  // (they feed `busy`) and dispatches them here after closing the picker.
+  async function runPicker(
+    mode: PickerMode,
+    branch: string,
+    options: MergeRunOptions,
+  ) {
+    setPickerMode(null);
+    if (mode === "rebase") {
+      try {
+        await rebaseBranch.mutateAsync(branch);
+        toast.success(t("branchUi.rebasedOnto", { branch }));
+      } catch (e) {
+        if (beginRebaseRecovery(e, branch)) return;
+        onError(e);
+      }
+    } else {
+      const squash = mode === "squash";
+      // Options apply to a regular merge only, not squash.
+      const noFf = mode === "merge" && options.noFf;
+      const strategy = mode === "merge" ? options.strategy : "none";
+      // The stash-and-retry compound runs a bare `merge --no-edit`, so it can
+      // only redo a merge that asked for nothing else — offering it for the
+      // others would quietly drop the option the user chose.
+      const plain = !squash && !noFf && strategy === "none";
+      try {
+        await mergeBranch.mutateAsync({ branch, squash, noFf, strategy });
+        toast.success(
+          squash
+            ? `Squashed ${branch} — changes are staged, review and commit`
+            : `Merged ${branch}`,
+        );
+      } catch (e) {
+        if (plain && beginMergeRecovery(e, branch)) return;
+        onError(e);
+      }
+    }
+  }
+
+  function openCreate() {
+    setOpen(false);
+    // Mutually exclusive with the rename dialog — see `openRename`.
+    setRenameTarget(null);
+    setCreateOpen(true);
+  }
+
+  function openRebaseOnto() {
+    setOpen(false);
+    setRebaseOntoOpen(true);
+  }
+
+  // The dialog collects the two branches; the switcher owns the mutation (it
+  // feeds `busy`). Conflicts leave the rebase in progress for the conflict
+  // banner, exactly like the plain rebase above.
+  //
+  // Proactive rather than error-triggered: the dialog already knows the tree is
+  // dirty, and git would refuse before touching anything, so offering the
+  // compound up front beats a round-trip that can only fail.
+  async function runRebaseOnto(newBase: string, oldBase: string) {
+    setRebaseOntoOpen(false);
+    const request = {
+      operationLabel: "rebase",
+      detail: newBase,
+      detailPreposition: "onto",
+      reappliedMessage: `Rebased onto ${newBase} and reapplied your changes.`,
+      plainMessage: `Rebased onto ${newBase}`,
+      run: { op: "rebaseOnto", newBase, oldBase },
+    } as const;
+    if (hasTrackedChanges) {
+      recovery.begin(request);
+      return;
+    }
+    try {
+      await rebaseOnto.mutateAsync({ newBase, oldBase });
+      toast.success(t("branchUi.rebasedOnto", { branch: newBase }));
+    } catch (e) {
+      // `hasTrackedChanges` is a query-state read that can trail the tree: a
+      // file saved between the check and the run still deserves the offer, so
+      // a dirty refusal routes back into the same recovery.
+      if (recovery.handleError(e, request)) return;
+      onError(e);
+    }
+  }
+
+  // A branch update only touches the working tree when it merges in place, i.e.
+  // when the updated branch IS the current one — the throwaway-worktree path is
+  // always clean. The branch check is belt-and-suspenders on top of the error
+  // classification; a mismatch falls through to the normal error toast.
+  function beginUpdateRecovery(e: unknown, branch: string, base: string) {
+    if (branch !== currentName) return false;
+    return recovery.handleError(e, {
+      operationLabel: "update",
+      detail: base,
+      reappliedMessage: `Updated from ${base} and reapplied your changes.`,
+      plainMessage: `Updated ${branch} from ${base}`,
+      run: { op: "merge", ref: base },
+    });
+  }
+
+  // Pull the latest from the default branch into `target` without switching to
+  // it (unless it's already current): fast-forwards when possible, otherwise
+  // merges via a throwaway worktree so the working tree — and its watchers —
+  // stay put. A conflicting merge aborts and reports rather than switching.
+  async function doUpdateFromDefault(target: string) {
+    if (!defaultName || target === defaultName) return;
+    const base = defaultName;
+    setOpen(false);
+    // The guard below reads not-a-promotion from the stand-in config while the
+    // rules are still loading, so it would pass vacuously — refuse instead of
+    // inverting a flow a settled rule names as promotion.
+    if (rulesSettling) {
+      toast.error(t("branchUi.branchRulesLoading"));
+      return;
+    }
+    // The doors into this are already disabled for promotion branches, but a
+    // rule can change under an open menu — and this is the only refusal the
+    // hotkey path passes through.
+    if (isPromotionBranch(rulesConfig, target)) {
+      toast.error(
+        `${target} is a promotion branch — it takes changes through promotions, not updates from ${base}`,
+      );
+      return;
+    }
+    try {
+      const outcome = await updateBranchFrom.mutateAsync({
+        branch: target,
+        base,
+      });
+      toast.success(
+        outcome === "up-to-date"
+          ? `${target} is already up to date with ${base}`
+          : `Updated ${target} from ${base}`,
+      );
+    } catch (e) {
+      if (!beginUpdateRecovery(e, target, base)) onError(e);
+    }
+  }
+
+  // Pull `target`'s own upstream (e.g. `origin/master`) into it without checking
+  // it out — the "just merged a PR, bring master current before I switch back"
+  // flow. Merges in place when `target` is current, fast-forwards otherwise.
+  async function doUpdateFromUpstream(target: string, base: string) {
+    setOpen(false);
+    try {
+      const outcome = await updateBranchFrom.mutateAsync({
+        branch: target,
+        base,
+      });
+      toast.success(
+        outcome === "up-to-date"
+          ? `${target} is already up to date with ${base}`
+          : `Updated ${target} from ${base}`,
+      );
+    } catch (e) {
+      if (!beginUpdateRecovery(e, target, base)) onError(e);
+    }
+  }
+
+  // The remedy for a branch whose upstream already carries its changes under
+  // other ids: point the branch back at that upstream instead of merging it in,
+  // which would duplicate them. `tip` is the sha the status was measured against,
+  // so a confirmed reset can only land where the copy said it would. The current
+  // branch takes the hard reset (its working tree moves too); every other branch
+  // is a ref move, which is why it works even from another checkout.
+  async function doResetToUpstream(branch: Branch, tip: string) {
+    const base = branch.upstream;
+    if (!base) return;
+    setOpen(false);
+    const treeNote = branch.isCurrent
+      ? ` Your files are rewritten to match, so commit or stash any uncommitted changes first.`
+      : "";
+    const n = branch.upstreamAhead;
+    const alreadyThere =
+      n === 1
+        ? `The only commit on ${branch.name} is already on ${base} under a different id`
+        : `All ${n} commits on ${branch.name} are already on ${base} under different ids`;
+    const ok = await useConfirm.getState().ask({
+      title: `Reset ${branch.name} to ${base}?`,
+      body: `${alreadyThere}, so no unique work is lost. ${branch.name} moves to ${base}'s tip.${treeNote}`,
+      confirmLabel: `Reset to ${base}`,
+      confirmVariant: "destructive",
+    });
+    if (!ok) return;
+    try {
+      if (branch.isCurrent) {
+        // The confirmation above spans an await, and HEAD can move under it — an
+        // out-of-app `git switch`, or the app's own checkout. `reset --hard`
+        // names no branch, so a moved HEAD would rewrite whatever is checked out
+        // NOW to a tip measured for a branch the user is no longer on. The ref
+        // reads live; the captured name is the only branch the confirmation
+        // described. Says so rather than returning quietly: the user just
+        // confirmed a destructive action, and silence there reads as "it
+        // worked". Wording kept in step with the sync controls' twin.
+        if (currentNameRef.current !== branch.name) {
+          toast.info(
+            t("branchUi.headMovedBeforeReset"),
+          );
+          return;
+        }
+        await hardReset.mutateAsync(tip);
+      } else {
+        await resetToUpstream.mutateAsync({
+          branch: branch.name,
+          expectedTip: tip,
+        });
+      }
+      toast.success(t("branchUi.branchResetToBase", { branch: branch.name, base }));
+    } catch (e) {
+      onError(e);
+    }
+  }
+
+  // Push a branch's ref without checking it out — the outbound counterpart of
+  // doUpdateFromUpstream. Whether this publishes (-u) or plain pushes is decided
+  // backend-side from the branch's tracking state. The publish arms pass an
+  // explicit `remote` (the chosen destination); a tracked push passes none and
+  // the backend resolves to the branch's own upstream remote.
+  function doPushBranch(branch: Branch, remote?: string) {
+    setOpen(false);
+    if (branch.upstream && !branch.upstreamGone)
+      void runPushBranch(branch, remote);
+    else void beginPublishBranch(branch, remote);
+  }
+
+  // Publishing a branch that is really a local copy of a fork PR's head pushes a
+  // separate copy to this repo and leaves the PR untouched — check for that
+  // first, and let the guard offer the fork instead. Advisory: a detection
+  // failure is indistinguishable from no match and just publishes.
+  async function beginPublishBranch(branch: Branch, remote?: string) {
+    setDetecting(true);
+    const match = await forgeDetectForkPrForBranch(repoPath, branch.name).catch(
+      () => null,
+    );
+    setDetecting(false);
+    if (match) setForkGuard({ match, branch, remote });
+    else void runPushBranch(branch, remote);
+  }
+
+  async function runPushBranch(branch: Branch, remote?: string) {
+    const publishing = !branch.upstream || branch.upstreamGone;
+    try {
+      await push.mutateAsync({
+        setUpstream: false,
+        branch: branch.name,
+        remote,
+      });
+      toast.success(
+        publishing
+          ? `Published ${branch.name} to ${remote ?? "origin"}`
+          : `Pushed ${branch.name} to ${branch.upstream}`,
+      );
+    } catch (e) {
+      onError(e);
+    }
+  }
+
+  const busy =
+    detecting ||
+    checkout.isPending ||
+    checkoutRemote.isPending ||
+    mergeBranch.isPending ||
+    rebaseBranch.isPending ||
+    rebaseOnto.isPending ||
+    push.isPending ||
+    updateBranchFrom.isPending ||
+    resetToUpstream.isPending ||
+    hardReset.isPending ||
+    switchAutostash.isPending ||
+    recovery.pending;
+
+  // Every "there is none" reason below derives from a query whose empty answer
+  // and whose UNANSWERED state are the same value — `?? null` for the names,
+  // `?? 0` for the counts. Asserting the absence on that value tells a user with
+  // a dirty tree on `master` that HEAD is detached and nothing is uncommitted,
+  // so no arm may assert an absence until its own read has actually answered.
+  // All four are unconditional, so `isPending` is the first-answer window and
+  // nothing else. A failed first read leaves the SAME undefined value a pending
+  // one does, so it gets its own arm rather than the assertion — and it isn't
+  // even short-lived: the query client retries once, only `status` polls, so for
+  // branches/defaultBranch/stashCount the failure stands until a refocus or an
+  // invalidation. Each value below is null once its read has answered, and
+  // otherwise the honest reason it can't.
+  const unread = (
+    q: { isPending: boolean; isError: boolean; data: unknown },
+    checking: string,
+    failed: string,
+  ) => {
+    if (q.isPending) return checking;
+    // An error over data that already landed is a failed REFRESH, not a missing
+    // answer: the row still has something true to say, so it says it.
+    if (q.isError && q.data === undefined) return failed;
+    return null;
+  };
+  const headUnread = unread(
+    status,
+    t("branchUi.checkingCurrentBranch"),
+    t("branchUi.repositoryStatusUnreadable"),
+  );
+  const changesUnread = unread(
+    status,
+    t("branchUi.checkingChanges"),
+    t("branchUi.repositoryStatusUnreadable"),
+  );
+  const defaultBranchUnread = unread(
+    defaultBranch,
+    t("branchUi.checkingDefaultBranch"),
+    t("branchUi.defaultBranchUnreadable"),
+  );
+  const branchesUnread = unread(
+    branches,
+    t("branchUi.checkingBranches"),
+    t("branchUi.branchListUnreadable"),
+  );
+  const stashCountUnread = unread(
+    stashCount,
+    t("branchUi.checkingStashes"),
+    t("branchUi.stashesUnreadable"),
+  );
+
+  // Why each multi-condition menu row is held, arms in the order that row's own
+  // `disabled` expression tests them. Null where the label already carries the
+  // reason — a row must not say it twice.
+  const renameCurrentBlockedReason =
+    headUnread ?? t("branchUi.detachedCannotRename");
+  const deleteCurrentBlockedReason = (() => {
+    if (!currentName)
+      return (
+        headUnread ?? t("branchUi.detachedCannotDelete")
+      );
+    // The remaining arm is branch protection, which the label already states.
+    return null;
+  })();
+  const updateFromDefaultBlockedReason = (() => {
+    if (!defaultName)
+      return defaultBranchUnread ?? t("branchUi.missingDefaultBranch");
+    if (!currentName)
+      return headUnread ?? t("branchUi.detachedCannotUpdate");
+    if (defaultName === currentName) return t("branchUi.alreadyOnBranch", { branch: defaultName ?? "" });
+    if (busy) return t("branchUi.anotherGitOperation");
+    // The remaining arm is the promotion rule, which the label already states.
+    return null;
+  })();
+  // The branch-count rows below share a shape: an unanswered branch list counts
+  // as zero, but a branch rule holds whether or not that list has landed — so an
+  // unanswered count yields to the rule arms rather than displacing them, and
+  // only a row with no rule against it reports that the list isn't in yet.
+  const mergeIntoCurrentBlockedReason = (() => {
+    if (otherBranches.length === 0) {
+      if (!branchesUnread) return t("branchUi.noBranchesToMerge");
+      if (canMergeIntoCurrent) return branchesUnread;
+    }
+    if (lockCurrent) return null; // the label says "(requires PR)"
+    if (!canMergeIntoCurrent)
+      return t("branchUi.branchRuleNoMergeCommits", { branch: currentName ?? "" });
+    return null;
+  })();
+  const squashIntoCurrentBlockedReason = (() => {
+    if (otherBranches.length === 0) {
+      if (!branchesUnread) return t("branchUi.noBranchesToMerge");
+      if (canSquashIntoCurrent) return branchesUnread;
+    }
+    if (lockCurrent)
+      return t("branchUi.branchRuleRequiresPullRequest", { branch: currentName ?? "" });
+    if (!canSquashIntoCurrent)
+      return t("branchUi.branchRuleNoSquash", { branch: currentName ?? "" });
+    return null;
+  })();
+  const rebaseCurrentBlockedReason = (() => {
+    if (otherBranches.length === 0) {
+      if (!branchesUnread) return t("branchUi.noBranchesToRebase");
+      if (!lockCurrent) return branchesUnread;
+    }
+    if (lockCurrent)
+      return t("branchUi.branchRuleRequiresPullRequest", { branch: currentName ?? "" });
+    return null;
+  })();
+  const changeBaseBlockedReason = (() => {
+    if (!currentName)
+      return headUnread ?? t("branchUi.detachedCannotRebase");
+    if (otherBranches.length < 2) {
+      if (!branchesUnread)
+        return t("branchUi.baseNeedsTwoBranches");
+      // `busy` joins the rule arms here: it too is true right now, whatever the
+      // branch count turns out to be.
+      if (!lockCurrent && !busy) return branchesUnread;
+    }
+    if (lockCurrent)
+      return t("branchUi.branchRuleRequiresPullRequest", { branch: currentName ?? "" });
+    if (busy) return t("branchUi.anotherGitOperation");
+    return null;
+  })();
+  const noChangesBlockedReason =
+    changesUnread ?? t("branchUi.noUncommittedChanges");
+  const popStashBlockedReason =
+    stashCountUnread ?? t("branchUi.noStashesToPop");
+  const viewStashesBlockedReason = stashCountUnread ?? t("branchUi.noStashes");
+
+  // Hotkey handlers reuse the menu's own flows, so every gate (clean tree,
+  // stash count, picker availability) and confirm dialog applies equally.
+  useHotkeyAction("show-branches", () => setOpen(true), !amending);
+  // Push-to-origin: ONE open-aware handler drives both shapes, because the popup
+  // is non-modal — a two-handler split lets a focus-outside press act on the
+  // wrong branch. The action is ORIGIN-scoped everywhere (label, help text,
+  // name), so it must never push somewhere unpredictable; enabled whenever the
+  // repo has an origin AND a target resolves (open list, or a current branch),
+  // and a non-actionable invocation gives an honest info toast rather than
+  // silence.
+  const currentBranch = branches.data?.find((b) => b.isCurrent);
+  useHotkeyAction(
+    "push-to-origin",
+    () => {
+      // Target: the highlighted row when the list is open, else the current
+      // branch. An open list with a highlight that resolves to no local branch
+      // (a remote-only row) is a real miss, not a fallback.
+      let branch: Branch | undefined;
+      if (open && activeBranch) {
+        branch = branches.data?.find((b) => b.name === activeBranch);
+        if (!branch) {
+          toast.info(t("branchUi.onlyLocalBranchesCanPush"));
+          return;
+        }
+      } else {
+        branch = currentBranch;
+      }
+      if (!branch) {
+        toast.info(t("branchUi.noBranchToPushToast"));
+        return;
+      }
+      const tracksOrigin =
+        branch.upstreamRemote === "origin" && !branch.upstreamGone;
+      const tracksOtherKnownRemote =
+        !!branch.upstream &&
+        !branch.upstreamGone &&
+        !!branch.upstreamRemote &&
+        branch.upstreamRemote !== "origin" &&
+        remoteNames.includes(branch.upstreamRemote);
+      if (
+        tracksOrigin &&
+        branch.upstreamAhead > 0 &&
+        branch.upstreamBehind === 0
+      ) {
+        doPushBranch(branch);
+      } else if (!branch.upstream || branch.upstreamGone) {
+        // `enabled` guarantees origin exists, so this publish destination is safe.
+        doPushBranch(branch, "origin");
+      } else if (
+        tracksOrigin &&
+        branch.upstreamAhead > 0 &&
+        branch.upstreamBehind > 0
+      ) {
+        // Genuinely diverged: commits on BOTH sides. Behind-only is not
+        // divergence — it gets its own arm below.
+        toast.info(
+          t("branchUi.branchDiverged", { branch: branch.name }),
+        );
+      } else if (tracksOrigin && branch.upstreamBehind > 0) {
+        // Behind only: nothing local to push; the remedy is a pull, so say so.
+        toast.info(t("branchUi.branchBehindPullFirst", { branch: branch.name, upstream: branch.upstream }));
+      } else if (tracksOrigin) {
+        toast.info(t("branchUi.branchNothingToPush", { branch: branch.name }));
+      } else if (branch.upstream && !branch.upstreamRemote) {
+        // Tracks a LOCAL branch (`git branch --track x main`):
+        // `%(upstream:remotename)` is empty → null upstreamRemote. There's
+        // nothing remote-related to say — and the context menu is the same
+        // authority (it offers neither Push nor Publish for these).
+        toast.info(
+          t("branchUi.branchTracksLocal", { branch: branch.name, upstream: branch.upstream }),
+        );
+      } else if (tracksOtherKnownRemote) {
+        toast.info(
+          t("branchUi.branchPushFromMenu", { branch: branch.name, remote: branch.upstreamRemote ?? "" }),
+        );
+      } else {
+        // Tracked, but the upstream's remote is no longer configured.
+        toast.info(
+          t("branchUi.branchRemoteMissing", { branch: branch.name }),
+        );
+      }
+    },
+    !busy && remoteNames.includes("origin") && (open || !!currentBranch),
+  );
+
+  useHotkeyAction("new-branch", openCreate);
+  useHotkeyAction(
+    "rename-branch",
+    () => currentName && openRename(currentName),
+    Boolean(currentName),
+  );
+  useHotkeyAction(
+    "delete-branch",
+    () => {
+      setOpen(false);
+      if (currentName) setDeleteTarget(currentName);
+    },
+    Boolean(currentName && !isDeletionBlocked(rulesConfig, currentName)),
+  );
+  useHotkeyAction("cleanup-branches", () => {
+    setOpen(false);
+    setCleanupOpen(true);
+  });
+  useHotkeyAction(
+    "update-from-default",
+    () => {
+      if (currentName) void doUpdateFromDefault(currentName);
+    },
+    Boolean(
+      defaultName &&
+        defaultName !== currentName &&
+        !busy &&
+        currentName &&
+        !currentPromotion,
+    ),
+  );
+  const defaultBranchRow = allBranches.find((b) => b.name === defaultName);
+  // The palette's own route to the same merge the row menu offers — so it needs
+  // the same refusal. There is no row rendered here to hang the probe's hook on,
+  // so it runs ON INVOCATION against the hook's own cached options: a diverged
+  // default pays one probe (usually a cache hit), and every other default spawns
+  // nothing at all.
+  async function updateDefaultFromUpstream() {
+    const row = defaultBranchRow;
+    if (!row?.upstream || row.upstreamGone) return;
+    if (row.upstreamAhead > 0 && row.upstreamBehind > 0) {
+      const status = await queryClient
+        .fetchQuery(branchRewriteStatusOptions(repoPath, row.name))
+        .catch(() => null);
+      // `patchEqual > 0` is strong evidence, not proof — two sides can apply the
+      // same patch independently. It only WITHHOLDS the merge, so a false read
+      // costs an explained no-op, never a duplicated history.
+      if (status?.remoteRewritten === true && status.patchEqual > 0) {
+        // The remedy has to match what the row actually offers: only the
+        // nothing-unique case gets a reset item there. With local-only commits
+        // the row shows a disabled update and no reset, so point at the pull that
+        // keeps them.
+        const remedy =
+          status.localOnly === 0
+            ? `Open the branch menu and use the ${row.name} row's reset instead.`
+            : `Switch to ${row.name} and use Pull with rebase — it keeps the ${status.localOnly} commit${status.localOnly === 1 ? "" : "s"} only ${row.name} has.`;
+        toast.warning(
+          `${row.upstream} already carries ${row.name}'s changes under different ids — merging it in would duplicate them.`,
+          { description: remedy, duration: 10000 },
+        );
+        return;
+      }
+    }
+    void doUpdateFromUpstream(row.name, row.upstream);
+  }
+  useHotkeyAction(
+    "update-default-from-upstream",
+    () => void updateDefaultFromUpstream(),
+    Boolean(defaultBranchRow?.upstream) &&
+      !defaultBranchRow?.upstreamGone &&
+      !busy,
+  );
+  useHotkeyAction(
+    "merge-into-current",
+    () => openPicker("merge"),
+    otherBranches.length > 0 && canMergeIntoCurrent,
+  );
+  useHotkeyAction(
+    "squash-merge-into-current",
+    () => openPicker("squash"),
+    otherBranches.length > 0 && canSquashIntoCurrent,
+  );
+  useHotkeyAction(
+    "rebase-current",
+    () => openPicker("rebase"),
+    otherBranches.length > 0 && !lockCurrent,
+  );
+  useHotkeyAction(
+    "rebase-onto-new-base",
+    openRebaseOnto,
+    Boolean(currentName) && otherBranches.length >= 2 && !lockCurrent && !busy,
+  );
+  useHotkeyAction("stash-all", () => setStashAllOpen(true), hasChanges);
+  useHotkeyAction("pop-stash", () => setStashPopOpen(true), stashes > 0);
+  useHotkeyAction(
+    "view-stashes",
+    () => {
+      setStashesView("stashes");
+      setStashesOpen(true);
+    },
+    stashes > 0,
+  );
+  // Always enabled — orphaned work commonly exists even with zero live stashes.
+  useHotkeyAction("recover-lost-work", () => {
+    setStashesView("recoverable");
+    setStashesOpen(true);
+  });
+  useHotkeyAction("operation-history", () => setOpHistoryOpen(true));
+  useHotkeyAction("discard-all", () => setDiscardAllOpen(true), hasChanges);
+  // Cross-worktree navigation (palette-only). They can fire while the popover is
+  // closed, so they can't rely on the open-gated `userWorktrees` cache — fetch
+  // the worktree list fresh, like the delete-branch off-switch does. Both then
+  // re-check the live repo before acting on the answer: the lookup outlives the
+  // render it started in, and acting on its answer after a repo switch would
+  // navigate to (or offer to promote) a worktree of the repo the user just left.
+  // `useOpenWorktree`'s own guard can't see this window — it captures the live
+  // repo when it is CALLED, which is already after this await.
+  useHotkeyAction("open-main-workspace", async () => {
+    setOpen(false);
+    try {
+      const wts = await listUserWorktrees(repoPath);
+      if (useUiStore.getState().repoPath !== repoPath) return;
+      const main = wts.find((w) => w.isMain);
+      if (!main) {
+        toast.error(t("branchUi.mainWorkspaceMissing"));
+        return;
+      }
+      if (normPath(main.path) === normPath(repoPath)) {
+        toast.info(t("branchUi.alreadyMainWorkspace"));
+        return;
+      }
+      void openWorktree(main.path);
+    } catch (e) {
+      toastError(e);
+    }
+  });
+  useHotkeyAction("promote-worktree-to-main", async () => {
+    setOpen(false);
+    try {
+      const wts = await listUserWorktrees(repoPath);
+      if (useUiStore.getState().repoPath !== repoPath) return;
+      const here = wts.find((w) => normPath(w.path) === normPath(repoPath));
+      if (!here || here.isMain) {
+        toast.info(
+          t("branchUi.promoteNeedsLinkedWorktree"),
+        );
+        return;
+      }
+      if (here.isDetached || !here.branch) {
+        toast.info(t("branchUi.promoteNoBranch"));
+        return;
+      }
+      if (here.isLocked) {
+        toast.info(t("branchUi.promoteUnlockFirst"));
+        return;
+      }
+      // Only a promote can have claimed the worktree you're standing in: no
+      // surface offers to delete the active checkout, and a promote marks its
+      // removal under the main workspace's key, never this one's.
+      if (isWorktreePromoting(here.path)) {
+        toast.info(t("worktreeDialog.promoting"));
+        return;
+      }
+      setPromoteTarget(here);
+    } catch (e) {
+      toastError(e);
+    }
+  });
+
+  // Shared by the visible list and the Archived section.
+  const renderBranchRow = (branch: Branch) => {
+    const div = divByName.get(branch.name);
+    const canUpdate = Boolean(defaultName) && branch.name !== defaultName;
+    const deletionBlocked = isDeletionBlocked(rulesConfig, branch.name);
+    // A promotion branch takes its changes through promotions, so the one-click
+    // update from the default branch is withheld.
+    const rowPromotion = isPromotionBranch(rulesConfig, branch.name);
+    // Archiving hides a branch from the branch surfaces, so it's refused for a
+    // branch that is somewhere in use: the one you're on, the default, and one
+    // another worktree has checked out. Unarchiving is never refused — an
+    // archived branch can be checked out, and this is its only way back.
+    const archiveLabel = branch.archived ? t("branchUi.unarchive") : t("branchUi.archive");
+    // The worktree (other than the active checkout) this branch occupies, when
+    // any — the row's whole worktree menu group hangs off it, and it narrows the
+    // object those items act on.
+    const rowWorktree = (userWorktrees.data ?? []).find(
+      (w) => w.path === worktreeByBranch.get(branch.name),
+    );
+    const inWorktree = rowWorktree !== undefined;
+    // `worktreeByBranch` admits the main workspace (it's a worktree to git, and
+    // any checkout other than the active one qualifies), so the strings that NAME
+    // this row's holding checkout come from the record instead of saying
+    // "worktree" flat.
+    const rowCopy = rowCheckoutCopy(rowWorktree?.isMain);
+    // A natively-disabled menu item swallows its tooltip, so the items `busy`
+    // alone holds carry the reason in the label. A structural reason always
+    // wins — this arm shows only where nothing else explains the dimming.
+    const busySuffix = busy ? " (operation in progress)" : "";
+    const rowWorktreeRemoving = Boolean(
+      rowWorktree && removingPaths.has(rowWorktree.path),
+    );
+    const wtLabel = (label: string, otherReason?: string) =>
+      worktreeItemLabel(label, rowWorktreeRemoving, t, otherReason);
+    const renameWorktreeBlockedReason = (() => {
+      if (rowWorktree?.isMain) return rowCopy.noun;
+      if (rowWorktree?.isLocked) return "locked";
+      return undefined;
+    })();
+    // Best-effort by design: a null `defaultName` (still loading, or unresolvable)
+    // drops the default-branch guard rather than disabling Archive everywhere.
+    // The worktree guard is HELD rather than dropped while its read is in
+    // flight — the map is empty until it lands, which would offer Archive on a
+    // branch the answer excludes. A FAILED read falls through to best-effort:
+    // no answer is coming, and holding the item forever helps no one.
+    // A branch whose worktree is being removed is the one exception, and it
+    // reads the removal store, not the worktree list: git goes on listing a
+    // worktree until its removal finishes, and this query is gated on the menu
+    // or the cleanup dialog being open, so `inWorktree` refuses on an answer
+    // that is either still true or already stale. Promote entries are excluded
+    // by `promotePhase`: a promote removes the worktree to CHECK THAT BRANCH
+    // OUT here, so archiving it mid-flight would hide the branch you land on.
+    const archiveBlockedReason = (() => {
+      if (branch.archived) return null;
+      if (branch.isCurrent) return "current branch";
+      if (branch.name === defaultName) return "default branch";
+      if (removals.some((r) => r.branch === branch.name && !r.promotePhase))
+        return null;
+      if (userWorktrees.data === undefined && !userWorktrees.isError)
+        return "checking worktrees…";
+      if (inWorktree) return rowCopy.blocked;
+      return null;
+    })();
+    // Outbound sync gating. `pushable` = tracked on a KNOWN remote and ahead →
+    // offer a plain push to that remote (disabled with "(diverged)" when also
+    // behind); the backend resolves to the branch's own upstream remote.
+    // `publishable` = untracked or gone AND at least one remote exists → offer
+    // Publish (one item per remote on a multi-remote repo). Hidden (not disabled)
+    // when in-sync, or tracked on a remote that no longer exists.
+    const upstreamRemote =
+      branch.upstream &&
+      !branch.upstreamGone &&
+      branch.upstreamRemote &&
+      remoteNames.includes(branch.upstreamRemote)
+        ? branch.upstreamRemote
+        : null;
+    const pushable = Boolean(upstreamRemote) && branch.upstreamAhead > 0;
+    const publishable =
+      (!branch.upstream || branch.upstreamGone) && remoteNames.length > 0;
+    // Publish destinations: origin first, then the rest alphabetical.
+    const publishRemotes = publishable
+      ? [...remoteNames].sort((a, b) =>
+          a === "origin" ? -1 : b === "origin" ? 1 : a.localeCompare(b),
+        )
+      : [];
+    // Upstream classification, for this row only while ITS menu is open. An
+    // upstream that already carries this branch's changes under other ids makes
+    // "Update from <upstream>" harmful: merging it back in duplicates them, and
+    // in a throwaway worktree it can't even run against a branch checked out
+    // elsewhere.
+    const rowDiverged = branch.upstreamAhead > 0 && branch.upstreamBehind > 0;
+    const rowProbeOpen = rowDiverged && rewriteProbe === branch.name;
+    // `isFetching` matters as much as the name match: a repo-wide invalidation
+    // leaves the previous answer served while the refetch is in flight, and that
+    // answer is the evidence a destructive confirm would quote.
+    const rowRewrite =
+      rowProbeOpen && !rewrite.isFetching ? rewrite.data : undefined;
+    // The verdict for the OPEN menu hasn't landed. This slot must never hold an
+    // ENABLED item that changes meaning underneath a pointer already aimed at it:
+    // the probe resolves a beat after the menu paints, and a merge silently
+    // becoming a destructive reset at the same coordinates is the context-menu
+    // TOCTOU class. So the slot waits, disabled, and only ever becomes enabled
+    // wearing its FINAL identity. An ERRORED probe is not pending — it falls
+    // through to the ordinary item, the same fail-safe an unprovable status takes.
+    const rowProbePending =
+      rowProbeOpen &&
+      !rewrite.isError &&
+      (rewrite.isFetching || rewrite.data === undefined);
+    // The pair, never the reflog verdict alone: offering a reset while unique
+    // local work exists would destroy it.
+    const resetTip =
+      rowRewrite?.remoteRewritten === true && rowRewrite.localOnly === 0
+        ? rowRewrite.upstreamTip
+        : null;
+    // Patch twins upstream AND commits without one: a reset would destroy the
+    // latter, and a merge would bring the twinned changes back in beside the
+    // copies already there. `patchEqual > 0` is strong evidence, not proof — two
+    // sides can apply the same patch independently, or cherry-pick both ways,
+    // with no rewrite involved. That is why this arm only WITHHOLDS an action:
+    // its failure direction is inaction, which the row's other items cover.
+    const rowMixedRewrite =
+      rowRewrite?.remoteRewritten === true &&
+      rowRewrite.localOnly > 0 &&
+      rowRewrite.patchEqual > 0;
+    return (
+      <ContextMenu
+        key={branch.name}
+        onOpenChange={(menuOpen) => {
+          if (menuOpen) setRewriteProbe(rowDiverged ? branch.name : null);
+          // Functional, not a captured read: right-clicking a second row closes
+          // this menu in the SAME tick the other one opens, and a batched
+          // comparison against the pre-update value would clear the new row's
+          // probe on the way out.
+          else setRewriteProbe((cur) => (cur === branch.name ? null : cur));
+        }}
+      >
+        <ContextMenuTrigger
+          render={
+            <button
+              type="button"
+              data-row={branch.name}
+              className="flex w-full flex-col gap-y-0.5 px-3 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:outline-none"
+              onClick={() => {
+                if (!branch.isCurrent) void switchTo(branch.name);
+              }}
+            >
+              <span className="flex w-full items-center gap-2">
+                <span
+                  className="min-w-0 flex-1 truncate"
+                  onMouseEnter={clipTitle(branch.name)}
+                >
+                  {branch.name}
+                  {branch.name === defaultName && (
+                    <span className="ml-1.5 text-[10px] text-muted-foreground">
+                      {t("branchUi.defaultBranchShort")}
+                    </span>
+                  )}
+                </span>
+                {branch.isCurrent && (
+                  <CheckIcon className="size-3.5 shrink-0" />
+                )}
+              </span>
+              <span className="flex w-full items-center gap-2">
+                {(() => {
+                  const pr = prByBranch.get(branch.name);
+                  if (!pr) return null;
+                  const isLocal = pr.select.kind === "local";
+                  return (
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      title={
+                        isLocal
+                          ? `${PR_STATE_LABEL[pr.state]} local pull request — open in Pull Requests`
+                          : `${PR_STATE_LABEL[pr.state]} pull request ${pr.label} — open in Pull Requests`
+                      }
+                      className={cn(
+                        "flex shrink-0 cursor-pointer items-center gap-0.5 text-[11px] tabular-nums hover:underline",
+                        PR_AUDIT_TONE[pr.state],
+                      )}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openPrChip(pr.select);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          openPrChip(pr.select);
+                        }
+                      }}
+                    >
+                      <GitPullRequestIcon className="size-3" weight="bold" />
+                      {pr.label}
+                    </span>
+                  );
+                })()}
+                {rowWorktree && (
+                  <span
+                    className="flex shrink-0 items-center gap-0.5 text-[11px] text-muted-foreground"
+                    title={rowCopy.title(rowWorktree.path)}
+                  >
+                    <TreeStructureIcon className="size-3" weight="bold" />
+                    {rowCopy.noun}
+                  </span>
+                )}
+                {/* Two distinct indicators: the sync indicator shows the
+                    branch's OWN upstream state in ARROW vocabulary (matching
+                    the header's Push/Pull counts); the divergence indicator
+                    shows drift from the DEFAULT branch as `+N −M {default}`
+                    TEXT so it can't be mistaken for unpushed work. Sync is
+                    skipped on a remoteless repo. */}
+                {remoteNames.length > 0 &&
+                  (() => {
+                    // A branch tracking a REMOVED remote offers neither Push
+                    // nor Publish, so arrows would imply an action the menu
+                    // can't honor — muted marker with a no-action title
+                    // instead. The `branch.upstreamRemote &&` conjunct keeps a
+                    // LOCAL-upstream branch (git's `%(upstream:remotename)` is
+                    // empty → null) out of this case so its truthful arrows
+                    // still show below.
+                    if (
+                      branch.upstream &&
+                      !branch.upstreamGone &&
+                      branch.upstreamRemote &&
+                      !remoteNames.includes(branch.upstreamRemote)
+                    ) {
+                      const label = `Tracks ${branch.upstream}, but that remote is no longer configured.`;
+                      return (
+                        <span
+                          role="img"
+                          aria-label={label}
+                          className="flex shrink-0 items-center text-muted-foreground"
+                          title={label}
+                        >
+                          <CloudSlashIcon className="size-3" />
+                        </span>
+                      );
+                    }
+                    if (branch.upstream && !branch.upstreamGone) {
+                      if (
+                        branch.upstreamAhead === 0 &&
+                        branch.upstreamBehind === 0
+                      ) {
+                        // In sync with the upstream — silence means synced.
+                        return null;
+                      }
+                      const parts: string[] = [];
+                      if (branch.upstreamAhead > 0)
+                        parts.push(`${branch.upstreamAhead} to push`);
+                      if (branch.upstreamBehind > 0)
+                        parts.push(`${branch.upstreamBehind} to pull`);
+                      const label = `${parts.join(", ")} — vs ${branch.upstream}`;
+                      return (
+                        <span
+                          // No text color: inherits the row foreground (a step
+                          // stronger than the muted divergence) and follows the
+                          // hover accent-foreground automatically. The arrow SVGs are
+                          // aria-hidden, so the span carries the name for readers —
+                          // role="img" because aria-label is not valid (nor reliably
+                          // announced) on a generic span.
+                          role="img"
+                          aria-label={label}
+                          className="flex shrink-0 items-center gap-1 text-[11px] tabular-nums"
+                          title={label}
+                        >
+                          {branch.upstreamAhead > 0 && (
+                            <span className="flex items-center gap-0.5">
+                              <ArrowUpIcon className="size-3" weight="bold" />
+                              {branch.upstreamAhead}
+                            </span>
+                          )}
+                          {branch.upstreamBehind > 0 && (
+                            <span className="flex items-center gap-0.5">
+                              <ArrowDownIcon className="size-3" weight="bold" />
+                              {branch.upstreamBehind}
+                            </span>
+                          )}
+                        </span>
+                      );
+                    }
+                    if (branch.upstreamGone) {
+                      const label = `Upstream ${branch.upstream} was deleted on the remote — likely merged. ${secondaryClickCapitalized} to publish again or delete.`;
+                      return (
+                        <span
+                          role="img"
+                          aria-label={label}
+                          className="flex shrink-0 items-center text-muted-foreground"
+                          title={label}
+                        >
+                          <CloudXIcon className="size-3" />
+                        </span>
+                      );
+                    }
+                    // !branch.upstream
+                    const publishHint = `Local only — never published. ${secondaryClickCapitalized} to publish.`;
+                    return (
+                      <span
+                        role="img"
+                        aria-label={publishHint}
+                        className="flex shrink-0 items-center text-muted-foreground"
+                        title={publishHint}
+                      >
+                        <CloudSlashIcon className="size-3" />
+                      </span>
+                    );
+                  })()}
+                {div &&
+                  (div.ahead > 0 || div.behind > 0) &&
+                  (() => {
+                    const parts: string[] = [];
+                    if (div.ahead > 0)
+                      parts.push(
+                        `${div.ahead} commit${div.ahead === 1 ? "" : "s"} ahead of ${defaultName}`,
+                      );
+                    if (div.behind > 0)
+                      // Behind-only must still name the base: role="img" hides the
+                      // visible {defaultName} child from AT, so the label is all
+                      // a reader gets. Skipped when the ahead part named it already.
+                      parts.push(
+                        `${div.behind} commit${div.behind === 1 ? "" : "s"} behind${div.ahead > 0 ? "" : ` ${defaultName}`}`,
+                      );
+                    const label = parts.join(", ");
+                    return (
+                      <span
+                        role="img"
+                        aria-label={label}
+                        className="flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground tabular-nums"
+                        title={label}
+                      >
+                        {div.ahead > 0 && <span>+{div.ahead}</span>}
+                        {div.behind > 0 && <span>{`−${div.behind}`}</span>}
+                        <span>{defaultName}</span>
+                      </span>
+                    );
+                  })()}
+                {branch.lastCommitDate && (
+                  <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">
+                    <RelativeTime date={branch.lastCommitDate} />
+                  </span>
+                )}
+              </span>
+            </button>
+          }
+        />
+        <ContextMenuContent className="min-w-48">
+          {(canUpdate ||
+            (branch.upstream && branch.upstreamBehind > 0) ||
+            pushable ||
+            publishable) && (
+            <>
+              {canUpdate && (
+                <ContextMenuItem
+                  disabled={busy || rowPromotion}
+                  onClick={() => void doUpdateFromDefault(branch.name)}
+                >
+                  {t("branchUi.updateFromBranch", { branch: defaultName ?? "" })}
+                  {rowPromotion ? ` (${t("branchUi.promotionBranchHint")})` : busySuffix}
+                </ContextMenuItem>
+              )}
+              {/* Pull the branch's own upstream in without switching — the star
+                  use case is the default branch after a PR merged upstream. An
+                  upstream that already carries this branch's changes under other
+                  ids replaces it: merging there duplicates them rather than
+                  syncing. The waiting arm comes FIRST so the slot can never be
+                  enabled while its identity is still in flight. */}
+              {branch.upstream &&
+                branch.upstreamBehind > 0 &&
+                (() => {
+                  const base = branch.upstream;
+                  // No onClick at all, not merely `disabled`: a pointer already
+                  // aimed here when the menu painted must be a hard no-op.
+                  if (rowProbePending) {
+                    return (
+                      <ContextMenuItem disabled>
+                        {t("branchUi.checkingRemote", { branch: base })}
+                      </ContextMenuItem>
+                    );
+                  }
+                  if (resetTip) {
+                    const holder = worktreeByBranch.get(branch.name);
+                    return (
+                      <ContextMenuItem
+                        disabled={busy || inWorktree}
+                        onClick={() => void doResetToUpstream(branch, resetTip)}
+                      >
+                        {t("branchUi.resetTo", { branch: base })}…
+                        {inWorktree
+                          ? ` (${t("branchUi.checkedOutIn", { worktree: holder ?? "" })})`
+                          : busySuffix}
+                      </ContextMenuItem>
+                    );
+                  }
+                  if (rowMixedRewrite) {
+                    return (
+                      <ContextMenuItem disabled>
+                        {t("branchUi.upstreamHasChanges", { branch: base })}
+                      </ContextMenuItem>
+                    );
+                  }
+                  return (
+                    <ContextMenuItem
+                      disabled={busy}
+                      onClick={() =>
+                        void doUpdateFromUpstream(branch.name, base)
+                      }
+                    >
+                      {t("branchUi.updateFromBranch", { branch: base })}{busySuffix}
+                    </ContextMenuItem>
+                  );
+                })()}
+              {/* Sync-out below sync-in. Push a branch's ref to origin without
+                  checking it out — works even when the branch is checked out in
+                  another worktree, since a push touches refs, never a working
+                  tree (hence deliberately NO inWorktree gate). Diverged branches
+                  push disabled with the reason in the label; the "Update from"
+                  item above is their remedy. */}
+              {pushable && (
+                <ContextMenuItem
+                  disabled={busy || branch.upstreamBehind > 0}
+                  onClick={() => doPushBranch(branch)}
+                >
+                  {branch.upstreamBehind > 0
+                    ? t("branchUi.pushToDiverged", { remote: branch.upstream ?? "" })
+                    : `${t("branchUi.pushTo", { remote: branch.upstream ?? "" })}${busySuffix}`}
+                </ContextMenuItem>
+              )}
+              {/* Publish an unpushed / upstream-deleted branch: one remote → a
+                  single item ("Publish branch" for origin), multiple → one flat
+                  item per remote (origin first), each passing its explicit
+                  destination. */}
+              {publishRemotes.length === 1 ? (
+                <ContextMenuItem
+                  disabled={busy}
+                  onClick={() => doPushBranch(branch, publishRemotes[0])}
+                >
+                  {publishRemotes[0] === "origin"
+                    ? `${t("branchUi.publishBranch")}${busySuffix}`
+                    : `${t("branchUi.publishTo", { remote: publishRemotes[0] })}${busySuffix}`}
+                </ContextMenuItem>
+              ) : (
+                publishRemotes.map((r) => (
+                  <ContextMenuItem
+                    key={r}
+                    disabled={busy}
+                    onClick={() => doPushBranch(branch, r)}
+                  >
+                    {t("branchUi.publishTo", { remote: r })}{busySuffix}
+                  </ContextMenuItem>
+                ))
+              )}
+              <ContextMenuSeparator />
+            </>
+          )}
+          <ContextMenuItem onClick={() => openRename(branch.name)}>
+            {t("branchUi.renameBranch")}
+          </ContextMenuItem>
+          <ContextMenuItem
+            onClick={() => copyText(branch.name, t("branchUi.branchNameCopied"))}
+          >
+            {t("branchUi.copyBranchName")}
+          </ContextMenuItem>
+          <ContextMenuItem
+            disabled={archiveBlockedReason !== null}
+            onClick={() => void setArchived(branch.name, !branch.archived)}
+          >
+            {archiveBlockedReason === null
+              ? archiveLabel
+              : `${archiveLabel} (${archiveBlockedReason})`}
+          </ContextMenuItem>
+          <ContextMenuSeparator />
+          {rowWorktree && (
+            <>
+              <ContextMenuItem
+                disabled={rowWorktreeRemoving}
+                onClick={() => {
+                  if (refuseWhileLeaving(rowWorktree.path, rowWorktreeRemoving, t))
+                    return;
+                  setOpen(false);
+                  void openWorktree(rowWorktree.path);
+                }}
+              >
+                {wtLabel(rowCopy.open)}
+              </ContextMenuItem>
+              {/* Copying a path acts on nothing, so a removal doesn't block it. */}
+              <ContextMenuItem
+                onClick={() => copyText(rowWorktree.path, t("branchUi.pathCopied"))}
+              >
+              {t("branchUi.copyPath")}
+              </ContextMenuItem>
+              <ContextMenuItem
+                // git worktree move refuses the main worktree and a locked one.
+                disabled={
+                  rowWorktree.isMain ||
+                  rowWorktree.isLocked ||
+                  rowWorktreeRemoving
+                }
+                onClick={() => {
+                  setOpen(false);
+                  setRenameWorktreeTarget(rowWorktree);
+                }}
+              >
+                {wtLabel(t("branchUi.renameWorktree"), renameWorktreeBlockedReason)}
+              </ContextMenuItem>
+              {!rowWorktree.isMain &&
+                (rowWorktree.isLocked ? (
+                  <ContextMenuItem
+                    // In-place state change: the list refreshes via the
+                    // mutation's invalidation, so the popover stays open.
+                    disabled={rowWorktreeRemoving}
+                    onClick={() => {
+                      // The menu can outlive the state that disabled this item,
+                      // and a promote's claim never re-renders it.
+                      if (
+                        refuseWhileLeaving(
+                          rowWorktree.path,
+                          rowWorktreeRemoving,
+                          t,
+                        )
+                      )
+                        return;
+                      void doUnlockWorktree(rowWorktree.path);
+                    }}
+                  >
+                    {wtLabel(t("branchUi.unlock"))}
+                  </ContextMenuItem>
+                ) : (
+                  <ContextMenuItem
+                    disabled={rowWorktreeRemoving}
+                    onClick={() => {
+                      setOpen(false);
+                      setLockWorktreeTarget(rowWorktree);
+                    }}
+                  >
+                    {wtLabel(t("branchUi.lock"))}
+                  </ContextMenuItem>
+                ))}
+              {/* Promote moves this worktree's branch into the main workspace,
+                  so it needs a linked worktree with a branch. */}
+              {!rowWorktree.isMain && !rowWorktree.isDetached && (
+                <ContextMenuItem
+                  disabled={rowWorktree.isLocked || rowWorktreeRemoving}
+                  onClick={() => {
+                    setOpen(false);
+                    setPromoteTarget(rowWorktree);
+                  }}
+                >
+                  {wtLabel(
+                    t("branchUi.promoteToMain"),
+                    rowWorktree.isLocked ? "locked" : undefined,
+                  )}
+                </ContextMenuItem>
+              )}
+              <ContextMenuItem
+                disabled={rowWorktree.isMain || rowWorktreeRemoving}
+                onClick={() => {
+                  setOpen(false);
+                  setRemoveWorktreeTarget(rowWorktree);
+                }}
+              >
+                {wtLabel(
+                  t("branchUi.deleteWorktree"),
+                  rowWorktree.isMain ? rowCopy.noun : undefined,
+                )}
+              </ContextMenuItem>
+              <ContextMenuSeparator />
+            </>
+          )}
+          <ContextMenuItem
+            disabled={deletionBlocked || inWorktree}
+            onClick={() => {
+              setOpen(false);
+              setDeleteTarget(branch.name);
+            }}
+          >
+            {deletionBlocked
+              ? t("branchUi.deleteBranchProtected")
+              : inWorktree
+                ? `Delete branch… (${rowCopy.held})`
+                : t("branchUi.deleteBranch")}
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
+    );
+  };
+
+  // A remote-only branch: lighter than a local row (muted, a leading "bring it
+  // down" glyph). Clicking checks it out, which `git switch` turns into a local
+  // tracking branch — routed through `switchTo` so in-progress changes are handled.
+  const renderRemoteRow = (branch: RemoteBranch) => {
+    // A protected name is protected on the remote too — reuse the local rule.
+    const deletionBlocked = isDeletionBlocked(rulesConfig, branch.name);
+    return (
+      <ContextMenu key={`remote/${branch.remote}/${branch.name}`}>
+        <ContextMenuTrigger
+          render={
+            <button
+              type="button"
+              data-row={branch.name}
+              title={`Check out ${branch.name} — creates a local branch tracking ${branch.remote}/${branch.name}`}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:outline-none"
+              onClick={() => void switchTo(branch.name, branch.remote)}
+            >
+              <CloudArrowDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
+              <span className="min-w-0 flex-1 truncate">{branch.name}</span>
+              {multipleRemotes && (
+                <span className="shrink-0 text-[11px] text-muted-foreground">
+                  {branch.remote}
+                </span>
+              )}
+              {branch.lastCommitDate && (
+                <span className="shrink-0 text-[11px] text-muted-foreground tabular-nums">
+                  <RelativeTime date={branch.lastCommitDate} />
+                </span>
+              )}
+            </button>
+          }
+        />
+        <ContextMenuContent className="min-w-48">
+          <ContextMenuItem
+            onClick={() => void switchTo(branch.name, branch.remote)}
+          >
+            {t("branchUi.checkOut")}
+          </ContextMenuItem>
+          <ContextMenuItem
+            onClick={() => copyText(branch.name, t("branchUi.branchNameCopied"))}
+          >
+            {t("branchUi.copyBranchName")}
+          </ContextMenuItem>
+          <ContextMenuSeparator />
+          {/* The Remote section dedupes a name across remotes to one row, so
+              this targets THIS row's remote; after invalidation a same-name row
+              from another remote may reappear. That's expected. */}
+          <ContextMenuItem
+            disabled={deletionBlocked}
+            onClick={() => {
+              setOpen(false);
+              setRemoteDeleteTarget({
+                remote: branch.remote,
+                name: branch.name,
+              });
+            }}
+          >
+            {deletionBlocked
+              ? `Delete on ${branch.remote}… (protected)`
+              : `Delete on ${branch.remote}…`}
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
+    );
+  };
+
+  return (
+    <>
+      <Popover.Root
+        open={open}
+        onOpenChange={(o) => {
+          setOpen(o);
+          if (!o) {
+            setBranchFilter("");
+            setActiveBranch(null);
+          }
+        }}
+      >
+        <Popover.Trigger
+          render={
+            <DisabledReasonButton
+              variant="ghost"
+              size="sm"
+              // The wrapper is the header's flex item, so it owns the shrink-20
+              // that makes the branch label collapse before the CI badge (4).
+              wrapperClassName="min-w-0 shrink-20"
+              disabled={busy || amending}
+              reason={(() => {
+                switch (true) {
+                  case amending:
+                    return t("branchUi.finishAmendToSwitch");
+                  case busy:
+                    return t("branchUi.anotherGitOperation");
+                  default:
+                    return undefined;
+                }
+              })()}
+              // overflow-hidden clips the box the shrink cascade squeezes; the
+              // shrink undoes the vendored Button's own shrink-0, or nothing
+              // truncates — without either, the icons spill out both sides
+              // into the separator and the repository menu on a narrow header.
+              className="min-w-0 shrink overflow-hidden"
+            >
+              <GitBranchIcon data-icon="inline-start" />
+              <span
+                className="min-w-0 truncate"
+                // Sits under the wrapper's conditional title — a static or
+                // blanked title here would suppress that tooltip.
+                onMouseEnter={clipTitle(currentLabel)}
+              >
+                {currentLabel}
+              </span>
+              {head?.detached && (
+                <Badge variant="secondary" className="ml-1 shrink-0">
+                  {t("branchUi.detached")}
+                </Badge>
+              )}
+              <CaretDownIcon data-icon="inline-end" />
+            </DisabledReasonButton>
+          }
+        />
+        <Popover.Portal>
+          <Popover.Positioner
+            align="start"
+            sideOffset={4}
+            className="isolate z-50"
+          >
+            <Popover.Popup
+              className="w-108 rounded-none bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10"
+              // Arrow keys move through the branch rows whether focus is on the
+              // filter input, a row, or the popup itself (Esc/Tab pass through).
+              onKeyDown={onBranchKeyDown}
+            >
+              {inLinkedWorktree && (
+                <div className="flex items-center gap-2 border-b bg-muted/40 px-3 py-2 text-[11px]">
+                  <TreeStructureIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                  <span className="min-w-0 flex-1 text-muted-foreground">
+                    {t("branchUi.inWorktree")}{" "}
+                    <span className="font-medium text-foreground">
+                      {currentWorktreeName}
+                    </span>{" "}
+                    {t("branchUi.checkoutLandsHere")}
+                  </span>
+                  {mainWorktree && (
+                    <button
+                      type="button"
+                      className="shrink-0 cursor-pointer font-medium text-primary hover:underline"
+                      onClick={() => {
+                        setOpen(false);
+                        void openWorktree(mainWorktree.path);
+                      }}
+                    >
+                      {t("repoDialogs.openMainWorkspace")}
+                    </button>
+                  )}
+                </div>
+              )}
+              <div className="border-b p-2">
+                <Input
+                  value={branchFilter}
+                  onChange={(e) => setBranchFilter(e.target.value)}
+                  placeholder={t("repoDialogs.filterBranches")}
+                  className="h-7"
+                  autoComplete="off"
+                />
+              </div>
+              <div className="max-h-60 overflow-y-auto">
+                {visibleBranches.length === 0 &&
+                  archivedBranches.length === 0 &&
+                  remoteOnly.length === 0 && (
+                    <p className="px-3 py-4 text-center text-xs text-muted-foreground">
+                      {branchFilter.trim()
+                        ? `No branches match "${branchFilter.trim()}"`
+                        : t("repoDialogs.noBranches")}
+                    </p>
+                  )}
+                {visibleBranches.map(renderBranchRow)}
+                {archivedBranches.length > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      className="flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-[11px] text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                      onClick={() => setShowArchived((v) => !v)}
+                    >
+                      <CaretDownIcon
+                        className={`size-3 transition-transform ${
+                          showArchived ? "" : "-rotate-90"
+                        }`}
+                        weight="bold"
+                      />
+                      {t("repoDialogs.archivedBranches")} ({archivedBranches.length})
+                    </button>
+                    {showArchived && archivedBranches.map(renderBranchRow)}
+                  </>
+                )}
+                {remoteOnly.length > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      className="flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-[11px] text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                      onClick={() => setShowRemote((v) => !v)}
+                      title={t("repoDialogs.branchesRemoteTip")}
+                    >
+                      <CaretDownIcon
+                        className={`size-3 transition-transform ${
+                          showRemote ? "" : "-rotate-90"
+                        }`}
+                        weight="bold"
+                      />
+                      {t("branchUi.remoteWithCount", { count: remoteOnly.length })}
+                    </button>
+                    {showRemote && remoteOnly.map(renderRemoteRow)}
+                  </>
+                )}
+              </div>
+              <div className="border-t py-1">
+                <MenuRow onClick={openCreate}>{t("repoDialogs.newBranch")}…</MenuRow>
+                <MenuRow
+                  disabled={!currentName}
+                  reason={renameCurrentBlockedReason}
+                  onClick={() => {
+                    if (!currentName) return;
+                    openRename(currentName);
+                  }}
+                >
+                  {t("repoDialogs.renameCurrentBranch")}
+                </MenuRow>
+                <MenuRow
+                  disabled={
+                    !currentName || isDeletionBlocked(rulesConfig, currentName)
+                  }
+                  reason={deleteCurrentBlockedReason}
+                  onClick={() => {
+                    if (!currentName) return;
+                    setOpen(false);
+                    setDeleteTarget(currentName);
+                  }}
+                >
+                  {currentName && isDeletionBlocked(rulesConfig, currentName)
+                    ? t("branchUi.currentBranchProtected")
+                    : t("branchUi.deleteCurrentBranch")}
+                </MenuRow>
+                <MenuRow
+                  onClick={() => {
+                    setOpen(false);
+                    setCleanupOpen(true);
+                  }}
+                >
+                  {t("branchUi.cleanUpBranches")}
+                </MenuRow>
+                {/* Dispatched, not owned: RepositoryMenu holds the one
+                    WorktreesDialog instance and the one "worktrees" handler, so
+                    a second mount here would stack a duplicate dialog on top of
+                    it, and a second registration would shadow the ⋮ menu's
+                    handler (dispatch runs the newest enabled one). Direct call
+                    in the same tick, as RepoSwitcher's rows do — the palette's
+                    setTimeout exists for closing a MODAL, which a popover
+                    isn't. */}
+                <MenuRow
+                  onClick={() => {
+                    setOpen(false);
+                    if (!dispatchAction("worktrees"))
+                      toast.error(t("branchUi.openWorktreeManagerFailed"));
+                  }}
+                >
+                  {t("branchUi.worktrees")}
+                  {linkedWorktreeCount > 0 ? ` (${linkedWorktreeCount})` : ""}…
+                </MenuRow>
+              </div>
+              <div className="border-t py-1">
+                <MenuRow
+                  disabled={!hasChanges}
+                  reason={noChangesBlockedReason}
+                  onClick={() => {
+                    setOpen(false);
+                    setDiscardAllOpen(true);
+                  }}
+                >
+                  {t("branchUi.discardAllChanges")}
+                </MenuRow>
+                <MenuRow
+                  disabled={!hasChanges}
+                  reason={noChangesBlockedReason}
+                  onClick={() => {
+                    setOpen(false);
+                    setStashAllOpen(true);
+                  }}
+                >
+                  {t("branchUi.stashAllChanges")}
+                </MenuRow>
+                <MenuRow
+                  disabled={stashes === 0}
+                  reason={popStashBlockedReason}
+                  onClick={() => {
+                    setOpen(false);
+                    setStashPopOpen(true);
+                  }}
+                >
+                  {t("branchUi.popLatestStash")}{stashes > 0 ? ` (${stashes})` : ""}…
+                </MenuRow>
+                <MenuRow
+                  disabled={stashes === 0}
+                  reason={viewStashesBlockedReason}
+                  onClick={() => {
+                    setOpen(false);
+                    setStashesView("stashes");
+                    setStashesOpen(true);
+                  }}
+                >
+                  {t("branchUi.viewStashes")}{stashes > 0 ? ` (${stashes})` : ""}…
+                </MenuRow>
+                {/* Not gated on stash count — orphaned work commonly exists
+                    with zero live stashes. */}
+                <MenuRow
+                  onClick={() => {
+                    setOpen(false);
+                    setStashesView("recoverable");
+                    setStashesOpen(true);
+                  }}
+                >
+                  {t("branchUi.recoverLostWork")}
+                </MenuRow>
+                <MenuRow
+                  onClick={() => {
+                    setOpen(false);
+                    setOpHistoryOpen(true);
+                  }}
+                >
+                  {t("branchUi.operationHistory")}
+                </MenuRow>
+              </div>
+              <div className="border-t py-1">
+                <MenuRow
+                  disabled={
+                    !defaultName ||
+                    !currentName ||
+                    defaultName === currentName ||
+                    busy ||
+                    currentPromotion
+                  }
+                  reason={updateFromDefaultBlockedReason}
+                  onClick={() => {
+                    if (currentName) void doUpdateFromDefault(currentName);
+                  }}
+                >
+                  {t("branchUi.updateFromDefault", { branch: defaultName ?? t("branchUi.defaultBranchLabel") })}
+                  {currentPromotion ? t("branchUi.promotionBranchHint") : ""}
+                </MenuRow>
+                <MenuRow
+                  disabled={otherBranches.length === 0 || !canMergeIntoCurrent}
+                  reason={mergeIntoCurrentBlockedReason}
+                  onClick={() => openPicker("merge")}
+                >
+                  {lockCurrent
+                    ? t("branchUi.mergeIntoCurrentRequiresPr")
+                    : t("branchUi.mergeIntoCurrent")}
+                </MenuRow>
+                <MenuRow
+                  disabled={otherBranches.length === 0 || !canSquashIntoCurrent}
+                  reason={squashIntoCurrentBlockedReason}
+                  onClick={() => openPicker("squash")}
+                >
+                  {t("branchUi.squashMergeIntoCurrent")}
+                </MenuRow>
+                <MenuRow
+                  disabled={otherBranches.length === 0 || lockCurrent}
+                  reason={rebaseCurrentBlockedReason}
+                  onClick={() => openPicker("rebase")}
+                >
+                  {t("branchUi.rebaseCurrent")}
+                </MenuRow>
+                <MenuRow
+                  disabled={
+                    !currentName ||
+                    otherBranches.length < 2 ||
+                    lockCurrent ||
+                    busy
+                  }
+                  reason={changeBaseBlockedReason}
+                  onClick={openRebaseOnto}
+                >
+                  {t("branchUi.changeBase")}
+                </MenuRow>
+              </div>
+            </Popover.Popup>
+          </Popover.Positioner>
+        </Popover.Portal>
+      </Popover.Root>
+
+      <CreateBranchDialog
+        repoPath={repoPath}
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        rulesConfig={rulesConfig}
+        aiEnabled={aiEnabled}
+        aiConfigured={aiConfigured}
+        hasChanges={hasChanges}
+        headExists={headExists}
+        entries={status.data?.entries ?? []}
+        allBranchNames={allBranches.map((b) => b.name)}
+        committedFallback={committedFallback}
+        committedStatus={committedStatus}
+        currentName={currentName}
+        defaultName={defaultName}
+        onOpenSettings={openSettings}
+      />
+
+      <RenameBranchDialog
+        repoPath={repoPath}
+        target={renameTarget}
+        currentName={currentName}
+        onClose={() => setRenameTarget(null)}
+        aiEnabled={aiEnabled}
+        aiConfigured={aiConfigured}
+        hasChanges={hasChanges}
+        headExists={headExists}
+        entries={status.data?.entries ?? []}
+        allBranchNames={allBranches.map((b) => b.name)}
+        committedFallback={committedFallback}
+        committedStatus={committedStatus}
+        onOpenSettings={openSettings}
+      />
+
+      <CleanupBranchesDialog
+        repoPath={repoPath}
+        open={cleanupOpen}
+        onClose={() => setCleanupOpen(false)}
+        branches={allBranches}
+        defaultBranch={defaultName}
+        currentBranch={currentName}
+        isProtected={(name) => isDeletionBlocked(rulesConfig, name)}
+        // Until both rules scopes land, `isProtected` excludes nothing, so the
+        // dialog holds its list rather than offering a branch a rule refuses.
+        rulesSettling={rulesSettling}
+        isInWorktree={(name) => worktreeByBranch.has(name)}
+        // From the removal store, not the worktree read: `isInWorktree` still
+        // matches a worktree git lists until its removal finishes, and that
+        // read is gated on this menu or the dialog being open, so it can lag —
+        // either way the exclusion holds a branch already on its way out. A
+        // promote's removal (`promotePhase`) doesn't count: it frees the branch
+        // to check it out here, and archiving would hide what you land on.
+        isWorktreeRemoving={(name) =>
+          removals.some((r) => r.branch === name && !r.promotePhase)
+        }
+        // The map is empty until the read lands and stays empty if it fails, so
+        // the dialog is told which, and holds its list rather than acting on an
+        // exclusion that isn't answering yet.
+        worktreeCheckState={worktreeCheckStateFrom(userWorktrees)}
+        prMergedByBranch={mergedPrByBranch}
+        // Only the closed list carries merged PRs, and `canGh` is what says the
+        // query runs at all — so the dialog is told which of the four it got,
+        // never-ran included.
+        prCheckState={prCheckStateFrom(canGh, closedPrs)}
+        // react-query's own signal for "offline": networkMode "online" parks the
+        // fetch, which is otherwise indistinguishable from one in flight.
+        prCheckPaused={closedPrs.fetchStatus === "paused"}
+      />
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        onCancel={() => setDeleteTarget(null)}
+        title={t("settingsAdvanced.branchDeleteQuestion")}
+        body={
+          <>
+            {t("branchUi.deleteBranchConfirm", { branch: shownDeleteTarget ?? "" })}
+            {shownDeleteTarget === currentName && ` ${t("branchUi.switchBeforeDelete")}`}
+          </>
+        }
+        confirmLabel="Delete"
+        confirmVariant="destructive"
+        pending={deleteBranch.isPending || checkout.isPending}
+        onConfirm={doDelete}
+      />
+
+      <ConfirmDialog
+        open={remoteDeleteTarget !== null}
+        onCancel={() => setRemoteDeleteTarget(null)}
+        title={
+          shownRemoteDeleteTarget
+            ? t("branchUi.deleteRemoteBranchTitle", { remote: shownRemoteDeleteTarget.remote })
+            : t("branchUi.deleteRemoteBranchGenericTitle")
+        }
+        body={
+          shownRemoteDeleteTarget ? (
+            <>
+              {t("branchUi.deleteRemoteBranchDescription", {
+                branch: shownRemoteDeleteTarget.name,
+                remote: shownRemoteDeleteTarget.remote,
+              })}
+            </>
+          ) : null
+        }
+        confirmLabel="Delete"
+        confirmVariant="destructive"
+        pending={deleteRemoteBranch.isPending}
+        onConfirm={doDeleteRemoteBranch}
+      />
+
+      <DeleteWorktreeDialog
+        key={removeWorktreeTarget?.path ?? "no-remove"}
+        repoPath={repoPath}
+        worktree={removeWorktreeTarget}
+        onClose={() => setRemoveWorktreeTarget(null)}
+      />
+
+      <StashesDialog
+        repoPath={repoPath}
+        open={stashesOpen}
+        onOpenChange={setStashesOpen}
+        initialView={stashesView}
+      />
+
+      <OperationHistoryDialog
+        repoPath={repoPath}
+        open={opHistoryOpen}
+        onOpenChange={setOpHistoryOpen}
+      />
+
+      <ConfirmDialog
+        open={discardAllOpen}
+        onCancel={() => setDiscardAllOpen(false)}
+        title={t("settingsAdvanced.discardChangesQuestion")}
+        body={t("branchUi.discardAllBody")}
+        confirmLabel={t("branchUi.discardAll")}
+        confirmVariant="destructive"
+        pending={discardAll.isPending}
+        onConfirm={doDiscardAll}
+      />
+
+      <ConfirmDialog
+        open={stashAllOpen}
+        onCancel={() => setStashAllOpen(false)}
+        title={t("settingsAdvanced.stashChangesQuestion")}
+        body={t("branchUi.stashAllBody")}
+        confirmLabel={t("branchUi.stashChanges")}
+        pending={stashAll.isPending}
+        onConfirm={doStashAll}
+      />
+
+      <ConfirmDialog
+        open={stashPopOpen}
+        onCancel={() => setStashPopOpen(false)}
+        title={t("settingsAdvanced.popStashQuestion")}
+        body={t("branchUi.popStashBody")}
+        confirmLabel={t("branchUi.popStash")}
+        pending={stashPop.isPending}
+        onConfirm={doStashPop}
+      />
+
+      <BranchMergePickerDialog
+        repoPath={repoPath}
+        mode={pickerMode}
+        onClose={() => setPickerMode(null)}
+        onRun={runPicker}
+        otherBranches={otherBranches}
+        currentLabel={currentLabel}
+      />
+
+      <RebaseOntoDialog
+        repoPath={repoPath}
+        open={rebaseOntoOpen}
+        onClose={() => setRebaseOntoOpen(false)}
+        onRun={runRebaseOnto}
+        otherBranches={otherBranches}
+        currentLabel={currentLabel}
+        defaultBranch={defaultName}
+        isPushed={Boolean(head?.upstream) && !head?.upstreamGone}
+      />
+
+      <ForkPrPublishGuard
+        repoPath={repoPath}
+        match={forkGuard?.match ?? null}
+        branch={forkGuard?.branch.name ?? ""}
+        destination={forkGuard?.remote ?? "origin"}
+        onClose={() => setForkGuard(null)}
+        onPublishAnyway={() => {
+          setForkGuard(null);
+          if (forkGuard) void runPushBranch(forkGuard.branch, forkGuard.remote);
+        }}
+      />
+
+      <SwitchWithChangesDialog
+        target={switchTarget}
+        currentLabel={currentLabel}
+        hint={switchHint}
+        reapply={reapplyOnSwitch}
+        onReapplyChange={(v) => {
+          reapplyTouchedRef.current = true;
+          setReapplyOnSwitch(v);
+        }}
+        onCancel={() => setSwitchTarget(null)}
+        onBringChanges={bringAndSwitch}
+        onStashAndSwitch={stashAndSwitch}
+      />
+
+      {recovery.dialog}
+
+      <PromoteWorktreeDialog
+        key={promoteTarget?.path ?? "no-promote"}
+        repoPath={repoPath}
+        worktree={promoteTarget}
+        onClose={() => setPromoteTarget(null)}
+      />
+
+      <RenameWorktreeDialog
+        key={renameWorktreeTarget?.path ?? "no-rename"}
+        repoPath={repoPath}
+        worktree={renameWorktreeTarget}
+        onClose={() => setRenameWorktreeTarget(null)}
+      />
+
+      <LockWorktreeDialog
+        key={lockWorktreeTarget?.path ?? "no-lock"}
+        repoPath={repoPath}
+        worktree={lockWorktreeTarget}
+        onClose={() => setLockWorktreeTarget(null)}
+      />
+    </>
+  );
+}

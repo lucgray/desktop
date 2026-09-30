@@ -1,0 +1,479 @@
+import { SparkleIcon } from "@phosphor-icons/react";
+import { useCallback, useLayoutEffect, useState } from "react";
+import { toast } from "sonner";
+import { SelectClipText } from "@/components/select-clip-text";
+import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
+import { Switch } from "@/components/ui/switch";
+import { clipTitleFromText } from "@/lib/clip-title";
+import {
+  useBranches,
+  useGlRepoSettings,
+  useUpdateGlRepoSettings,
+} from "@/lib/git/queries";
+import type {
+  Branch,
+  GitLabRepoSettings,
+  GitLabRepoSettingsInput,
+} from "@/lib/git/types";
+import { usePublishGenerateAction } from "@/lib/hotkeys/useGenerateChord";
+import { useAiConfigured, useAiEnabled } from "@/lib/settings/queries";
+import {
+  cancelRepoDescGeneration,
+  claimRepoDescGeneration,
+  consumePendingRepoDesc,
+  type RepoDescResult,
+  registerRepoDescListener,
+  settleRepoDescGeneration,
+  useIsGeneratingRepoDesc,
+} from "@/lib/stores/repo-description-generation";
+import { useUiStore } from "@/lib/stores/ui";
+import { toastError } from "@/lib/toast";
+import { DescriptionField } from "./DescriptionField";
+import { AsyncErrorCard } from "./parts";
+import { GITLAB_TOPIC_RULES, TopicsField } from "./TopicsField";
+import { useGenerateRepoDescription } from "./useGenerateRepoDescription";
+import { useTranslation, type TranslationKey } from "@/lib/i18n";
+
+/** The GitLab counterpart of {@link GeneralSettingsSection}: GitLab's settings
+ *  model is its own shape (per-feature access levels, one merge-method enum, a
+ *  squash option), so it gets a GitLab-shaped form instead of a lossy mapping
+ *  onto the GitHub one. Same batch Save posture. */
+export function GitLabGeneralSection({
+  repoPath,
+  open,
+}: {
+  repoPath: string;
+  open: boolean;
+}) {
+  const { t } = useTranslation();
+  const settings = useGlRepoSettings(repoPath, open);
+  const branches = useBranches(repoPath);
+
+  if (settings.isPending) {
+    return (
+      <div className="min-w-0 space-y-3">
+        <Skeleton className="h-9 w-full" />
+        <Skeleton className="h-9 w-full" />
+        <Skeleton className="h-20 w-full" />
+      </div>
+    );
+  }
+
+  if (settings.isError || !settings.data) {
+    return (
+      <AsyncErrorCard title={t("repoSettings.loadSettingsFailed")} error={settings.error} />
+    );
+  }
+
+  return (
+    <GitLabGeneralForm
+      key={repoPath}
+      repoPath={repoPath}
+      settings={settings.data}
+      branches={branches.data ?? []}
+    />
+  );
+}
+
+function toInput(s: GitLabRepoSettings): GitLabRepoSettingsInput {
+  return {
+    description: s.description ?? "",
+    topics: s.topics,
+    defaultBranch: s.defaultBranch,
+    issuesAccessLevel: s.issuesAccessLevel,
+    mergeRequestsAccessLevel: s.mergeRequestsAccessLevel,
+    wikiAccessLevel: s.wikiAccessLevel,
+    snippetsAccessLevel: s.snippetsAccessLevel,
+    forkingAccessLevel: s.forkingAccessLevel,
+    mergeMethod: s.mergeMethod,
+    squashOption: s.squashOption,
+    removeSourceBranchAfterMerge: s.removeSourceBranchAfterMerge,
+    onlyAllowMergeIfPipelineSucceeds: s.onlyAllowMergeIfPipelineSucceeds,
+    onlyAllowMergeIfAllDiscussionsAreResolved:
+      s.onlyAllowMergeIfAllDiscussionsAreResolved,
+  };
+}
+
+/** GitLab's per-feature access levels — tri-state, never collapsed to a
+ *  checkbox (that would silently clobber "Members only"). */
+const ACCESS_LEVELS = [
+  { value: "enabled", key: "repoSettings.everyoneWithAccess" },
+  { value: "private", key: "repoSettings.membersOnly" },
+  { value: "disabled", key: "repoSettings.disabled" },
+] as const;
+
+const FEATURES: { key: FeatureKey; label: TranslationKey }[] = [
+  { key: "issuesAccessLevel", label: "repoSettings.issues" },
+  { key: "mergeRequestsAccessLevel", label: "repoSettings.mergeRequests" },
+  { key: "wikiAccessLevel", label: "repoSettings.wiki" },
+  { key: "snippetsAccessLevel", label: "repoSettings.snippets" },
+  { key: "forkingAccessLevel", label: "repoSettings.forking" },
+];
+type FeatureKey =
+  | "issuesAccessLevel"
+  | "mergeRequestsAccessLevel"
+  | "wikiAccessLevel"
+  | "snippetsAccessLevel"
+  | "forkingAccessLevel";
+
+/** GitLab's merge-method enum, with its own UI vocabulary. */
+const MERGE_METHODS = [
+  { value: "merge", key: "repoSettings.mergeCommit" },
+  { value: "rebase_merge", key: "repoSettings.semiLinearMerge" },
+  { value: "ff", key: "repoSettings.fastForwardMerge" },
+] as const;
+
+const SQUASH_OPTIONS = [
+  { value: "default_off", key: "repoSettings.allowOffByDefault" },
+  { value: "default_on", key: "repoSettings.encourageOnByDefault" },
+  { value: "always", key: "repoSettings.require" },
+  { value: "never", key: "repoSettings.doNotAllow" },
+] as const;
+
+/** Base UI's <Select> resolves the selected value → its display label from an
+ *  `items` map; without it a closed select falls back to the raw value (so the
+ *  trigger reads "enabled" / "merge" / "default_off" until the popup is opened). */
+const ACCESS_LEVEL_ITEMS: Record<string, string> = Object.fromEntries(
+  ACCESS_LEVELS.map((o) => [o.value, o.key]),
+);
+const MERGE_METHOD_ITEMS: Record<string, string> = Object.fromEntries(
+  MERGE_METHODS.map((o) => [o.value, o.key]),
+);
+const SQUASH_OPTION_ITEMS: Record<string, string> = Object.fromEntries(
+  SQUASH_OPTIONS.map((o) => [o.value, o.key]),
+);
+
+/** Normalize AI-suggested topics per GitLab's rules (trim only, case + spaces
+ *  preserved), deduped and with no cap — used when the Generate result seeds topics. */
+function normalizeGlTopics(raw: string[]): string[] {
+  return [
+    ...new Set(raw.map((t) => GITLAB_TOPIC_RULES.normalize(t)).filter(Boolean)),
+  ];
+}
+
+function GitLabGeneralForm({
+  repoPath,
+  settings,
+  branches,
+}: {
+  repoPath: string;
+  settings: GitLabRepoSettings;
+  branches: Branch[];
+}) {
+  const { t } = useTranslation();
+  const update = useUpdateGlRepoSettings(repoPath);
+  const base = toInput(settings);
+  const [form, setForm] = useState<GitLabRepoSettingsInput>(base);
+
+  const aiEnabled = useAiEnabled();
+  const aiConfigured = useAiConfigured();
+  const openSettings = useUiStore((s) => s.openSettings);
+  const repoName =
+    useUiStore((s) => s.repoName) ?? repoPath.split(/[/\\]/).pop() ?? repoPath;
+  const descGen = useGenerateRepoDescription(repoPath);
+  // A run started here outlives this form (the dialog and the rail both unmount
+  // their section immediately), so the store owns it: `generating` covers the
+  // stream this mount launched, the store covers one it inherited.
+  const storeBusy = useIsGeneratingRepoDesc(repoPath);
+  const busy = descGen.generating || storeBusy;
+
+  function set<K extends keyof GitLabRepoSettingsInput>(
+    key: K,
+    value: GitLabRepoSettingsInput[K],
+  ) {
+    setForm((f) => ({ ...f, [key]: value }));
+  }
+
+  // Seeds the draft the way a manual edit would, so the Save bar goes live.
+  const applyResult = useCallback(({ description, topics }: RepoDescResult) => {
+    if (description) setForm((f) => ({ ...f, description }));
+    if (topics.length)
+      setForm((f) => ({ ...f, topics: normalizeGlTopics(topics) }));
+  }, []);
+
+  // Take a result that settled while no section was mounted, then stay the
+  // recipient for one that settles during this mount. A LAYOUT effect: a settle
+  // between the commit and a passive flush would find no listener and toast.
+  useLayoutEffect(() => {
+    const pending = consumePendingRepoDesc(repoPath);
+    if (pending) applyResult(pending);
+    return registerRepoDescListener(repoPath, applyResult);
+  }, [repoPath, applyResult]);
+
+  // Shared by the Generate button and the settings dialog's generate chord,
+  // which this publishes to — the shell owns the chord because it owns the
+  // DialogContent every section renders inside.
+  async function runGenerate() {
+    if (!claimRepoDescGeneration(repoPath, descGen.cancel)) return;
+    let result: RepoDescResult | null = null;
+    try {
+      await descGen.generate({
+        repoName,
+        onResult: (r) => {
+          result = r;
+        },
+      });
+    } finally {
+      // In a `finally` because nothing else clears the lane: a throw between
+      // the claim and here would leave every surface for this repo busy.
+      settleRepoDescGeneration(repoPath, result);
+    }
+  }
+  const { hint: generateHint } = usePublishGenerateAction(
+    aiEnabled && aiConfigured && !busy,
+    runGenerate,
+  );
+
+  const dirty = JSON.stringify(form) !== JSON.stringify(base);
+
+  // Awaited, not per-call callbacks: this subtree unmounts when the dialog
+  // closes or the rail crossfades to another section, and react-query drops
+  // per-call callbacks on unmount — the outcome would never reach the user.
+  async function handleSave() {
+    try {
+      await update.mutateAsync(form);
+      toast.success(t("repoSettings.settingsSaved"));
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  // Keep the current default selectable even if that branch isn't local; drop
+  // agent-session branches (`gd/session/*`) — they're app-internal.
+  const branchNames = branches
+    .map((b) => b.name)
+    .filter((n) => !n.startsWith("gd/session/"));
+  const branchOptions =
+    form.defaultBranch && !branchNames.includes(form.defaultBranch)
+      ? [form.defaultBranch, ...branchNames]
+      : branchNames;
+
+  return (
+    <div className="min-w-0 space-y-4">
+      <DescriptionField
+        id="gl-repo-description"
+        value={form.description}
+        onChange={(v) => set("description", v)}
+        placeholder={t("repoSettings.projectDescriptionPlaceholder")}
+        generate={
+          aiEnabled &&
+          (!aiConfigured ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              className="text-muted-foreground"
+              onClick={() => openSettings("ai")}
+            >
+              <SparkleIcon data-icon="inline-start" />
+              {t("repoSettings.setupAi")}
+            </Button>
+          ) : busy ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              className="text-muted-foreground"
+              onClick={() => {
+                if (descGen.generating) descGen.cancel();
+                else cancelRepoDescGeneration(repoPath);
+              }}
+            >
+              <Spinner data-icon="inline-start" />
+              {t("repoSettings.cancel")}
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              title={`${t("repoSettings.suggestDescriptionTopicsAi")}${generateHint}`}
+              onClick={runGenerate}
+            >
+              <SparkleIcon data-icon="inline-start" />
+              {t("repoSettings.generate")}
+            </Button>
+          ))
+        }
+      />
+
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-between">
+          <Label htmlFor="gl-repo-topics">{t("repoSettings.topics")}</Label>
+          <span className="text-[11px] text-muted-foreground tabular-nums">
+            {form.topics.length}
+          </span>
+        </div>
+        <TopicsField
+          id="gl-repo-topics"
+          topics={form.topics}
+          onChange={(next) => set("topics", next)}
+          rules={GITLAB_TOPIC_RULES}
+        />
+      </div>
+
+      <div className="space-y-1.5">
+        <Label htmlFor="gl-repo-default-branch">{t("repoSettings.defaultBranch")}</Label>
+        <Select
+          items={Object.fromEntries(branchOptions.map((b) => [b, b]))}
+          value={form.defaultBranch ?? ""}
+          onValueChange={(v) => {
+            if (v) set("defaultBranch", v);
+          }}
+        >
+          <SelectTrigger id="gl-repo-default-branch" className="w-full">
+            <SelectValue
+              placeholder={t("repoSettings.noDefaultBranchYet")}
+              onMouseEnter={clipTitleFromText}
+            />
+          </SelectTrigger>
+          <SelectContent>
+            {branchOptions.map((b) => (
+              <SelectItem key={b} value={b}>
+                <SelectClipText>{b}</SelectClipText>
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      <div className="space-y-2">
+        <p className="text-xs font-medium">{t("repoSettings.features")}</p>
+        <p className="text-[11px] text-muted-foreground">
+          {t("repoSettings.membersOnlyHelp")}
+        </p>
+        <div className="grid grid-cols-2 gap-x-4 gap-y-3">
+          {FEATURES.map(({ key, label }) => (
+            <div key={key} className="space-y-1.5">
+              <Label htmlFor={`gl-feature-${key}`} className="text-xs">
+                {t(label)}
+              </Label>
+              <Select
+                items={ACCESS_LEVEL_ITEMS}
+                value={form[key]}
+                onValueChange={(v) => {
+                  if (v) set(key, v);
+                }}
+              >
+                <SelectTrigger id={`gl-feature-${key}`} className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {ACCESS_LEVELS.map((o) => (
+                    <SelectItem key={o.value} value={o.value}>
+                      {t(o.key)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <p className="text-xs font-medium">{t("repoSettings.mergeRequests")}</p>
+        <div className="grid grid-cols-2 gap-4">
+          <div className="space-y-1.5">
+            <Label htmlFor="gl-merge-method">{t("repoSettings.mergeMethod")}</Label>
+            <Select
+              items={MERGE_METHOD_ITEMS}
+              value={form.mergeMethod}
+              onValueChange={(v) => {
+                if (v) set("mergeMethod", v);
+              }}
+            >
+              <SelectTrigger id="gl-merge-method" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {MERGE_METHODS.map((o) => (
+                  <SelectItem key={o.value} value={o.value}>
+                    {t(o.key)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="gl-squash-option">{t("repoSettings.squashCommits")}</Label>
+            <Select
+              items={SQUASH_OPTION_ITEMS}
+              value={form.squashOption}
+              onValueChange={(v) => {
+                if (v) set("squashOption", v);
+              }}
+            >
+              <SelectTrigger id="gl-squash-option" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {SQUASH_OPTIONS.map((o) => (
+                  <SelectItem key={o.value} value={o.value}>
+                    {t(o.key)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        <div className="space-y-2 pt-1">
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor="gl-remove-source" className="text-xs">
+              {t("repoSettings.deleteSourceBranchByDefault")}
+            </Label>
+            <Switch
+              id="gl-remove-source"
+              checked={form.removeSourceBranchAfterMerge}
+              onCheckedChange={(v) => set("removeSourceBranchAfterMerge", v)}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor="gl-pipeline-succeeds" className="text-xs">
+              {t("repoSettings.pipelinesMustSucceed")}
+            </Label>
+            <Switch
+              id="gl-pipeline-succeeds"
+              checked={form.onlyAllowMergeIfPipelineSucceeds}
+              onCheckedChange={(v) =>
+                set("onlyAllowMergeIfPipelineSucceeds", v)
+              }
+            />
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor="gl-discussions-resolved" className="text-xs">
+              {t("repoSettings.threadsResolvedBeforeMerge")}
+            </Label>
+            <Switch
+              id="gl-discussions-resolved"
+              checked={form.onlyAllowMergeIfAllDiscussionsAreResolved}
+              onCheckedChange={(v) =>
+                set("onlyAllowMergeIfAllDiscussionsAreResolved", v)
+              }
+            />
+          </div>
+        </div>
+      </div>
+
+      <div className="flex items-center justify-end gap-2 border-t pt-3">
+        <Button
+          disabled={!dirty || update.isPending || busy}
+          onClick={handleSave}
+        >
+          {update.isPending && <Spinner data-icon="inline-start" />}
+          {t("repoSettings.saveChanges")}
+        </Button>
+      </div>
+    </div>
+  );
+}

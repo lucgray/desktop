@@ -1,0 +1,399 @@
+import { KanbanIcon } from "@phosphor-icons/react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Spinner } from "@/components/ui/spinner";
+import { presentError } from "@/lib/error-summary";
+import { forgeIssueComment } from "@/lib/git/api";
+import {
+  forgeFeatureReady,
+  useCreateIssue,
+  useForgeStatus,
+} from "@/lib/git/queries";
+import type { LocalIssue } from "@/lib/issues/local";
+import { useUpdateLocalIssue } from "@/lib/issues/queries";
+import { jiraIssueComment } from "@/lib/jira/api";
+import {
+  useJiraCreateIssue,
+  useJiraIssueTypes,
+  useJiraLink,
+  useJiraPermissions,
+} from "@/lib/jira/queries";
+import { useSetRepoLens } from "@/lib/repo-lens/queries";
+import { landedIn } from "@/lib/stores/notifications";
+import { useUiStore } from "@/lib/stores/ui";
+import { toastComposedError, toastError } from "@/lib/toast";
+import { cn } from "@/lib/utils";
+import { useTranslation } from "@/lib/i18n";
+
+type Destination = "forge" | "jira";
+
+/**
+ * Publishes a local issue to a real tracker — the repo's forge (GitHub or
+ * GitLab) or the linked Jira project — opening a real issue with the same
+ * title/description, **re-posting its comments** (so nothing is lost), then
+ * closing the local issue with a link to its successor. When both destinations
+ * are available the user picks one; when only one is, that's the whole flow.
+ * Deliberately fires no automations — the local issue's creation was the trigger
+ * point, not this.
+ */
+export function PromoteLocalIssueDialog({
+  repoPath,
+  issue,
+  open,
+  onOpenChange,
+}: {
+  repoPath: string;
+  issue: LocalIssue;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  // Promotion always targets the fork's own remote (origin) — never the parent.
+  const createIssue = useCreateIssue(repoPath, "origin");
+  const update = useUpdateLocalIssue(repoPath);
+  const selectIssue = useUiStore((s) => s.selectIssue);
+  const setLens = useSetRepoLens(repoPath);
+
+  const forge = useForgeStatus(repoPath);
+  const remoteLabel = forge.data?.provider === "gitlab" ? "GitLab" : "GitHub";
+  const canPublishForge = forgeFeatureReady(forge.data, "issueCreate");
+
+  const link = useJiraLink(repoPath).data;
+  const jiraPerms = useJiraPermissions(repoPath, link);
+  const canPublishJira = !!link && (jiraPerms.data?.createIssues ?? false);
+  const jiraCreate = useJiraCreateIssue(repoPath, link);
+  // Fetch the project's issue types only while the dialog is open AND Jira is a
+  // possible destination — no picker here, so we auto-resolve the first
+  // creatable (`!subtask`) type, mirroring CreateJiraIssueDialog.
+  const jiraTypes = useJiraIssueTypes(repoPath, link, open && canPublishJira);
+  const creatableTypes = useMemo(
+    () => (jiraTypes.data ?? []).filter((t) => !t.subtask),
+    [jiraTypes.data],
+  );
+
+  const bothAvailable = canPublishForge && canPublishJira;
+  // Init unconditionally to "forge"; the effect below settles the real default
+  // once the async gates resolve (a bare init can't, since both gates are still
+  // pending at mount).
+  const [destination, setDestination] = useState<Destination>("forge");
+  // True once the user has explicitly toggled the destination — after that the
+  // auto-default effect must not override their pick (only the hidden-destination
+  // force-switch below still applies).
+  const userPicked = useRef(false);
+  // Keep the selection sensible as the async gates resolve (the forge status +
+  // Jira permission probes land at different times, often out of order). Two
+  // rules:
+  //   1. Auto-default only while the user hasn't picked: forge-first when both
+  //      are available, jira when only jira is. This is what makes forge win the
+  //      race even if the (cached) Jira gate resolves first.
+  //   2. Force-switch away from a destination whose gate just turned false —
+  //      applies EVEN after a user pick, because a hidden destination must never
+  //      be the one that submits.
+  useEffect(() => {
+    if (!userPicked.current) {
+      if (canPublishForge) setDestination("forge");
+      else if (canPublishJira) setDestination("jira");
+      return;
+    }
+    // User has picked: only correct an impossible selection.
+    setDestination((cur) => {
+      if (cur === "forge" && !canPublishForge && canPublishJira) return "jira";
+      if (cur === "jira" && !canPublishJira && canPublishForge) return "forge";
+      return cur;
+    });
+  }, [canPublishForge, canPublishJira]);
+
+  const [pending, setPending] = useState(false);
+
+  const carried = issue.comments.filter((c) => c.body.trim());
+
+  const targetLabel = destination === "jira" ? "Jira" : remoteLabel;
+  // The auto-resolved Jira type; absent until types load. Its absence disables
+  // the Jira submit so we never fire a create with no type.
+  const jiraTypeId = creatableTypes[0]?.id ?? null;
+  const jiraReady = destination !== "jira" || jiraTypeId !== null;
+  // Explain WHY the Jira submit is dead (never a title on a disabled button):
+  // still loading the project's types, or the project has none we can create.
+  const jiraLoadingTypes = destination === "jira" && jiraTypes.isPending;
+  const jiraTypesError = destination === "jira" && jiraTypes.isError;
+  const jiraNoTypes =
+    destination === "jira" &&
+    !jiraTypes.isPending &&
+    !jiraTypes.isError &&
+    creatableTypes.length === 0;
+
+  async function promoteForge() {
+    // Once the remote issue exists, later steps (comment carry-over, closing the
+    // local issue) failing must NOT re-arm the submit — retrying would open a
+    // duplicate. Track it so the catch can disclose instead of re-running.
+    let created: { number: number; url: string } | null = null;
+    let failedStep = "finishing up";
+    try {
+      const { number, url } = await createIssue.mutateAsync({
+        title: issue.title,
+        body: issue.body,
+        // Local labels are free-form and may not exist remotely; leave them off.
+        labels: [],
+        assignees: [],
+        milestone: null,
+        type: null,
+      });
+      created = { number, url };
+      failedStep = "carrying over comments";
+      for (const c of carried) {
+        await forgeIssueComment(repoPath, number, c.body, "origin");
+      }
+      failedStep = "closing the local issue";
+      await closeLocalWithBackLink(
+        `Promoted to ${remoteLabel} issue [#${number}](${url}).`,
+      );
+      // One read for both halves: the toast is unconditional and names the repo
+      // when it isn't the one on screen, while the navigation below only lands
+      // when it is — landed elsewhere it would close a dialog the user reopened
+      // there and point that repo's Issues tab at a number belonging to this one.
+      const { live, away } = landedIn(repoPath);
+      toast.success(`Opened issue #${number}${away}`, {
+        description: url,
+        action: { label: "View", onClick: () => openUrl(url) },
+      });
+      // The promoted issue lives on the fork (origin) — force the origin lens so
+      // the Issues tab shows it (and any stale remote selection is cleared) before
+      // navigating to it.
+      if (live) {
+        onOpenChange(false);
+        setLens("origin");
+        selectIssue({ kind: "remote", id: String(number) });
+      }
+    } catch (e) {
+      if (created === null) {
+        // The create itself failed — retrying is correct, keep the dialog open.
+        toastError(e);
+        return;
+      }
+      // The remote issue already exists. Close the dialog (leaving it open on this
+      // issue is a duplicate factory — the local issue wasn't closed, so it still
+      // reads as promotable) and disclose what was created and what failed. The
+      // close names its SUBJECT as well as its repo: the host keeps one
+      // `promoteOpen` state and already blanks it when the selection moves, so a
+      // close landing on another issue's confirm protects nothing here and shuts a
+      // dialog the user opened for something else.
+      const { number, url } = created;
+      const ui = useUiStore.getState();
+      const { live, away } = landedIn(repoPath);
+      // The close needs the subject too; the toast names only the REPO, since that
+      // is the part the user can't see for themselves.
+      const onThisIssue =
+        live &&
+        ui.selectedIssue?.kind === "local" &&
+        ui.selectedIssue.id === issue.id;
+      if (onThisIssue) onOpenChange(false);
+      toastComposedError({
+        title: `Created issue #${number}${away}, but ${failedStep} failed: ${presentError(e).summary}`,
+        errors: [e],
+        // `canPublishForge` gated this run on a resolved forge status, so the
+        // label names the real provider.
+        view: { url, label: `View on ${remoteLabel}` },
+        duration: 10000,
+      });
+    }
+  }
+
+  async function promoteJira() {
+    if (!link || jiraTypeId === null) return;
+    // Same retry-safety invariant as the forge path, tracked independently per
+    // destination: once the Jira issue exists, a failure in a later step must
+    // disclose rather than re-run (a retry would create a duplicate).
+    let created: { key: string; url: string } | null = null;
+    let failedStep = "finishing up";
+    try {
+      const { key, url } = await jiraCreate.mutateAsync({
+        issueTypeId: jiraTypeId,
+        summary: issue.title,
+        descriptionMd: issue.body.trim() || undefined,
+      });
+      created = { key, url };
+      failedStep = "carrying over comments";
+      for (const c of carried) {
+        await jiraIssueComment(link.siteHost, key, c.body);
+      }
+      failedStep = "closing the local issue";
+      await closeLocalWithBackLink(`Promoted to Jira issue [${key}](${url}).`);
+      // Same one read as the forge path: the toast names its repo either way, the
+      // selection and close only land while that repo is the one on screen. The
+      // pinned `useJiraCreateIssue` means this continuation outlives the detach a
+      // switch causes, so it has to answer for where it ended up.
+      const { live, away } = landedIn(repoPath);
+      toast.success(`Created ${key}${away}`, {
+        description: url,
+        action: { label: "View", onClick: () => openUrl(url) },
+      });
+      if (live) {
+        onOpenChange(false);
+        selectIssue({ kind: "jira", id: key });
+      }
+    } catch (e) {
+      if (created === null) {
+        toastError(e);
+        return;
+      }
+      // Same subject-and-repo close as the forge path: one `promoteOpen` for the
+      // whole view, blanked when the selection moves, so closing it from here
+      // would shut a confirm the user opened for a different issue.
+      const { key, url } = created;
+      const ui = useUiStore.getState();
+      const { live, away } = landedIn(repoPath);
+      const onThisIssue =
+        live &&
+        ui.selectedIssue?.kind === "local" &&
+        ui.selectedIssue.id === issue.id;
+      if (onThisIssue) onOpenChange(false);
+      toastComposedError({
+        title: `Created ${key}${away}, but ${failedStep} failed: ${presentError(e).summary}`,
+        errors: [e],
+        view: { url, label: "View in Jira" },
+        duration: 10000,
+      });
+    }
+  }
+
+  // Provider-agnostic final step: close the local issue with a back-link comment
+  // to its successor. Shared by both destinations, unchanged from the original.
+  async function closeLocalWithBackLink(backLink: string) {
+    await update.mutateAsync({
+      id: issue.id,
+      mutate: (cur) => ({
+        ...cur,
+        status: "closed",
+        closedAt: new Date().toISOString(),
+        comments: [
+          ...cur.comments,
+          {
+            id: crypto.randomUUID(),
+            body: backLink,
+            createdAt: new Date().toISOString(),
+          },
+        ],
+      }),
+    });
+  }
+
+  async function promote() {
+    setPending(true);
+    try {
+      if (destination === "jira") await promoteJira();
+      else await promoteForge();
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{t("issuePromote.title", { target: targetLabel })}</DialogTitle>
+          <DialogDescription>
+            {t("issuePromote.openLead", { target: targetLabel })}
+            {carried.length > 0
+              ? t("issuePromote.repostComments", { count: carried.length })
+              : ""}
+            {t("issuePromote.closeNote")}
+          </DialogDescription>
+        </DialogHeader>
+
+        {bothAvailable && (
+          <div className="space-y-1.5">
+            <p className="text-xs font-medium text-muted-foreground">
+              {t("issuePromote.publishTo")}
+            </p>
+            {/* Segmented toggle: two Tab-focusable buttons with aria-pressed,
+                matching the app's existing segmented-tab idiom (each is its own
+                tab stop; Enter/Space toggles). */}
+            <div className="flex gap-2" aria-label={t("issuePromote.destination")}>
+              <Button
+                variant={destination === "forge" ? "secondary" : "outline"}
+                className={cn(
+                  "flex-1",
+                  destination === "forge" && "font-medium",
+                )}
+                aria-pressed={destination === "forge"}
+                onClick={() => {
+                  userPicked.current = true;
+                  setDestination("forge");
+                }}
+                disabled={pending}
+              >
+                {remoteLabel}
+              </Button>
+              <Button
+                variant={destination === "jira" ? "secondary" : "outline"}
+                className={cn(
+                  "flex-1",
+                  destination === "jira" && "font-medium",
+                )}
+                aria-pressed={destination === "jira"}
+                onClick={() => {
+                  userPicked.current = true;
+                  setDestination("jira");
+                }}
+                disabled={pending}
+              >
+                <KanbanIcon data-icon="inline-start" />
+                {t("issuePromote.jira")}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {jiraLoadingTypes && (
+          <p className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Spinner data-icon="inline-start" />
+            {t("issuePromote.loadingTypes")}
+          </p>
+        )}
+        {jiraTypesError && (
+          <div className="flex items-center gap-2 border px-3 py-2 text-xs text-muted-foreground">
+            <span className="flex-1">{t("issuePromote.loadTypesFailed")}</span>
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              onClick={() => jiraTypes.refetch()}
+            >
+              {t("issuePromote.retry")}
+            </Button>
+          </div>
+        )}
+        {jiraNoTypes && (
+          <p className="text-xs text-warning">
+            {t("issuePromote.noTypes")}
+          </p>
+        )}
+
+        <DialogFooter>
+          <Button
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            disabled={pending}
+          >
+            {t("issuePromote.cancel")}
+          </Button>
+          <Button onClick={promote} disabled={pending || !jiraReady}>
+            {pending && <Spinner data-icon="inline-start" />}
+            {t("issuePromote.publish", { target: targetLabel })}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}

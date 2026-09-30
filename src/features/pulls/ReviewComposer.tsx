@@ -1,0 +1,239 @@
+import { type KeyboardEvent, useState } from "react";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { MarkdownEditor } from "@/components/markdown-editor";
+import { Button } from "@/components/ui/button";
+import { useMentionCandidates } from "@/features/conversations/useMentionCandidates";
+import { useCreateReviewThread } from "@/lib/git/queries";
+import type { RemoteLens } from "@/lib/git/types";
+import { SUBMIT_HINT } from "@/lib/hotkeys/binding";
+import { useAddReviewDraft } from "@/lib/pulls/review-drafts";
+import { toastError } from "@/lib/toast";
+import { buildSuggestionFence, extractNewSideLines } from "./suggestion-utils";
+import { useTranslation } from "@/lib/i18n";
+
+export interface ReviewComposerProps {
+  repoPath: string;
+  number: number;
+  path: string;
+  side: "new" | "old";
+  /** The anchored (end) line of the comment. */
+  line: number;
+  /** Range start when a range was drag-selected; absent for a single line. */
+  fromLine?: number;
+  provider: "github" | "gitlab" | "bitbucket";
+  /** This file's unified-diff section, for prefilling a suggestion's code. */
+  fileSection: string;
+  /** Current pending-review size — drives the Add-to-review button label. */
+  draftCount: number;
+  canCreateThread: boolean;
+  /** The origin|upstream lens the parent PR view resolved (scopes the thread). */
+  lens: RemoteLens;
+  onClose: () => void;
+}
+
+/**
+ * The inline composer rendered inside a diff line-widget slot: a compact
+ * MarkdownEditor with the anchor label, an "Add suggestion" action that inserts
+ * the provider-correct ```suggestion fence pre-filled with the selected code, and
+ * two submit paths — "Add single comment" (posts one line comment optimistically)
+ * and "Add to review" (stages a pending-review draft). Wired by PrFilesPane via
+ * DiffSurface's `lineWidget`; P5 supplies the props from the PR view.
+ */
+export function ReviewComposer({
+  repoPath,
+  number,
+  path,
+  side,
+  line,
+  fromLine,
+  provider,
+  fileSection,
+  draftCount,
+  canCreateThread,
+  lens,
+  onClose,
+}: ReviewComposerProps) {
+  const { t } = useTranslation();
+  const [body, setBody] = useState("");
+  const [pending, setPending] = useState(false);
+  const createThread = useCreateReviewThread(repoPath, lens);
+  const addDraft = useAddReviewDraft(repoPath, lens, number);
+  const mentions = useMentionCandidates({ repoPath, lens, provider });
+
+  // The multi-line range, normalized: [from, line] with from <= line.
+  const rangeFrom = fromLine !== undefined && fromLine < line ? fromLine : line;
+  const isRange = rangeFrom !== line;
+  // GitHub and GitLab both carry a real range on the thread anchor (startLine);
+  // Bitbucket's API anchors at the end line only (fromLine shown in the label
+  // plus a disclosure below). So send startLine on GitHub/GitLab for a real
+  // range, and never on Bitbucket.
+  const startLine =
+    (provider === "github" || provider === "gitlab") && isRange
+      ? rangeFrom
+      : undefined;
+
+  const anchorLabel = isRange
+    ? `Lines ${rangeFrom}–${line} · ${path}`
+    : `Line ${line} · ${path}`;
+
+  // Suggestions replace NEW-side code, so an old-side anchor can't be suggested
+  // on. Bitbucket suggestions are single-line only. Otherwise we need the current
+  // code for the range to prefill; if it can't be recovered, degrade the action.
+  const currentLines =
+    side === "new" ? extractNewSideLines(fileSection, rangeFrom, line) : null;
+  const bitbucketMultiline = provider === "bitbucket" && isRange;
+  const suggestionDisabledReason =
+    side === "old"
+      ? t("remainingUi.reviewSuggestionNewSide")
+      : bitbucketMultiline
+        ? t("remainingUi.reviewSuggestionBitbucket")
+        : currentLines === null
+          ? t("remainingUi.reviewSuggestionCodeUnavailable")
+          : null;
+  const canSuggest = suggestionDisabledReason === null;
+
+  function insertSuggestion() {
+    if (!currentLines) return;
+    const fence = buildSuggestionFence(
+      provider,
+      { from: rangeFrom, to: line },
+      currentLines,
+    );
+    // Append to the end of the body (a blank line before it when there's already
+    // content), then let the user keep editing.
+    setBody((prev) =>
+      prev.trim() ? `${prev.replace(/\n*$/, "")}\n\n${fence}\n` : `${fence}\n`,
+    );
+  }
+
+  async function addSingleComment() {
+    if (!canCreateThread || !body.trim() || pending) return;
+    setPending(true);
+    // Posting is optimistic (the thread lands in the cache immediately), so close
+    // right away — the synthetic thread renders under the line without waiting.
+    // The failure rides the promise (detached, so the close still happens on this
+    // tick): closing unmounts this composer, and react-query drops per-call mutate
+    // callbacks once an observer has no listeners.
+    void createThread
+      .mutateAsync({ number, path, line, side, startLine, body: body.trim() })
+      .catch((e) => toastError(e));
+    onClose();
+  }
+
+  async function addToReview() {
+    if (!body.trim() || pending) return;
+    setPending(true);
+    try {
+      await addDraft.mutateAsync({
+        id: crypto.randomUUID(),
+        path,
+        line,
+        side,
+        ...(startLine !== undefined ? { startLine } : {}),
+        body: body.trim(),
+        createdAt: new Date().toISOString(),
+      });
+      onClose();
+    } catch (e) {
+      toastError(e);
+      setPending(false);
+    }
+  }
+
+  // mod+Enter: add-to-review when a review is already in progress, else the
+  // single-comment path (mirrors the primary button's meaning below).
+  function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      if (draftCount > 0) addToReview();
+      else if (canCreateThread) addSingleComment();
+    } else if (e.key === "Escape") {
+      // Close only this widget — don't leak Escape to global handlers.
+      e.preventDefault();
+      e.stopPropagation();
+      onClose();
+    }
+  }
+
+  const addToReviewLabel =
+    draftCount === 0 ? t("remainingUi.reviewStart") : t("remainingUi.reviewAddToReview");
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">
+          {anchorLabel}
+        </span>
+        <DisabledReasonButton
+          variant="ghost"
+          size="xs"
+          className="shrink-0 text-muted-foreground"
+          disabled={!canSuggest}
+          reason={suggestionDisabledReason}
+          onClick={insertSuggestion}
+        >
+          {t("remainingUi.reviewAddSuggestion")}
+        </DisabledReasonButton>
+      </div>
+      {provider === "bitbucket" && isRange && (
+        <p className="text-[11px] text-muted-foreground">
+          {t("remainingUi.reviewBitbucketRange")}
+        </p>
+      )}
+      <MarkdownEditor
+        aria-label={t("remainingUi.reviewCommentOn", { anchor: anchorLabel })}
+        placeholder={t("remainingUi.reviewLeaveComment")}
+        value={body}
+        onChange={setBody}
+        onKeyDown={onKeyDown}
+        autoFocus
+        rows={3}
+        textareaClassName="max-h-48 min-h-16 resize-y"
+        mentions={mentions}
+      />
+      <div className="flex items-center gap-2">
+        {canCreateThread && (
+          <span
+            title={
+              !body.trim()
+                ? t("remainingUi.reviewWriteCommentFirst")
+                : draftCount > 0
+                  ? undefined
+                  : SUBMIT_HINT
+            }
+          >
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!body.trim() || pending}
+              onClick={addSingleComment}
+            >
+              {t("remainingUi.reviewAddSingleComment")}
+            </Button>
+          </span>
+        )}
+        <span
+          title={
+            !body.trim()
+              ? t("remainingUi.reviewWriteCommentFirst")
+              : draftCount > 0
+                ? SUBMIT_HINT
+                : undefined
+          }
+        >
+          <Button
+            variant={canCreateThread ? "secondary" : "outline"}
+            size="sm"
+            disabled={!body.trim() || pending}
+            onClick={addToReview}
+          >
+            {addToReviewLabel}
+          </Button>
+        </span>
+        <Button variant="ghost" size="sm" disabled={pending} onClick={onClose}>
+          {t("common.cancel")}
+        </Button>
+      </div>
+    </div>
+  );
+}

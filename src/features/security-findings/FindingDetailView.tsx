@@ -1,0 +1,904 @@
+import { ArrowSquareOutIcon } from "@phosphor-icons/react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import type { ReactNode } from "react";
+import { Markdown } from "@/components/markdown/markdown";
+import { PathText } from "@/components/path-text";
+import { RelativeTime } from "@/components/relative-time";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Skeleton } from "@/components/ui/skeleton";
+import type {
+  BbAnnotationOut,
+  BbReportOut,
+} from "@/lib/bitbucket/security-findings";
+import {
+  bbAnnotationTypeLabel,
+  bbReportLabel,
+  bbResultLabel,
+  linkOutLabel,
+  useBitbucketFindings,
+} from "@/lib/bitbucket/security-findings";
+import { forgeReady, forgeSupports, useForgeStatus } from "@/lib/git/queries";
+import type {
+  CodeScanningAlertOut,
+  CvssOut,
+  CweOut,
+  DependabotAlertOut,
+  ReferenceOut,
+  RepoAdvisoryOut,
+  SecretScanningAlertOut,
+} from "@/lib/github/security-findings";
+import {
+  useCodeScanningAlerts,
+  useDependabotAlerts,
+  useRepoAdvisories,
+  useSecretScanningAlerts,
+} from "@/lib/github/security-findings";
+import type {
+  GlCodeQualityFindingOut,
+  GlFindingsOut,
+  GlSecureFindingOut,
+} from "@/lib/gitlab/security-findings";
+import {
+  codeQualityFindingId,
+  secureFindingId,
+  useGitLabFindings,
+} from "@/lib/gitlab/security-findings";
+import { type SelectedFinding, useUiStore } from "@/lib/stores/ui";
+import { type TranslationKey, useTranslation } from "@/lib/i18n";
+import { parseableDate } from "@/lib/time";
+import { cveUrl, cweUrl, ghsaUrl, repoAdvisoryGhsaUrl } from "./advisory-links";
+import {
+  CodeScanningChip,
+  CqChip,
+  SeverityChip,
+  ValidityChip,
+  validityLabel,
+} from "./severity";
+
+function Row({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <>
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="min-w-0 wrap-break-word">{children}</dd>
+    </>
+  );
+}
+
+function DetailShell({
+  title,
+  chip,
+  htmlUrl,
+  linkLabel,
+  linkTitle,
+  meta,
+  children,
+}: {
+  title: string;
+  /** The category's own status chip — severity, SARIF level, or validity; each
+   *  category names its state in its own ladder's words. */
+  chip: ReactNode;
+  htmlUrl: string;
+  /** What the link-out opens, when it isn't the finding's page on GitHub. */
+  linkLabel?: string;
+  /** Hover preview of the destination, for a link whose label can't name it
+   *  outright. Left unset elsewhere: a blank `title` would suppress an
+   *  ancestor's tooltip, so the attribute must be absent, never empty. */
+  linkTitle?: string;
+  meta: ReactNode;
+  children: ReactNode;
+}) {
+  const { t } = useTranslation();
+  const resolvedLinkLabel = linkLabel ?? t("findingsUi.viewOnGitHub");
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="border-b p-4">
+        <h2 className="text-sm font-semibold text-balance">{title}</h2>
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {chip}
+          {/* A tolerated malformed item can lack html_url — no link, no button. */}
+          {htmlUrl ? (
+            <Button
+              variant="outline"
+              size="sm"
+              className="ml-auto"
+              title={linkTitle}
+              onClick={() => openUrl(htmlUrl)}
+            >
+              <ArrowSquareOutIcon data-icon="inline-start" />
+              {resolvedLinkLabel}
+            </Button>
+          ) : null}
+        </div>
+        <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
+          {meta}
+        </dl>
+      </div>
+      {/* overflow-hidden: the vendored ScrollArea Root is `relative`-only, so a
+          fill-layout body would grow the pane past the viewport without it. */}
+      <ScrollArea className="min-h-0 flex-1 overflow-hidden">
+        <div className="p-4">{children}</div>
+      </ScrollArea>
+    </div>
+  );
+}
+
+/** GitHub reports `direct` / `transitive`; anything else is shown as it arrived,
+ *  so a value we don't know yet is never dropped or mislabeled. */
+function relationshipLabel(relationship: string, t: (key: TranslationKey) => string): string {
+  switch (relationship.toLowerCase()) {
+    case "direct":
+      return t("findingsUi.directDependency");
+    case "transitive":
+      return t("findingsUi.transitiveDependency");
+    default:
+      return relationship;
+  }
+}
+
+/** One CVSS version's score and decoded metrics. An advisory can carry v3 and v4
+ *  at once, so each gets its own section rather than one collapsed "CVSS" row. */
+function CvssSection({ cvss }: { cvss: CvssOut }) {
+  return (
+    <section className="mb-4">
+      <h3 className="mb-1.5 flex items-baseline gap-2 text-xs font-semibold">
+        {/* The version is empty when the vector named none — heading it
+            "CVSS" alone beats a dangling revision number. */}
+        <span>{cvss.version ? `CVSS ${cvss.version}` : "CVSS"}</span>
+        {cvss.score !== null ? (
+          <span className="font-normal text-muted-foreground tabular-nums">
+            {cvss.score}
+          </span>
+        ) : null}
+      </h3>
+      {cvss.metrics.length > 0 ? (
+        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
+          {cvss.metrics.map((m) => (
+            <Row key={m.label} label={m.label}>
+              {m.value}
+            </Row>
+          ))}
+        </dl>
+      ) : (
+        // An unparseable vector still says something — show it raw rather than
+        // silently rendering an empty section.
+        <p className="font-mono text-[11px] wrap-break-word text-muted-foreground">
+          {cvss.vectorString}
+        </p>
+      )}
+    </section>
+  );
+}
+
+function ReferencesSection({ references }: { references: ReferenceOut[] }) {
+  const { t } = useTranslation();
+  return (
+    <section className="mt-4">
+      <h3 className="mb-1.5 text-xs font-semibold">{t("findingsUi.referencesHeading")}</h3>
+      <ul>
+        {references.map((r, i) => (
+          <li key={`${r.url}-${i}`}>
+            <button
+              type="button"
+              onClick={() => openUrl(r.url)}
+              className="flex w-full cursor-pointer items-center gap-2 rounded px-1 py-1 text-left text-xs hover:bg-muted/40"
+            >
+              <span className="shrink-0">{r.label}</span>
+              <span
+                className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground"
+                title={r.url}
+              >
+                {r.url}
+              </span>
+              <ArrowSquareOutIcon className="size-3 shrink-0 text-muted-foreground" />
+            </button>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/** A GHSA or CVE id as a link-out chip, in the same idiom as the GitLab
+ *  identifier chips; plain text when no URL could be built from it. */
+function AdvisoryIdValue({ id, url }: { id: string; url: string | null }) {
+  if (!url) return <span className="font-mono">{id}</span>;
+  return (
+    <button
+      type="button"
+      title={url}
+      onClick={() => openUrl(url)}
+      className="inline-flex cursor-pointer items-center gap-1 rounded border px-1.5 py-0.5 hover:bg-muted/40"
+    >
+      <span className="font-mono whitespace-nowrap">{id}</span>
+      <ArrowSquareOutIcon className="size-3 text-muted-foreground" />
+    </button>
+  );
+}
+
+/** Id and name share ONE flex item as inline text: a space between two flex
+ *  items is dropped from layout and from the accessible name, while a space in
+ *  text flow survives both. The nowrap id can't split; only the name wraps. */
+function CweChip({ cwe }: { cwe: CweOut }) {
+  const url = cweUrl(cwe.cweId);
+  const content = (
+    <span className="min-w-0 wrap-break-word">
+      <span className="font-mono whitespace-nowrap">{cwe.cweId}</span>
+      {cwe.name ? ` ${cwe.name}` : null}
+    </span>
+  );
+  return url ? (
+    <button
+      type="button"
+      title={url}
+      onClick={() => openUrl(url)}
+      className="inline-flex max-w-full cursor-pointer items-center gap-1 rounded border px-1.5 py-0.5 text-left hover:bg-muted/40"
+    >
+      {content}
+      <ArrowSquareOutIcon className="size-3 shrink-0 text-muted-foreground" />
+    </button>
+  ) : (
+    <Badge
+      variant="outline"
+      className="h-auto max-w-full py-0.5 text-left font-normal whitespace-normal"
+    >
+      {content}
+    </Badge>
+  );
+}
+
+function AlertDetail({ alert }: { alert: DependabotAlertOut }) {
+  const { t } = useTranslation();
+  return (
+    <DetailShell
+      // Falls back to the identity field, never invented prose: a doubly-degraded
+      // item with no GHSA id either keeps a blank heading rather than a lie.
+      title={alert.summary || alert.ghsaId}
+      chip={<SeverityChip severity={alert.severity} />}
+      htmlUrl={alert.htmlUrl}
+      meta={
+        <>
+          <Row label={t("findingsUi.packageLabel")}>
+            <span className="font-mono">{alert.packageName}</span>{" "}
+            <span className="text-muted-foreground">
+              {alert.ecosystem}
+              {alert.scope ? ` · ${alert.scope}` : ""}
+            </span>
+          </Row>
+          {/* Next to the package: whether this is your dependency or something
+              underneath it decides who can act on it. Omitted when unstated. */}
+          {alert.relationship ? (
+            <Row label={t("findingsUi.dependencyLabel")}>
+              {relationshipLabel(alert.relationship, t)}
+            </Row>
+          ) : null}
+          <Row label={t("findingsUi.manifestLabel")}>
+            <PathText path={alert.manifestPath} className="font-mono" />
+          </Row>
+          {/* Always the global database: Dependabot alerts reference published
+              advisories. */}
+          <Row label={t("findingsUi.ghsaLabel")}>
+            <AdvisoryIdValue id={alert.ghsaId} url={ghsaUrl(alert.ghsaId)} />
+          </Row>
+          {alert.cveId ? (
+            <Row label={t("findingsUi.cveLabel")}>
+              <AdvisoryIdValue id={alert.cveId} url={cveUrl(alert.cveId)} />
+            </Row>
+          ) : null}
+          {/* Only when there's no CVSS section to carry the score — otherwise
+              this row and the first section state the same number twice. */}
+          {alert.cvssScore !== null && alert.cvss.length === 0 ? (
+            <Row label={t("findingsUi.cvssLabel")}>
+              <span className="tabular-nums">{alert.cvssScore}</span>
+            </Row>
+          ) : null}
+          <Row label={t("findingsUi.affectedLabel")}>
+            {alert.vulnerableVersionRange ?? t("findingsUi.notStated")}
+          </Row>
+          <Row label={t("findingsUi.patchedLabel")}>
+            {alert.firstPatchedVersion ?? t("findingsUi.noPatchedVersionYet")}
+          </Row>
+          {alert.cwes.length > 0 ? (
+            <Row label="CWE">
+              <span className="flex flex-wrap gap-1">
+                {alert.cwes.map((c) => (
+                  <CweChip key={c.cweId} cwe={c} />
+                ))}
+              </span>
+            </Row>
+          ) : null}
+          {parseableDate(alert.createdAt) ? (
+            <Row label={t("findingsUi.openedLabel")}>
+              <RelativeTime date={alert.createdAt} />
+            </Row>
+          ) : null}
+        </>
+      }
+    >
+      {/* Index-keyed: the version can come through empty, so it isn't unique. */}
+      {alert.cvss.map((c, i) => (
+        <CvssSection key={`${c.version}-${i}`} cvss={c} />
+      ))}
+      <Markdown>{alert.description}</Markdown>
+      {alert.references.length > 0 ? (
+        <ReferencesSection references={alert.references} />
+      ) : null}
+    </DetailShell>
+  );
+}
+
+/** Sentence-case a raw wire value, leaving the rest of it as it arrived so an
+ *  unrecognized level still reads instead of collapsing to "Unspecified". */
+function capitalizeFirst(value: string): string {
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+/** `path:line`, or a placeholder when the path came through empty — a line
+ *  number hung off nothing reads as a location. Must stay in step with
+ *  `PathLabel` in FindingsPanel, which renders the same value in the list. */
+function locationText(path: string, line: number | null, noPath: string): string {
+  return path ? (line === null ? path : `${path}:${line}`) : noPath;
+}
+
+function CodeScanningDetail({ alert }: { alert: CodeScanningAlertOut }) {
+  const { t } = useTranslation();
+  return (
+    <DetailShell
+      title={alert.ruleName || alert.ruleId || t("findingsUi.unidentifiedRule")}
+      chip={
+        <CodeScanningChip
+          securitySeverity={alert.securitySeverity}
+          severity={alert.severity}
+        />
+      }
+      htmlUrl={alert.htmlUrl}
+      meta={
+        <>
+          {/* Omitted outright when the id is empty — the title already carries
+              the fallback, matching how a missing date drops its row. */}
+          {alert.ruleId ? (
+            <Row label={t("findingsUi.ruleLabel")}>
+              <span className="font-mono">{alert.ruleId}</span>
+            </Row>
+          ) : null}
+          {/* The SARIF level, spelled out — the chip shows it only when the rule
+              carries no security severity to outrank it. */}
+          {alert.severity ? (
+            <Row label={t("findingsUi.levelLabel")}>{capitalizeFirst(alert.severity)}</Row>
+          ) : null}
+          <Row label={t("findingsUi.toolLabel")}>
+            {alert.toolName}
+            {alert.toolVersion ? (
+              <span className="text-muted-foreground">
+                {" "}
+                {alert.toolVersion}
+              </span>
+            ) : null}
+          </Row>
+          <Row label={t("findingsUi.locationLabel")}>
+            <span className="font-mono">
+              {locationText(alert.path, alert.startLine, t("findingsUi.noFilePath"))}
+            </span>
+          </Row>
+          {alert.ref ? (
+            <Row label={t("findingsUi.refLabel")}>
+              <span className="font-mono">{alert.ref}</span>
+            </Row>
+          ) : null}
+          {/* No State row: the fetch pins state=open, so it could only ever
+              read "open". */}
+          {parseableDate(alert.createdAt) ? (
+            <Row label={t("findingsUi.openedLabel")}>
+              <RelativeTime date={alert.createdAt} />
+            </Row>
+          ) : null}
+        </>
+      }
+    >
+      <p className="text-xs wrap-break-word">{alert.message}</p>
+      {alert.ruleDescription ? (
+        <p className="mt-3 text-xs wrap-break-word text-muted-foreground">
+          {alert.ruleDescription}
+        </p>
+      ) : null}
+    </DetailShell>
+  );
+}
+
+function SecretScanningDetail({ alert }: { alert: SecretScanningAlertOut }) {
+  const { t } = useTranslation();
+  return (
+    <DetailShell
+      title={
+        alert.secretTypeDisplayName || alert.secretType || t("findingsUi.unknownSecretType")
+      }
+      chip={<ValidityChip validity={alert.validity} />}
+      htmlUrl={alert.htmlUrl}
+      meta={
+        <>
+          <Row label={t("findingsUi.typeLabel")}>
+            {alert.secretTypeDisplayName || alert.secretType || "Unknown"}
+          </Row>
+          <Row label={t("findingsUi.validityLabel")}>{validityLabel(alert.validity)}</Row>
+          {/* No State row: the fetch pins state=open, so it could only ever
+              read "open". */}
+          {/* Only for a confirmed public leak — a null means GitHub didn't say,
+              and "No" would read as a clearance it never gave. */}
+          {alert.publiclyLeaked === true ? (
+            <Row label={t("findingsUi.publiclyLeaked")}>{t("common.yes")}</Row>
+          ) : null}
+          {parseableDate(alert.createdAt) ? (
+            <Row label={t("findingsUi.openedLabel")}>
+              <RelativeTime date={alert.createdAt} />
+            </Row>
+          ) : null}
+        </>
+      }
+    >
+      {/* The locations of a secret are a separate paginated endpoint we don't
+          fetch, so this says so instead of implying the alert has no detail. */}
+      <p className="text-xs text-muted-foreground">
+        {t("findingsUi.openAlertOnGitHub")}
+      </p>
+    </DetailShell>
+  );
+}
+
+function AdvisoryDetail({ advisory }: { advisory: RepoAdvisoryOut }) {
+  const { t } = useTranslation();
+  return (
+    <DetailShell
+      title={advisory.summary || advisory.ghsaId}
+      chip={<SeverityChip severity={advisory.severity} />}
+      htmlUrl={advisory.htmlUrl}
+      meta={
+        <>
+          <Row label={t("findingsUi.ghsaLabel")}>
+            <AdvisoryIdValue
+              id={advisory.ghsaId}
+              url={repoAdvisoryGhsaUrl(
+                advisory.ghsaId,
+                httpUrl(advisory.htmlUrl) ?? "",
+              )}
+            />
+          </Row>
+          {advisory.cveId ? (
+            <Row label={t("findingsUi.cveLabel")}>
+              <AdvisoryIdValue
+                id={advisory.cveId}
+                url={cveUrl(advisory.cveId)}
+              />
+            </Row>
+          ) : null}
+          <Row label={t("findingsUi.stateLabel")}>{advisory.state}</Row>
+          {advisory.cvssScore !== null ? (
+            <Row label={t("findingsUi.cvssLabel")}>
+              <span className="tabular-nums">{advisory.cvssScore}</span>
+            </Row>
+          ) : null}
+          {/* Dates that don't exist are omitted outright — a withdrawn-at of
+              "never" would read as a claim the advisory stands. */}
+          {advisory.publishedAt && parseableDate(advisory.publishedAt) ? (
+            <Row label={t("findingsUi.publishedLabel")}>
+              <RelativeTime date={advisory.publishedAt} />
+            </Row>
+          ) : null}
+          {advisory.updatedAt && parseableDate(advisory.updatedAt) ? (
+            <Row label={t("findingsUi.updatedLabel")}>
+              <RelativeTime date={advisory.updatedAt} />
+            </Row>
+          ) : null}
+          {advisory.withdrawnAt && parseableDate(advisory.withdrawnAt) ? (
+            <Row label={t("findingsUi.withdrawnLabel")}>
+              <RelativeTime date={advisory.withdrawnAt} />
+            </Row>
+          ) : null}
+        </>
+      }
+    >
+      {advisory.vulnerabilities.length > 0 && (
+        <section className="mb-4">
+          <h3 className="mb-1.5 text-xs font-semibold">{t("findingsUi.affectedPackages")}</h3>
+          <ul className="space-y-1 text-xs">
+            {advisory.vulnerabilities.map((v) => (
+              <li key={`${v.ecosystem}/${v.packageName}`}>
+                <span className="font-mono">{v.packageName}</span>{" "}
+                <span className="text-muted-foreground">{v.ecosystem}</span>
+                <span className="block text-[11px] text-muted-foreground">
+                  {v.vulnerableVersionRange ?? t("findingsUi.rangeNotStated")} →{" "}
+                  {v.patchedVersions ?? t("findingsUi.noPatchedVersion")}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+      {advisory.description ? (
+        <Markdown>{advisory.description}</Markdown>
+      ) : null}
+    </DetailShell>
+  );
+}
+
+/** The URL only when it's one the system browser should open. Identifier links
+ *  come from third-party report files, where a `file://` or `javascript:` value
+ *  has no meaning here. */
+function httpUrl(url: string | null): string | null {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:"
+      ? url
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A permalink to the finding's line at the pipeline's commit, or `""` when any
+ *  piece is missing. GitLab's own vulnerability pages are an Ultimate feature and
+ *  404 for exactly the Free-tier projects this reads reports for, so the blob
+ *  view is the only link that resolves. */
+function glBlobUrl(
+  data: GlFindingsOut,
+  path: string,
+  line: number | null,
+): string {
+  if (!data.projectWebUrl || !data.pipeline || !path) return "";
+  // Each segment encoded, `/` separators kept, so an odd path can't rewrite the
+  // URL it lands in.
+  const encoded = path.split("/").map(encodeURIComponent).join("/");
+  const anchor = line === null ? "" : `#L${line}`;
+  return `${data.projectWebUrl}/-/blob/${data.pipeline.sha}/${encoded}${anchor}`;
+}
+
+/** The pipeline these findings were read from, one click from the detail. */
+function GlPipelineRow({ data }: { data: GlFindingsOut }) {
+  const { t } = useTranslation();
+  const pipeline = data.pipeline;
+  if (!pipeline?.webUrl) return null;
+  return (
+    <Row label={t("findingsUi.pipelineLabel")}>
+      <button
+        type="button"
+        title={pipeline.webUrl}
+        onClick={() => openUrl(pipeline.webUrl)}
+        className="inline-flex cursor-pointer items-center gap-1 hover:underline"
+      >
+        #{pipeline.iid}
+        <ArrowSquareOutIcon className="size-3" />
+      </button>
+    </Row>
+  );
+}
+
+function GlSecureDetail({
+  finding,
+  data,
+  fallbackTitle,
+}: {
+  finding: GlSecureFindingOut;
+  data: GlFindingsOut;
+  /** The category's own name for a finding whose report gave none. */
+  fallbackTitle: string;
+}) {
+  const { t } = useTranslation();
+  return (
+    <DetailShell
+      title={finding.name || fallbackTitle}
+      chip={<SeverityChip severity={finding.severity} />}
+      htmlUrl={glBlobUrl(data, finding.file, finding.startLine)}
+      linkLabel={t("findingsUi.viewFileOnGitLab")}
+      meta={
+        <>
+          <Row label={t("findingsUi.fileLabel")}>
+            <span className="font-mono">
+              {locationText(finding.file, finding.startLine, t("findingsUi.noFilePath"))}
+            </span>
+          </Row>
+          {finding.scannerName ? (
+            <Row label={t("findingsUi.scannerLabel")}>{finding.scannerName}</Row>
+          ) : null}
+          {finding.identifiers.length > 0 ? (
+            <Row label={t("findingsUi.identifiersLabel")}>
+              <span className="flex flex-wrap gap-1">
+                {finding.identifiers.map((identifier, i) => {
+                  const label =
+                    identifier.name || identifier.value || identifier.type;
+                  const url = httpUrl(identifier.url);
+                  const key = `${identifier.type}-${identifier.value}-${i}`;
+                  return url ? (
+                    <button
+                      key={key}
+                      type="button"
+                      title={url}
+                      onClick={() => openUrl(url)}
+                      className="inline-flex cursor-pointer items-center gap-1 rounded border px-1.5 py-0.5 hover:bg-muted/40"
+                    >
+                      {label}
+                      <ArrowSquareOutIcon className="size-3 text-muted-foreground" />
+                    </button>
+                  ) : (
+                    <Badge key={key} variant="outline" className="font-normal">
+                      {label}
+                    </Badge>
+                  );
+                })}
+              </span>
+            </Row>
+          ) : null}
+          <GlPipelineRow data={data} />
+        </>
+      }
+    >
+      {/* Scanner descriptions carry fenced code and links, so they render as
+          markdown rather than as preformatted text. */}
+      {finding.description ? <Markdown>{finding.description}</Markdown> : null}
+    </DetailShell>
+  );
+}
+
+function GlQualityDetail({
+  finding,
+  data,
+}: {
+  finding: GlCodeQualityFindingOut;
+  data: GlFindingsOut;
+}) {
+  const { t } = useTranslation();
+  return (
+    <DetailShell
+      title={finding.checkName || "Unidentified check"}
+      chip={<CqChip severity={finding.severity} />}
+      htmlUrl={glBlobUrl(data, finding.path, finding.line)}
+      linkLabel={t("findingsUi.viewFileOnGitLab")}
+      meta={
+        <>
+          {/* No Severity row — the chip above already names it in the
+              CodeClimate ladder's own words. */}
+          <Row label={t("findingsUi.pathLabel")}>
+            <span className="font-mono">
+              {locationText(finding.path, finding.line, t("findingsUi.noFilePath"))}
+            </span>
+          </Row>
+          <GlPipelineRow data={data} />
+        </>
+      }
+    >
+      {finding.description ? <Markdown>{finding.description}</Markdown> : null}
+    </DetailShell>
+  );
+}
+
+/**
+ * One Code Insights annotation. The heading names the report it came from — the
+ * same string the panel's section header shows — so the summary can own the body
+ * at whatever length Bitbucket's 450-character cap allows.
+ */
+function BbAnnotationDetail({
+  report,
+  annotation,
+}: {
+  report: BbReportOut;
+  annotation: BbAnnotationOut;
+}) {
+  const { t } = useTranslation();
+  return (
+    <DetailShell
+      title={bbReportLabel(report)}
+      // Omitted outright when the report stated no severity: every rung the chip
+      // could name would be a claim the report never made.
+      chip={
+        annotation.severity ? (
+          <SeverityChip severity={annotation.severity} />
+        ) : null
+      }
+      // The annotation's own link only: the report's points at the tool that
+      // published it, so falling back would open a page about the scanner
+      // instead of about this finding. `||`, not `??` — the tolerant parse
+      // degrades a missing link to an empty string, which means no button.
+      htmlUrl={annotation.link || ""}
+      linkLabel={linkOutLabel(annotation.link)}
+      // The label names only the host; the full URL is what says where this
+      // actually lands, so it previews on hover.
+      linkTitle={annotation.link || undefined}
+      meta={
+        <>
+          {annotation.annotationType ? (
+            <Row label={t("findingsUi.typeLabel")}>
+              {bbAnnotationTypeLabel(annotation.annotationType)}
+            </Row>
+          ) : null}
+          {annotation.path ? (
+            <Row label={t("findingsUi.locationLabel")}>
+              <span className="font-mono">
+                {locationText(annotation.path, annotation.line, t("findingsUi.noFilePath"))}
+              </span>
+            </Row>
+          ) : null}
+          {report.reporter ? (
+            <Row label={t("findingsUi.reporterLabel")}>{report.reporter}</Row>
+          ) : null}
+          {/* The report's own description, which nothing else surfaces. A
+              tolerated empty string is falsy, so it drops the row like a null. */}
+          {report.details ? (
+            <Row label={t("findingsUi.reportDetails")}>{report.details}</Row>
+          ) : null}
+          {/* The annotation's own verdict and the report's are separate states,
+              so neither ever stands in for the other under one label. */}
+          {annotation.result ? (
+            <Row label={t("findingsUi.resultLabel")}>{bbResultLabel(annotation.result)}</Row>
+          ) : null}
+          {report.result ? (
+            <Row label={t("findingsUi.reportResult")}>{bbResultLabel(report.result)}</Row>
+          ) : null}
+          {annotation.createdOn && parseableDate(annotation.createdOn) ? (
+            <Row label={t("findingsUi.createdLabel")}>
+              <RelativeTime date={annotation.createdOn} />
+            </Row>
+          ) : null}
+        </>
+      }
+    >
+      {annotation.summary ? (
+        <p className="text-xs wrap-break-word">{annotation.summary}</p>
+      ) : null}
+      {annotation.details ? (
+        <p className="mt-3 text-xs wrap-break-word text-muted-foreground">
+          {annotation.details}
+        </p>
+      ) : null}
+    </DetailShell>
+  );
+}
+
+export function FindingDetailView({
+  repoPath,
+  active,
+}: {
+  repoPath: string;
+  active: boolean;
+}) {
+  const { t } = useTranslation();
+  const selectedFinding = useUiStore((s) => s.selectedFinding);
+  const limits = useUiStore((s) => s.findingsLimits);
+  const forge = useForgeStatus(repoPath);
+  const enabled =
+    forgeReady(forge.data) && forgeSupports(forge.data, "securityFindings");
+  // Same hooks, same provider gate and same store limits as the panel, so these
+  // are cache hits rather than a second fetch — and the other provider's
+  // commands are never invoked.
+  const provider = forge.data?.provider;
+  const onGitHub = enabled && provider === "github";
+  const alerts = useDependabotAlerts(repoPath, onGitHub, active, limits.alerts);
+  const codeScanning = useCodeScanningAlerts(
+    repoPath,
+    onGitHub,
+    active,
+    limits.codeScanning,
+  );
+  const secrets = useSecretScanningAlerts(
+    repoPath,
+    onGitHub,
+    active,
+    limits.secretScanning,
+  );
+  const advisories = useRepoAdvisories(
+    repoPath,
+    onGitHub,
+    active,
+    limits.advisories,
+  );
+  const gl = useGitLabFindings(
+    repoPath,
+    enabled && provider === "gitlab",
+    active,
+    limits.gitlab,
+  );
+  const bb = useBitbucketFindings(
+    repoPath,
+    enabled && provider === "bitbucket",
+    active,
+    limits.bitbucket,
+  );
+
+  // Only the selected finding's own category decides the pending/error state —
+  // a sibling category failing must not blank a finding that loaded fine. Typed
+  // to what's read here, since the six categories carry different data shapes.
+  const queryByType: Record<
+    SelectedFinding["type"],
+    { isPending: boolean; isError: boolean }
+  > = {
+    alert: alerts,
+    codeScanning,
+    secretScanning: secrets,
+    advisory: advisories,
+    glFinding: gl,
+    bbFinding: bb,
+  };
+  const query = selectedFinding ? queryByType[selectedFinding.type] : alerts;
+
+  // Gated on `enabled`: a disabled query stays `isPending` forever, so an
+  // ungated skeleton would spin here if the repo lost the capability mid-session.
+  if (enabled && query.isPending) {
+    return (
+      <div className="space-y-3 p-4">
+        <Skeleton className="h-7 w-2/3" />
+        <Skeleton className="h-4 w-1/2" />
+        <Skeleton className="h-24 w-full" />
+      </div>
+    );
+  }
+
+  if (query.isError) {
+    return (
+      <div className="p-6 text-center text-sm text-muted-foreground">
+        {t("findingsUi.loadFindingError")}
+      </div>
+    );
+  }
+
+  if (selectedFinding?.type === "alert") {
+    const alert = alerts.data?.alerts.find(
+      (a) => a.number === selectedFinding.number,
+    );
+    if (alert) return <AlertDetail alert={alert} />;
+  } else if (selectedFinding?.type === "codeScanning") {
+    const alert = codeScanning.data?.alerts.find(
+      (a) => a.number === selectedFinding.number,
+    );
+    if (alert) return <CodeScanningDetail alert={alert} />;
+  } else if (selectedFinding?.type === "secretScanning") {
+    const alert = secrets.data?.alerts.find(
+      (a) => a.number === selectedFinding.number,
+    );
+    if (alert) return <SecretScanningDetail alert={alert} />;
+  } else if (selectedFinding?.type === "advisory") {
+    const advisory = advisories.data?.advisories.find(
+      (a) => a.ghsaId === selectedFinding.ghsaId,
+    );
+    if (advisory) return <AdvisoryDetail advisory={advisory} />;
+  } else if (selectedFinding?.type === "glFinding" && gl.data) {
+    const data = gl.data;
+    if (selectedFinding.category === "codeQuality") {
+      const finding = data.codeQuality.findings.find(
+        (f) => codeQualityFindingId(f) === selectedFinding.id,
+      );
+      if (finding) return <GlQualityDetail finding={finding} data={data} />;
+    } else {
+      const category =
+        selectedFinding.category === "sast" ? data.sast : data.secretDetection;
+      const finding = category.findings.find(
+        (f) => secureFindingId(f) === selectedFinding.id,
+      );
+      if (finding)
+        return (
+          <GlSecureDetail
+            finding={finding}
+            data={data}
+            fallbackTitle={
+              selectedFinding.category === "sast"
+                ? t("findingsUi.unidentifiedRule")
+                : t("findingsUi.unknownSecretType")
+            }
+          />
+        );
+    }
+  } else if (selectedFinding?.type === "bbFinding" && bb.data) {
+    const report = bb.data.reports.find(
+      (r) => r.uuid === selectedFinding.reportUuid,
+    );
+    const annotation = report?.annotations.find(
+      (a) => a.uuid === selectedFinding.annotationUuid,
+    );
+    if (report && annotation)
+      return <BbAnnotationDetail report={report} annotation={annotation} />;
+  }
+
+  return (
+    <div className="p-6 text-center text-sm text-muted-foreground">
+      {t("findingsUi.findingNoLongerListed")}
+    </div>
+  );
+}

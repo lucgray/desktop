@@ -1,0 +1,600 @@
+import { create } from "zustand";
+import { bumpNavVersion } from "@/features/sessions/navVersion";
+import { isWatchingAgentSurface } from "@/features/sessions/watching";
+import {
+  type AgentKind,
+  appendTranscriptText,
+  appendTranscriptTool,
+  type ContextPack,
+  cancelAgentSession,
+  ensureTranscriptText,
+  runAgentSession,
+  type TranscriptSegment,
+} from "@/lib/ai/agent";
+import {
+  buildPlanPrompt,
+  extractPlanDraft,
+  validatePlanPaths,
+} from "@/lib/ai/prompt";
+import { terminalErrorMessage } from "@/lib/ai/terminal-error";
+import { gitListTracked, readRepoInstructions } from "@/lib/git/api";
+import { emitNotification } from "@/lib/notifications/emit";
+import { norm } from "@/lib/repo-key";
+import { loadSettings } from "@/lib/settings/api";
+import { repoNameFromPath } from "@/lib/stores/notifications";
+import { errorMessage } from "@/lib/tauri/invoke";
+import { loadPersistedPlans, savePersistedPlans } from "./persistence";
+
+export interface PlanDraft {
+  title: string;
+  body: string;
+  /** Cited paths that didn't resolve to a real tracked file/dir — possible
+   *  hallucinations for the human gate to scrutinize before filing the issue. */
+  unverified: string[];
+}
+
+/** Prefill for the plan composer — a free-form goal and/or an existing issue. */
+export interface PlanSeed {
+  /** The repo this seed was raised in. The Agent tab lives under `<Activity>`, so
+   *  an unconsumed seed outlives a repo switch — the consumer matches on this
+   *  rather than prefilling another repo's composer. */
+  repoPath: string;
+  goal?: string;
+  issueTitle?: string | null;
+  issueBody?: string | null;
+  /** The research run this plan was handed off from ("Turn into a Plan"), if any.
+   *  Recorded on the plan so the research sidebar can derive that its run was
+   *  converted (and archive it). Reversible: discard the plan and it reverts. */
+  originResearchId?: string;
+  /** What the origin research stage already examined (files/searches/web), carried
+   *  forward as grounding data for the planner. Plain JSON ⇒ persists with the seed
+   *  and survives the Re-plan round-trip. Absent on a bare Plan (no handoff). */
+  contextPack?: ContextPack;
+}
+
+/** A seed as recorded on its run — `repoPath` is absent on runs persisted before
+ *  the repo axis existed, so readers of a rehydrated seed must handle its absence. */
+export type StoredPlanSeed = Omit<PlanSeed, "repoPath"> & { repoPath?: string };
+
+export interface GenerateArgs extends PlanSeed {
+  /** Planning needs repo-aware reads, which only the CLI agents have. */
+  agent: AgentKind;
+  model: string;
+  /** Reasoning/effort level ("" = provider default; else low/medium/high/xhigh). */
+  effort: string;
+  /** The original prompt to display. Derived from goal/issueTitle when omitted. */
+  origin?: { goal: string; issueTitle: string | null };
+}
+
+/**
+ * One concurrent plan run — a **read-only agent conversation**. Turn 1 explores
+ * the repo and drafts an agent-ready issue; answering its open questions resumes
+ * the SAME conversation (the agent keeps its exploration + the prior draft in
+ * context) and refines incrementally, rather than re-planning from scratch. Kept
+ * in the list so switching away never loses it — the keyed analogue of a session.
+ */
+export interface PlanRun {
+  /** Stable id (also the row key + active-selection key). */
+  id: string;
+  repoPath: string;
+  /** Which CLI drives the conversation, fixed at creation. */
+  agent: AgentKind;
+  model: string;
+  effort: string;
+  /** The conversation's stable uuid: `--session-id` on turn 1, `--resume` after;
+   *  also the cancel key. */
+  sessionId: string;
+  /** The CLI's native resume id captured on turn 1 (Codex thread / opencode
+   *  session), so a host conversation resumes the right thread. Unset until then. */
+  nativeSessionId: string | null;
+  /** The original prompt, for the sidebar row + the result header. */
+  origin: { goal: string; issueTitle: string | null } | null;
+  /** The seed this run was started from, so "Re-plan" can reopen the composer. */
+  seed: StoredPlanSeed | null;
+  generating: boolean;
+  /** The user stopped this run mid-turn (Stop). Idle but restartable; tells the
+   *  result view to offer Restart instead of treating partial output as a draft. */
+  stopped: boolean;
+  /** The latest streamed plan markdown (replaced each turn — a refine re-outputs
+   *  the full updated plan). */
+  text: string;
+  /** Transient tool-activity note (e.g. "Reading files…"). */
+  status: string;
+  /** The interleaved render of the latest turn — prose runs + tool steps in order
+   *  (`text` is the same prose, concatenated, kept for parsing the draft).
+   *  Persisted with the run (absent only on runs saved before this field existed →
+   *  the transcript falls back to `text`). */
+  segments?: TranscriptSegment[];
+  /** Parsed + path-validated result, set when the turn completes. */
+  draft: PlanDraft | null;
+  /** The latest turn's reported cost (USD); null if unreported. */
+  costUsd: number | null;
+  /** The write-capable session this plan was implemented into (via "Implement"),
+   *  so the sidebar row mirrors that session's status instead of "Plan ready". */
+  implementedSessionId: string | null;
+  error: string | null;
+}
+
+interface PlanState {
+  /** All concurrent plan runs, in creation order. */
+  runs: PlanRun[];
+  /** The plan run shown in the agent canvas; null = no plan selected (it shares
+   *  the surface with sessions — see `agentSelect.ts` for mutual exclusion). */
+  activePlanId: string | null;
+  /** A seed for the activation "Plan a task" composer (set by the agent-plan
+   *  hotkey, or an issue's Plan button), consumed by SessionActivation. */
+  pendingPlanSeed: PlanSeed | null;
+  /** Whether persisted plans have been loaded. Short-circuits {@link hydrate}; it is
+   *  NOT what gates the autosave, which awaits a RESOLVED `hydrate()` instead, so a
+   *  read that failed at startup is retried rather than written over. */
+  hydrated: boolean;
+
+  /** Load persisted plans from disk into the list (once, at startup). */
+  hydrate: () => Promise<void>;
+  setActivePlan: (id: string | null) => void;
+  setPendingPlanSeed: (seed: PlanSeed | null) => void;
+  /** Start a new plan run (creates it, selects it, streams turn 1). Returns its id. */
+  start: (args: GenerateArgs) => string;
+  /** Resume the conversation with the user's answers folded in, so the agent
+   *  refines incrementally. No-op if it's missing or mid-turn. */
+  refine: (
+    id: string,
+    decisions: { question: string; answer: string }[],
+  ) => void;
+  /** Send a free-form follow-up — resumes the conversation so the agent revises
+   *  the plan. No-op if it's missing, mid-turn, or the message is blank. */
+  sendFollowUp: (id: string, message: string) => void;
+  /** Link a plan to the write-capable session "Implement" spawned from it. */
+  markImplemented: (id: string, sessionId: string) => void;
+  /** Signal an in-flight turn to stop (leaves the run restartable). */
+  cancel: (id: string) => void;
+  /** Re-run a stopped (or errored) plan from its original seed — a fresh
+   *  conversation, reusing the row. No-op while generating. */
+  restart: (id: string) => void;
+  /** Drop a run from the list (cancelling any in-flight turn). */
+  remove: (id: string) => void;
+  /** Repoint every run of a relocated repo at its new path, so they stay in the
+   *  sidebar and the next autosave writes the migrated paths back (an unpatched
+   *  list would re-persist the old ones over the on-disk migration). */
+  relocateRepoPath: (oldPath: string, newPath: string) => void;
+}
+
+function repoName(p: string): string {
+  return (
+    p
+      .replace(/[/\\]+$/, "")
+      .split(/[/\\]/)
+      .pop() ?? p
+  );
+}
+
+/**
+ * Read-only planning surface. Each plan run is a **resumable read-only agent
+ * conversation** (the `agent_session` backend with `readOnly: true` — read tools
+ * only, no worktree, runs in the live repo). Turn 1 explores + drafts + asks; a
+ * refine resumes the same conversation with the answers, so the agent keeps its
+ * context and refines incrementally. Cited paths are validated against
+ * `git ls-files`. Never writes: the per-CLI read-only toolset is the hard guarantee.
+ */
+export const usePlanStore = create<PlanState>((set, get) => {
+  /** The in-flight `hydrate()` attempt, so concurrent callers share one disk read
+   *  (see `hydrate`). Lives in the factory closure, which runs exactly once. */
+  let hydrating: Promise<void> | null = null;
+
+  /** Patch one run by id — maps over the array, touching only that run, so
+   *  concurrent runs streaming at once never clobber each other. */
+  const patch = (id: string, p: Partial<PlanRun>) =>
+    set({ runs: get().runs.map((r) => (r.id === id ? { ...r, ...p } : r)) });
+
+  /** Stream one turn of run `id` (a read-only agent session turn), then parse the
+   *  result into a draft. `resume` continues the conversation (a refine). */
+  const runTurn = async (
+    id: string,
+    system: string,
+    userPrompt: string,
+    resume: boolean,
+  ) => {
+    const run0 = get().runs.find((r) => r.id === id);
+    if (!run0) return;
+    patch(id, {
+      generating: true,
+      text: "",
+      status: "",
+      segments: [],
+      draft: null,
+      costUsd: null,
+      stopped: false,
+      error: null,
+    });
+    // True once this turn's result is stale: the user stopped it (`stopped`), or a
+    // restart issued a fresh session id. Either way its (killed/partial) output must
+    // not overwrite the run — guards every terminal patch below.
+    const superseded = () => {
+      const cur = get().runs.find((r) => r.id === id);
+      return !cur || cur.sessionId !== run0.sessionId || cur.stopped;
+    };
+    const tracked = await gitListTracked(run0.repoPath).catch(
+      () => [] as string[],
+    );
+    let finalText = "";
+    let errored = false;
+    // Announce a finished plan run (success OR failure) the way agent sessions do.
+    // A plan that finished WITH clarifying questions is a blocking handoff — it
+    // idles until the user answers — so always nudge, even while they're watching
+    // it (a redundant toast costs nothing; a stranded handoff costs a lost turn).
+    // Otherwise stay quiet only when they're actually looking at this plan
+    // (focused + Agent tab + selected); a focused user on another tab still gets
+    // it. Skips a run removed mid-flight (its row is gone, nothing to return to).
+    const notifyDone = (failed: boolean, hasQuestions = false) => {
+      const run = get().runs.find((r) => r.id === id);
+      if (!run) return;
+      if (
+        !hasQuestions &&
+        isWatchingAgentSurface(get().activePlanId, id, run.repoPath)
+      )
+        return;
+      const label =
+        run.origin?.issueTitle?.trim() || run.origin?.goal?.trim() || "Plan";
+      const headline = failed
+        ? "Plan failed"
+        : hasQuestions
+          ? "Plan ready — answer its questions"
+          : "Plan ready";
+      emitNotification({
+        source: "agents",
+        row: {
+          kind: "plan-done",
+          tone: failed ? "danger" : hasQuestions ? "warning" : "success",
+          title: headline,
+          subtitle: label,
+          repoPath: run.repoPath,
+          repoName: repoNameFromPath(run.repoPath),
+          target: { type: "agent" },
+          dedupeKey: `plan:${id}:${failed}:${hasQuestions}`,
+        },
+        // Pings even while focused — the watching check above already excused the
+        // one surface that would make it redundant, questions excepted.
+        os: { title: headline, body: label, focus: "always" },
+      });
+    };
+    try {
+      await runAgentSession({
+        binPath: null,
+        agent: run0.agent,
+        model: run0.model,
+        effort: run0.effort,
+        systemPrompt: system,
+        userPrompt,
+        // Read-only: runs in the live repo, never a worktree, and can't write.
+        worktreePath: run0.repoPath,
+        sessionId: run0.sessionId,
+        resume,
+        readOnly: true,
+        isolation: "worktree",
+        nativeSessionId: run0.nativeSessionId,
+        onEvent: (ev) => {
+          if (ev.kind === "nativeSession") {
+            // Capture once (turn 1) so a host resume targets this conversation.
+            const cur = get().runs.find((r) => r.id === id);
+            if (cur && !cur.nativeSessionId)
+              patch(id, { nativeSessionId: ev.id });
+          } else if (ev.kind === "delta") {
+            finalText += ev.text;
+            const cur = get().runs.find((r) => r.id === id);
+            patch(id, {
+              text: finalText,
+              segments: appendTranscriptText(cur?.segments ?? [], ev.text),
+              status: "",
+            });
+          } else if (ev.kind === "status") {
+            patch(id, { status: ev.text });
+          } else if (ev.kind === "tool") {
+            const cur = get().runs.find((r) => r.id === id);
+            patch(id, {
+              segments: appendTranscriptTool(
+                cur?.segments ?? [],
+                ev.tool,
+                ev.target,
+              ),
+              status: "",
+            });
+          } else if (ev.kind === "done") {
+            // The terminal event carries the authoritative full text; prefer it —
+            // except on an errored Done, whose text is the failure reason and must
+            // not fold into the transcript (visible on the superseded path).
+            if (!ev.isError && ev.text.length > finalText.length)
+              finalText = ev.text;
+            if (ev.costUsd != null) patch(id, { costUsd: ev.costUsd });
+            // Whole-message agents (codex) stream no deltas — fold the final text
+            // in so the transcript shows it after its tool steps.
+            const cur = get().runs.find((r) => r.id === id);
+            patch(id, {
+              segments: ensureTranscriptText(cur?.segments ?? [], finalText),
+            });
+            if (ev.isError) {
+              errored = true;
+              // Don't paint an error onto a run the user just stopped (or a turn a
+              // restart superseded) — a killed process may emit one on the way out.
+              if (!superseded())
+                patch(id, {
+                  // The terminal event's OWN text — never the delta accumulation,
+                  // whose narration could pass the error-shape net as the "reason".
+                  error: terminalErrorMessage(
+                    ev.text,
+                    "The planner reported an error.",
+                  ),
+                });
+            }
+          } else if (ev.kind === "error") {
+            errored = true;
+            // Keep what a killed run wrote — a whole-message agent (codex) delivers it
+            // only here, so adopt it when nothing streamed and fold it in exactly as the
+            // done branch does. `errored` returns before `extractPlanDraft` below, so a
+            // truncated plan can still never become a draft. Superseded-guarded like the
+            // error patch: a stopped or restarted run's dying event must not write into
+            // the transcript that replaced it.
+            if (!superseded() && ev.partialText?.trim() && !finalText) {
+              finalText = ev.partialText;
+              const cur = get().runs.find((r) => r.id === id);
+              patch(id, {
+                text: finalText,
+                segments: ensureTranscriptText(cur?.segments ?? [], finalText),
+              });
+            }
+            if (!superseded()) patch(id, { error: ev.message });
+          }
+        },
+      });
+    } catch (e) {
+      if (superseded()) return;
+      patch(id, { generating: false, error: errorMessage(e) });
+      notifyDone(true);
+      return;
+    }
+    if (superseded()) return;
+    if (errored) {
+      patch(id, { generating: false });
+      notifyDone(true);
+      return;
+    }
+    const { title, body } = extractPlanDraft(finalText);
+    if (!body.trim()) {
+      patch(id, {
+        generating: false,
+        error: "The planner returned nothing — try again.",
+      });
+      notifyDone(true);
+      return;
+    }
+    patch(id, {
+      generating: false,
+      draft: {
+        title,
+        body,
+        unverified: validatePlanPaths(body, new Set(tracked)),
+      },
+    });
+    notifyDone(false, /\[NEEDS\s+CLARIFICATION/i.test(body));
+  };
+
+  /** Build turn 1's system + user prompt (grounded in the repo's instructions),
+   *  then stream it. */
+  const runFirstTurn = async (id: string, args: GenerateArgs) => {
+    const { repoPath, goal = "", issueTitle, issueBody, contextPack } = args;
+    const [repoInstructions, settings] = await Promise.all([
+      readRepoInstructions(repoPath).catch(() => null),
+      loadSettings().catch(() => null),
+    ]);
+    const { system, prompt } = buildPlanPrompt({
+      goal,
+      issueTitle,
+      issueBody,
+      repoName: repoName(repoPath),
+      repoInstructions,
+      globalInstructions: settings?.globalInstructions ?? "",
+      contextPack,
+    });
+    await runTurn(id, system, prompt, false);
+  };
+
+  return {
+    runs: [],
+    activePlanId: null,
+    pendingPlanSeed: null,
+    hydrated: false,
+
+    // REJECTS when the file can't be read, and leaves `hydrated` false — that flag
+    // is what stands between the persistence subscription below and a whole-list
+    // write, so marking it true on failure would let the next state change persist
+    // a live-only snapshot over plans this process never read. A store with nothing
+    // saved yet resolves to `[]` (the plugin's `load()` tolerates a missing file),
+    // so a throw means genuinely unreadable and the save path retries it.
+    hydrate: async () => {
+      if (get().hydrated) return;
+      // Concurrent callers WAIT on the in-flight attempt instead of starting a
+      // second read — and never skip, which would let a save proceed before the
+      // merge landed. Cleared on settle so a FAILED attempt can be retried; a
+      // successful one is short-circuited by `hydrated` above.
+      hydrating ??= (async () => {
+        const persisted = await loadPersistedPlans();
+        // Merge under any runs created before hydration finished (newest state wins).
+        const live = new Set(get().runs.map((r) => r.id));
+        set({
+          runs: [...persisted.filter((p) => !live.has(p.id)), ...get().runs],
+          hydrated: true,
+        });
+      })().finally(() => {
+        hydrating = null;
+      });
+      return hydrating;
+    },
+
+    setActivePlan: (activePlanId) => {
+      // Tick the agent-surface nav counter so an in-flight handoff can tell the
+      // user navigated (see navVersion.ts) — covers the direct "Back" button too.
+      bumpNavVersion();
+      set({ activePlanId });
+    },
+    setPendingPlanSeed: (pendingPlanSeed) => set({ pendingPlanSeed }),
+
+    start: (args) => {
+      const id = crypto.randomUUID();
+      const { goal = "", issueTitle } = args;
+      const run: PlanRun = {
+        id,
+        repoPath: args.repoPath,
+        agent: args.agent,
+        model: args.model,
+        effort: args.effort,
+        sessionId: crypto.randomUUID(),
+        nativeSessionId: null,
+        origin: args.origin ?? { goal, issueTitle: issueTitle ?? null },
+        seed: {
+          repoPath: args.repoPath,
+          goal: args.goal,
+          issueTitle: args.issueTitle,
+          issueBody: args.issueBody,
+          originResearchId: args.originResearchId,
+          contextPack: args.contextPack,
+        },
+        generating: true,
+        stopped: false,
+        text: "",
+        status: "",
+        draft: null,
+        costUsd: null,
+        implementedSessionId: null,
+        error: null,
+      };
+      set({
+        runs: [...get().runs, run],
+        activePlanId: id,
+        pendingPlanSeed: null,
+      });
+      void runFirstTurn(id, args);
+      return id;
+    },
+
+    refine: (id, decisions) => {
+      const run = get().runs.find((r) => r.id === id);
+      if (!run || run.generating) return;
+      const answered = decisions.filter((d) => d.answer.trim());
+      if (answered.length === 0) return;
+      const block = answered
+        .map((d) => `- ${d.question} → ${d.answer.trim()}`)
+        .join("\n");
+      // Resume the conversation: the agent already has its exploration + the prior
+      // draft in context, so this refines incrementally (no re-exploration).
+      const userPrompt = `I've answered the open questions:\n${block}\n\nIncorporate these decisions into the plan (resolve them — don't ask them again), and re-output the COMPLETE updated agent-ready issue in the same format.`;
+      void runTurn(id, "", userPrompt, true);
+    },
+
+    sendFollowUp: (id, message) => {
+      const run = get().runs.find((r) => r.id === id);
+      const text = message.trim();
+      if (!run || run.generating || !text) return;
+      const userPrompt = `${text}\n\nApply this and re-output the COMPLETE updated agent-ready issue in the same format.`;
+      void runTurn(id, "", userPrompt, true);
+    },
+
+    markImplemented: (id, sessionId) =>
+      patch(id, { implementedSessionId: sessionId }),
+
+    cancel: (id) => {
+      const run = get().runs.find((r) => r.id === id);
+      if (!run?.generating) return;
+      void cancelAgentSession(run.sessionId);
+      // Settle to a clear stopped state right away; the in-flight turn sees
+      // `stopped` when its killed process returns and bails without overwriting.
+      patch(id, { generating: false, status: "", stopped: true });
+    },
+
+    restart: (id) => {
+      const run = get().runs.find((r) => r.id === id);
+      if (!run || run.generating) return;
+      // Fresh conversation (the stopped one was killed): a new session id so the
+      // old turn — if it's still resolving — is detected as stale and bails, then
+      // re-run turn 1 from the original seed.
+      patch(id, {
+        sessionId: crypto.randomUUID(),
+        nativeSessionId: null,
+        generating: true,
+        status: "",
+        stopped: false,
+        error: null,
+      });
+      void runFirstTurn(id, {
+        repoPath: run.repoPath,
+        goal: run.seed?.goal ?? run.origin?.goal ?? "",
+        issueTitle: run.seed?.issueTitle,
+        issueBody: run.seed?.issueBody,
+        contextPack: run.seed?.contextPack,
+        agent: run.agent,
+        model: run.model,
+        effort: run.effort,
+        origin: run.origin ?? undefined,
+      });
+    },
+
+    remove: (id) => {
+      const run = get().runs.find((r) => r.id === id);
+      if (run?.generating) void cancelAgentSession(run.sessionId);
+      set({
+        runs: get().runs.filter((r) => r.id !== id),
+        activePlanId: get().activePlanId === id ? null : get().activePlanId,
+      });
+    },
+
+    relocateRepoPath: (oldPath, newPath) => {
+      // No-match guard: a fresh array would trip the persistence subscribe
+      // into rewriting plans.json with identical content.
+      if (!get().runs.some((r) => norm(r.repoPath) === norm(oldPath))) return;
+      set({
+        runs: get().runs.map((r) =>
+          norm(r.repoPath) === norm(oldPath) ? { ...r, repoPath: newPath } : r,
+        ),
+      });
+    },
+  };
+});
+
+// Persist the plan list to disk, debounced so a streaming run's rapid text
+// updates coalesce into roughly one write a second (the latest snapshot wins, and
+// captures the native session id mid-stream so a resume survives a restart).
+//
+// This is a WHOLE-LIST write, so it must never run against a list that hasn't been
+// merged with disk. `hydrate()` is the gate rather than the `hydrated` flag: it
+// no-ops once hydrated, and otherwise re-attempts the read the startup call may have
+// lost to a transient failure (the store loader retries on the next call). Only a
+// resolved hydrate reaches `savePersistedPlans`, so the snapshot always contains what
+// was on disk plus whatever is live; a still-failing read rejects here and writes
+// nothing, leaving the file intact for the next attempt.
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+usePlanStore.subscribe((state, prev) => {
+  if (state.runs === prev.runs) return;
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    void usePlanStore
+      .getState()
+      .hydrate()
+      // Read the list AFTER the merge, never the `state` this callback closed over.
+      .then(() => savePersistedPlans(usePlanStore.getState().runs))
+      .catch(() => undefined);
+  }, 800);
+});
+
+// Load persisted plans once at startup (so they're back in the sidebar, resumable).
+// A failure here is not terminal: it leaves `hydrated` false and the save path above
+// retries, so the sidebar fills in as soon as the file is readable again.
+void usePlanStore
+  .getState()
+  .hydrate()
+  .catch(() => undefined);
+
+/** The currently-selected plan run, or null. Reference-stable while that run is
+ *  unchanged (so streaming another run won't re-render the active one). */
+export function useActivePlanRun(): PlanRun | null {
+  return usePlanStore(
+    (s) => s.runs.find((r) => r.id === s.activePlanId) ?? null,
+  );
+}

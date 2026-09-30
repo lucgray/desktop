@@ -1,0 +1,866 @@
+import { PlusIcon, SparkleIcon, XIcon } from "@phosphor-icons/react";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { LabeledGroup } from "@/components/form/labeled-group";
+import { LazyPanelFallback } from "@/components/lazy-panel-fallback";
+import { PathText } from "@/components/path-text";
+import { SelectClipText } from "@/components/select-clip-text";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Spinner } from "@/components/ui/spinner";
+import { Switch } from "@/components/ui/switch";
+import { clipTitleFromText } from "@/lib/clip-title";
+import { isMac, isWindows } from "@/lib/hotkeys/binding";
+import { useGenerateChord } from "@/lib/hotkeys/useGenerateChord";
+import {
+  useDetectedInterpreters,
+  useResolvedInterpreter,
+} from "@/lib/scripts/interpreters";
+import { useTaskRepoKeys } from "@/lib/scripts/queries";
+import {
+  scopeRepoLabel,
+  TASK_SCOPE_GLOBAL,
+  TASK_SCOPE_UNKNOWN,
+  taskScope,
+} from "@/lib/scripts/scope";
+import {
+  type ArgDoc,
+  availableInterpreters,
+  DEFAULT_INTERPRETER,
+  INTERPRETERS,
+  type Interpreter,
+  interpreterForExt,
+  type TaskDef,
+  type TaskSource,
+} from "@/lib/scripts/types";
+import { useAiConfigured, useAiEnabled } from "@/lib/settings/queries";
+import { type TranslationKey, useTranslation } from "@/lib/i18n";
+import { useUiStore } from "@/lib/stores/ui";
+import { useRetained } from "@/lib/use-retained";
+import { cn } from "@/lib/utils";
+import { useAnalyzeScript } from "./useAnalyzeScript";
+import { useGenerateScript } from "./useGenerateScript";
+
+// CodeMirror is heavy; lazy-load it so its chunk stays off the boot path and only
+// loads when the task editor first opens (same as the git-hooks editor).
+const CodeEditor = lazy(() =>
+  import("@/components/code-editor").then((m) => ({ default: m.CodeEditor })),
+);
+
+const INTERPRETER_LABELS: Record<string, string> = Object.fromEntries(
+  INTERPRETERS.map((i) => [i.id, i.label]),
+);
+
+/** An arg-doc row in the editor: the doc plus a dialog-local key, so removing a
+ *  row can't re-key its neighbours' inputs (index keys would). Stripped on save. */
+type ArgDocRow = ArgDoc & { key: string };
+
+const toRows = (docs: ArgDoc[]): ArgDocRow[] =>
+  docs.map((d) => ({ ...d, key: crypto.randomUUID() }));
+
+/**
+ * How a draft scoped outside the open repo describes itself: its Select option,
+ * and why the two repo-reading file controls are held. A malformed stored scope
+ * names no repository to open, so its copy points at the repair — pick a scope —
+ * rather than at a repo that doesn't exist.
+ */
+function elsewhereScopeCopy(scope: string, t: (key: TranslationKey, values?: Record<string, string | number>) => string): {
+  optionLabel: string;
+  chooseReason: string;
+  analyzeReason: string;
+} {
+  if (scope === TASK_SCOPE_UNKNOWN) {
+    // Both controls clear the same way, so they share one sentence.
+    const repair = t("scriptsUi.unreadableScopeRepair");
+    return {
+      optionLabel: t("scriptsUi.unreadableSavedScope"),
+      chooseReason: repair,
+      analyzeReason: repair,
+    };
+  }
+  const label = scopeRepoLabel(scope);
+  return {
+    optionLabel: t("scriptsUi.otherRepository", { name: label }),
+    chooseReason: t("scriptsUi.chooseFromScopedRepo", { name: label }),
+    analyzeReason: t("scriptsUi.analyzeScopedRepo", { name: label }),
+  };
+}
+
+/** What the **Script file** field means in each scope: a repo-scoped task keeps a
+ *  path relative to its own root, while one offered everywhere has no root to
+ *  resolve against, so a typed relative path follows whichever repo is open. */
+/** Make a picked absolute path relative to the repo root when it's inside it, so a
+ *  task like `scripts/release.mjs` works in any repo that has it. Outside the repo,
+ *  keep the absolute path (it's machine-specific). A null `repoRoot` means there is
+ *  no root to be relative to — no repo open, or a draft scoped to every repository.
+ *  Windows and macOS paths compare case-insensitively; store forward slashes either
+ *  way. */
+function toRepoRelative(picked: string, repoRoot: string | null): string {
+  const norm = (p: string) => p.replace(/\\/g, "/");
+  const p = norm(picked);
+  if (!repoRoot) return p;
+  const root = norm(repoRoot).replace(/\/+$/, "");
+  // Windows and macOS default to case-insensitive filesystems; Linux is
+  // case-sensitive, so folding the prefix there could wrongly relativize a
+  // sibling directory that differs only in case.
+  const fold = (s: string) => (isWindows || isMac ? s.toLowerCase() : s);
+  return fold(p).startsWith(`${fold(root)}/`) ? p.slice(root.length + 1) : p;
+}
+
+/**
+ * Create or edit a task. The parent owns open state + persistence: `onSave`
+ * receives the full task (with a stable id) and `onDelete` its id. A task's script
+ * is either an **existing file** in the repo (run in place) or an **inline** body;
+ * inline bodies can be AI-generated, and **Analyze with AI** documents either kind
+ * (name, description, accepted arguments) from the script itself. Definitions are
+ * app-data only — never repo content.
+ */
+export function TaskDialog({
+  task,
+  open,
+  onOpenChange,
+  onSave,
+  onDelete,
+}: {
+  /** An existing task to edit, `"new"` to create, or null when closed. */
+  task: TaskDef | "new" | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSave: (task: TaskDef) => void;
+  onDelete: (id: string) => void;
+}) {
+  const { t } = useTranslation();
+  const editing = task !== "new" && task !== null ? task : null;
+  const shownTask = useRetained(task);
+  const shownEditing =
+    shownTask !== "new" && shownTask !== null ? shownTask : null;
+  const repoPath = useUiStore((s) => s.repoPath);
+  const openSettings = useUiStore((s) => s.openSettings);
+  const aiEnabled = useAiEnabled();
+  const aiConfigured = useAiConfigured();
+  const scriptGen = useGenerateScript(repoPath ?? "");
+  const scriptAnalyze = useAnalyzeScript(repoPath ?? "");
+  // Which interpreters are actually installed — shown per-option so you can see
+  // what a task can run with, and warned about when the chosen one is missing.
+  const detected = useDetectedInterpreters();
+  const options = availableInterpreters();
+
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [interpreter, setInterpreter] =
+    useState<Interpreter>(DEFAULT_INTERPRETER);
+  const [sourceKind, setSourceKind] = useState<TaskSource["kind"]>("file");
+  const [path, setPath] = useState("");
+  const [body, setBody] = useState("");
+  const [args, setArgs] = useState("");
+  const [argDocs, setArgDocs] = useState<ArgDocRow[]>([]);
+  const [describe, setDescribe] = useState("");
+  const [confirmBeforeRun, setConfirmBeforeRun] = useState(true);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [scope, setScope] = useState<string>(TASK_SCOPE_GLOBAL);
+
+  // Scope lookup keys for the open repo: [repoPath] while its identity resolves,
+  // [repoPath, identity] once it does. The canonical value the "This repository"
+  // option stores is the most-preferred (last) key — the identity once resolved,
+  // matching what the store folds a written scope onto.
+  const { keys: repoKeys } = useTaskRepoKeys(repoPath);
+  const thisRepoKey = repoKeys.length ? repoKeys[repoKeys.length - 1] : null;
+  // A draft offered everywhere has no repo root to resolve a script path against
+  // — the one discriminant behind how the picker stores a path and how the field
+  // describes itself.
+  const isGlobalDraft = scope === TASK_SCOPE_GLOBAL;
+  // A legacy raw-path scope for the OPEN repo reads as "this repository" too
+  // (repoKeys carries both forms), so it selects that option rather than falling
+  // through to the other-repository one.
+  const scopedToThisRepo = !isGlobalDraft && repoKeys.includes(scope);
+  // The draft belongs to a repo that isn't the one open behind this dialog. Read
+  // from the DRAFT, not the saved task, so re-scoping to this repository releases
+  // the file-source controls in the same keystroke that adopts the task.
+  const scopedElsewhere = !isGlobalDraft && !scopedToThisRepo;
+  // One source for every string a foreign scope produces here — the option label
+  // and both file-control reasons — so they can't disagree about what it is.
+  const elsewhereCopy = elsewhereScopeCopy(scope, t);
+  const scopeOptions: { value: string; label: string }[] = [
+    { value: TASK_SCOPE_GLOBAL, label: t("scriptsUi.allRepositories") },
+  ];
+  if (repoPath && thisRepoKey)
+    scopeOptions.push({
+      value: thisRepoKey,
+      label: t("scriptsUi.thisRepository", { name: scopeRepoLabel(repoPath) }),
+    });
+  // A scope pointing at a DIFFERENT repo needs an option of its own: without one
+  // the Select can't represent its own value, and saving an untouched edit would
+  // silently re-scope the task to whatever the trigger happened to show. The value
+  // stays the stored scope verbatim whatever the label says.
+  if (scopedElsewhere)
+    scopeOptions.push({ value: scope, label: elsewhereCopy.optionLabel });
+  // The Select's value must equal an option value: normalize a this-repo scope
+  // held under a non-canonical key onto the option's canonical one. The
+  // `?? scope` arm is type-level only — `scopedToThisRepo` implies repoKeys is
+  // non-empty, which TS can't narrow across the check.
+  const selectedScope = scopedToThisRepo ? (thisRepoKey ?? scope) : scope;
+  const scopeItems = Object.fromEntries(
+    scopeOptions.map((o) => [o.value, o.label]),
+  );
+
+  // The cheap `detected` pass above only checks PATH + known install dirs, so it
+  // misses nvm/fnm-managed binaries when the app was launched from Finder/Dock
+  // (launchd's minimal PATH). For the SELECTED interpreter, confirm the way an
+  // actual run resolves it (login shell) before warning.
+  const cheapSelectedPath = detected.data?.get(interpreter)?.path ?? null;
+  const cheapMissed = detected.isSuccess && cheapSelectedPath === null;
+  // Only confirm off Windows — there `resolve_named` reduces to the same
+  // `find_executable` the cheap pass already ran (no login-shell probe), so a
+  // confirm can never change the outcome. And only while the editor is open (the
+  // dialog stays mounted across close, so `open` keeps a stale selection from
+  // probing) and the cheap pass missed — so we never spawn a shell we don't need.
+  const needsConfirm = open && !isWindows && cheapMissed;
+  const confirmed = useResolvedInterpreter(interpreter, needsConfirm);
+  // Authoritative path for the selected interpreter: cheap hit, else the confirm.
+  const selectedPath = cheapSelectedPath ?? confirmed.data ?? null;
+  const selectedResolving = needsConfirm && confirmed.isLoading;
+  // Missing = the cheap pass found nothing AND either we're not confirming
+  // (Windows / dialog closed → cheap detection is authoritative) or the
+  // login-shell confirm also came back empty. While a confirm is in flight it is
+  // not yet "missing" — that window is `selectedResolving` instead.
+  const selectedMissing =
+    cheapMissed &&
+    (needsConfirm ? confirmed.isSuccess && confirmed.data == null : true);
+
+  // Seed the fields when a task (or "new") opens. Keyed on the dialog opening so
+  // reopening the same task re-seeds from the saved value, discarding stray edits.
+  const seededFor = useRef<string | null>(null);
+  const cancelGenerate = scriptGen.cancel;
+  const cancelAnalyze = scriptAnalyze.cancel;
+  useEffect(() => {
+    if (!open) {
+      seededFor.current = null;
+      // Abort any in-flight Generate/Analyze: this component instance stays
+      // mounted across open/close (only the Dialog hides), so a stream left
+      // running would resolve into whichever task is opened NEXT — its
+      // callbacks write through the same state setters.
+      cancelGenerate();
+      cancelAnalyze();
+      return;
+    }
+    const key = editing?.id ?? "new";
+    if (seededFor.current === key) return;
+    seededFor.current = key;
+    setName(editing?.name ?? "");
+    setDescription(editing?.description ?? "");
+    setInterpreter(editing?.interpreter ?? DEFAULT_INTERPRETER);
+    setSourceKind(editing?.source.kind ?? "file");
+    setPath(editing?.source.kind === "file" ? editing.source.path : "");
+    setBody(editing?.source.kind === "inline" ? editing.source.body : "");
+    setArgs(editing?.args ?? "");
+    setArgDocs(toRows(editing?.argDocs ?? []));
+    setDescribe("");
+    setConfirmBeforeRun(editing?.confirmBeforeRun ?? true);
+    setConfirmDelete(false);
+    // The task's stored scope verbatim; a new task belongs to the open repo.
+    // Whether that value is the canonical "this repository" key is decided at
+    // render (`selectedScope`), so a scope seeded before the identity resolved
+    // still lands on the right option once it does.
+    setScope(editing ? taskScope(editing) : (thisRepoKey ?? TASK_SCOPE_GLOBAL));
+  }, [open, editing, cancelGenerate, cancelAnalyze, thisRepoKey]);
+
+  const trimmedName = name.trim();
+  // Saving mid-stream would persist a half-written script, so an in-flight
+  // generate/analyze blocks it just like an empty name does.
+  const canSave =
+    trimmedName !== "" &&
+    (sourceKind === "file" ? path.trim() !== "" : body.trim() !== "") &&
+    !scriptGen.generating &&
+    !scriptAnalyze.analyzing;
+  const canAnalyze =
+    sourceKind === "file" ? path.trim() !== "" : body.trim() !== "";
+  const analyzeEmptyReason =
+    sourceKind === "file"
+      ? "Choose a script file first"
+      : "Write or generate a script first";
+  // The file-source controls read the OPEN repo's tree — the picker relativizes
+  // against it and the analyzer reads through it — so on a task scoped elsewhere
+  // they would resolve a foreign relative path against the wrong checkout. An
+  // identity key can't be reversed to a checkout path (the owning repo may not be
+  // on disk at all), so the controls are held rather than retargeted. Inline
+  // sources are repo-independent and stay live.
+  const chooseBlockedReason = scopedElsewhere
+    ? elsewhereCopy.chooseReason
+    : null;
+  const analyzeBlockedReason =
+    scopedElsewhere && sourceKind === "file"
+      ? elsewhereCopy.analyzeReason
+      : null;
+
+  async function choose() {
+    const picked = await openDialog({
+      title: t("scriptsUi.chooseScript"),
+      defaultPath: repoPath ?? undefined,
+    });
+    if (typeof picked !== "string") return;
+    // Relativizing a global task's pick would store a path that resolves inside
+    // whichever repo happens to be open at run time, so it keeps the full path.
+    setPath(toRepoRelative(picked, isGlobalDraft ? null : repoPath));
+    // Pre-select the interpreter from the extension (still overridable).
+    const guess = interpreterForExt(picked);
+    if (guess) setInterpreter(guess);
+  }
+
+  // Shared by the Generate button, the describe field's Enter key, and the
+  // generate chord.
+  function runGenerate() {
+    scriptGen.generate({
+      description: describe,
+      interpreter,
+      onBody: setBody,
+    });
+  }
+  // The generate chord drives Generate — never Analyze, which documents an
+  // existing script rather than writing one. Mounted on DialogContent so it also
+  // covers the X close button (a SIBLING of the fields inside the Popup). It is
+  // swallowed here whenever it may fire (the hook mirrors the global listener's
+  // own guards), including the file-source case where there's no Generate at
+  // all, so the global generate-commit-message action can't run behind the
+  // dialog.
+  const generateChord = useGenerateChord({
+    enabled:
+      sourceKind === "inline" &&
+      aiEnabled &&
+      aiConfigured &&
+      describe.trim() !== "" &&
+      !scriptGen.generating,
+    run: runGenerate,
+  });
+
+  function runAnalyze() {
+    scriptAnalyze.analyze({
+      interpreter,
+      ...(sourceKind === "file" ? { path: path.trim() } : { body }),
+      onResult: (r) => {
+        // Fill what the analysis produced; leave anything it couldn't derive
+        // untouched (and never clear hand-written docs on an empty result).
+        if (r.name) setName(r.name);
+        if (r.description) setDescription(r.description);
+        if (r.argDocs.length > 0) setArgDocs(toRows(r.argDocs));
+      },
+    });
+  }
+
+  function updateRow(key: string, patch: Partial<ArgDoc>) {
+    setArgDocs((rows) =>
+      rows.map((r) => (r.key === key ? { ...r, ...patch } : r)),
+    );
+  }
+
+  function save() {
+    if (!canSave) return;
+    const source: TaskSource =
+      sourceKind === "file"
+        ? { kind: "file", path: path.trim() }
+        : { kind: "inline", body };
+    onSave({
+      id: editing?.id ?? crypto.randomUUID(),
+      name: trimmedName,
+      description: description.trim(),
+      interpreter,
+      source,
+      args: args.trim(),
+      argDocs: argDocs
+        .filter((r) => r.arg.trim() !== "")
+        .map(({ arg, description: d }) => ({
+          arg: arg.trim(),
+          description: d,
+        })),
+      confirmBeforeRun,
+      scope: selectedScope,
+      // Confirmations are the run surface's to record; the editor carries the
+      // task's existing ones through untouched.
+      runConfirmedIn: editing?.runConfirmedIn ?? [],
+    });
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        className="max-h-[85vh] overflow-y-auto sm:max-w-2xl"
+        onKeyDown={generateChord.onKeyDown}
+      >
+        <DialogHeader>
+          <DialogTitle>{shownEditing ? t("scriptsUi.editTask") : t("scriptsUi.newTask")}</DialogTitle>
+          <DialogDescription>
+            {t("scriptsUi.taskDialogDescription")}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid grid-cols-[1fr_auto] gap-3">
+          <div className="min-w-0 space-y-1.5">
+            <Label htmlFor="task-name">{t("scriptsUi.name")}</Label>
+            <Input
+              id="task-name"
+              autoFocus
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={t("scriptsUi.nameExample")}
+              autoComplete="off"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="task-interpreter">{t("scriptsUi.runWith")}</Label>
+            <Select
+              items={INTERPRETER_LABELS}
+              value={interpreter}
+              onValueChange={(v) => v && setInterpreter(v as Interpreter)}
+            >
+              <SelectTrigger id="task-interpreter" className="w-48">
+                <SelectValue />
+              </SelectTrigger>
+              {/* Wider than the trigger: the popup defaults to the trigger's
+                  width (w-(--anchor-width)) and hard-clips overflow, which cut
+                  the detected interpreter paths mid-character. 320px gives the
+                  paths room; anything longer still middle-truncates inside the
+                  span (max-w-64) with its clipped-only tooltip. */}
+              <SelectContent className="w-80">
+                {options.map((i) => {
+                  // The selected interpreter reflects the login-shell confirm (what
+                  // a run actually resolves); others stay on cheap PATH detection.
+                  const isSelected = i.id === interpreter;
+                  const found = isSelected
+                    ? selectedPath
+                    : (detected.data?.get(i.id)?.path ?? null);
+                  const missing = isSelected
+                    ? selectedMissing
+                    : detected.isSuccess &&
+                      (detected.data?.get(i.id)?.path ?? null) === null;
+                  return (
+                    <SelectItem key={i.id} value={i.id}>
+                      <span className="flex flex-col">
+                        <span className="flex items-center gap-1.5">
+                          {i.label}
+                          {missing && (
+                            <span className="text-[10px] text-muted-foreground">
+                              · {t("scriptsUi.notDetected")}
+                            </span>
+                          )}
+                        </span>
+                        {found ? (
+                          // max-w-64 self-bounds the row against ItemText's
+                          // `min-width: auto` floor, which no truncate inside a
+                          // Select popup engages without.
+                          <PathText
+                            path={found}
+                            className="max-w-64 font-mono text-[10px] text-muted-foreground"
+                          />
+                        ) : isSelected && selectedResolving ? (
+                          <span className="text-[11px] text-muted-foreground">
+                            {t("scriptsUi.checkingShell")}
+                          </span>
+                        ) : (
+                          <span className="text-[11px] text-muted-foreground">
+                            {i.hint}
+                          </span>
+                        )}
+                      </span>
+                    </SelectItem>
+                  );
+                })}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+
+        {selectedResolving && (
+          <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <Spinner className="size-3" />
+            {t("scriptsUi.checkingShellFor")}{" "}
+            {INTERPRETER_LABELS[interpreter] ?? interpreter}…
+          </p>
+        )}
+        {selectedMissing && (
+          <p className="text-xs text-warning">
+            {t("scriptsUi.interpreterMissing", { interpreter: INTERPRETER_LABELS[interpreter] ?? interpreter })}
+          </p>
+        )}
+
+        <div className="space-y-1.5">
+          <Label htmlFor="task-description">
+            {t("scriptsUi.description")}{" "}
+            <span className="font-normal text-muted-foreground">
+              {t("scriptsUi.optional")}
+            </span>
+          </Label>
+          <Input
+            id="task-description"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder={t("scriptsUi.descriptionPlaceholder")}
+            autoComplete="off"
+          />
+        </div>
+
+        {/* No repo open means no choice to offer — the task stays global. */}
+        {repoPath && (
+          <div className="space-y-1.5">
+            <Label htmlFor="task-scope">{t("scriptsUi.availableIn")}</Label>
+            <Select
+              // Without `items`, Base UI's SelectValue renders the RAW value —
+              // for an identity-keyed scope that's a bare "…/.git" path. The map
+              // makes the trigger show the option label.
+              items={scopeItems}
+              value={selectedScope}
+              onValueChange={(v) => v && setScope(v)}
+            >
+              <SelectTrigger id="task-scope" className="w-full">
+                <SelectValue onMouseEnter={clipTitleFromText} />
+              </SelectTrigger>
+              <SelectContent>
+                {scopeOptions.map((o) => (
+                  <SelectItem key={o.value} value={o.value}>
+                    <SelectClipText>{o.label}</SelectClipText>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              {t("scriptsUi.scopeDescription")}
+            </p>
+          </div>
+        )}
+
+        {/* Source: an existing file, or an inline body — with the AI analyzer
+            alongside, since it documents whichever source is active. */}
+        <div className="flex items-center justify-between gap-2">
+          <div className="inline-flex w-fit rounded-md border p-0.5 text-xs">
+            {(
+              [
+                ["file", t("scriptsUi.existingFile")],
+                ["inline", t("scriptsUi.inlineScript")],
+              ] as const
+            ).map(([kind, label]) => (
+              <button
+                key={kind}
+                type="button"
+                onClick={() => setSourceKind(kind)}
+                className={cn(
+                  "rounded px-2.5 py-1 transition-colors",
+                  sourceKind === kind
+                    ? "bg-accent text-accent-foreground"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {aiEnabled &&
+            aiConfigured &&
+            (scriptAnalyze.analyzing ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="xs"
+                className="text-muted-foreground"
+                onClick={scriptAnalyze.cancel}
+              >
+                <Spinner data-icon="inline-start" />
+                {t("scriptsUi.analyzing")}
+              </Button>
+            ) : (
+              <DisabledReasonButton
+                type="button"
+                variant="ghost"
+                size="xs"
+                className="text-muted-foreground"
+                disabled={!canAnalyze || analyzeBlockedReason !== null}
+                reason={analyzeBlockedReason ?? analyzeEmptyReason}
+                title={t("scriptsUi.analyzeTitle")}
+                onClick={runAnalyze}
+              >
+                <SparkleIcon data-icon="inline-start" />
+                {t("scriptsUi.analyzeWithAi")}
+              </DisabledReasonButton>
+            ))}
+        </div>
+
+        {sourceKind === "file" ? (
+          <div className="space-y-1.5">
+            <Label htmlFor="task-path">{t("scriptsUi.scriptFile")}</Label>
+            <div className="flex gap-2">
+              <Input
+                id="task-path"
+                className="flex-1 font-mono"
+                value={path}
+                onChange={(e) => setPath(e.target.value)}
+                placeholder="scripts/release.mjs"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <DisabledReasonButton
+                type="button"
+                variant="outline"
+                disabled={chooseBlockedReason !== null}
+                reason={chooseBlockedReason}
+                onClick={choose}
+              >
+                {t("scriptsUi.choose")}
+              </DisabledReasonButton>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {t(isGlobalDraft ? "scriptsUi.globalPathHint" : "scriptsUi.repoPathHint")}
+            </p>
+          </div>
+        ) : (
+          <LabeledGroup
+            label={t("scriptsUi.script")}
+            className="space-y-1.5"
+            actions={
+              <>
+                {aiEnabled &&
+                  !aiConfigured &&
+                  (scriptGen.generating ? null : (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="xs"
+                      className="text-muted-foreground"
+                      title={t("scriptsUi.connectAiGenerate")}
+                      onClick={() => {
+                        onOpenChange(false);
+                        openSettings("ai");
+                      }}
+                    >
+                      <SparkleIcon data-icon="inline-start" />
+                      {t("scriptsUi.setupAiGenerate")}
+                    </Button>
+                  ))}
+                {aiEnabled && aiConfigured && scriptGen.generating && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    className="text-muted-foreground"
+                    onClick={scriptGen.cancel}
+                  >
+                    <Spinner data-icon="inline-start" />
+                    {t("scriptsUi.generating")}
+                  </Button>
+                )}
+              </>
+            }
+          >
+            {aiEnabled && aiConfigured && !scriptGen.generating && (
+              <div className="flex gap-2">
+                <Input
+                  value={describe}
+                  onChange={(e) => setDescribe(e.target.value)}
+                  onKeyDown={(e) => {
+                    // Same gate as the Generate button and the chord — Enter on
+                    // an empty description would otherwise generate from nothing.
+                    if (e.key === "Enter" && describe.trim() !== "") {
+                      e.preventDefault();
+                      runGenerate();
+                    }
+                  }}
+                  placeholder={t("scriptsUi.describeScript")}
+                  autoComplete="off"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={describe.trim() === ""}
+                  // The chord is only offered while it would do something — a
+                  // disabled Generate's shortcut is dead too.
+                  title={
+                    describe.trim() !== ""
+                      ? t("scriptsUi.writeScriptWithAiHint", { hint: generateChord.hint })
+                      : t("scriptsUi.writeScriptWithAi")
+                  }
+                  onClick={runGenerate}
+                >
+                  <SparkleIcon data-icon="inline-start" />
+                  {t("scriptsUi.generate")}
+                </Button>
+              </div>
+            )}
+
+            <div className="h-48 overflow-hidden rounded-md border">
+              <Suspense
+                fallback={
+                  <LazyPanelFallback
+                    name="the script editor"
+                    className="p-0"
+                    rows={["h-full w-full"]}
+                  />
+                }
+              >
+                <CodeEditor value={body} onChange={setBody} />
+              </Suspense>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {t("scriptsUi.scriptBodyDescription")}
+            </p>
+          </LabeledGroup>
+        )}
+
+        <div className="space-y-1.5">
+          <Label htmlFor="task-args">
+            {t("scriptsUi.arguments")}{" "}
+            <span className="font-normal text-muted-foreground">
+              {t("scriptsUi.optional")}
+            </span>
+          </Label>
+          <Input
+            id="task-args"
+            className="font-mono"
+            value={args}
+            onChange={(e) => setArgs(e.target.value)}
+            placeholder="--preview"
+            autoComplete="off"
+            spellCheck={false}
+          />
+          <p className="text-xs text-muted-foreground">
+            {t("scriptsUi.defaultArgsDescription")}{" "}
+            <span className="font-mono">--message "two words"</span>.
+          </p>
+        </div>
+
+        <div
+          role="group"
+          aria-labelledby="task-argdocs-label"
+          className="space-y-1.5"
+        >
+          <Label id="task-argdocs-label">
+            {t("scriptsUi.documentedArgs")}{" "}
+            <span className="font-normal text-muted-foreground">
+              {t("scriptsUi.optionalArgsReference")}
+            </span>
+          </Label>
+          {argDocs.map((row, index) => (
+            <div key={row.key} className="flex gap-2">
+              <Input
+                className="w-40 font-mono"
+                value={row.arg}
+                onChange={(e) => updateRow(row.key, { arg: e.target.value })}
+                placeholder="--flag"
+                autoComplete="off"
+                spellCheck={false}
+                aria-label={`Argument ${index + 1}`}
+              />
+              <Input
+                className="min-w-0 flex-1"
+                value={row.description}
+                onChange={(e) =>
+                  updateRow(row.key, { description: e.target.value })
+                }
+                placeholder={t("scriptsUi.argumentDescription")}
+                autoComplete="off"
+                aria-label={`Argument ${index + 1} description`}
+              />
+              <Button
+                type="button"
+                size="icon-xs"
+                variant="ghost"
+                className="shrink-0 self-center text-muted-foreground"
+                onClick={() =>
+                  setArgDocs((rows) => rows.filter((r) => r.key !== row.key))
+                }
+                title={t("scriptsUi.removeArgumentNamed", { argument: row.arg.trim() || t("scriptsUi.thisArgument") })}
+                aria-label={t("scriptsUi.removeArgument", { index: index + 1 })}
+              >
+                <XIcon />
+              </Button>
+            </div>
+          ))}
+          <Button
+            type="button"
+            variant="ghost"
+            size="xs"
+            className="text-muted-foreground"
+            onClick={() =>
+              setArgDocs((rows) => [
+                ...rows,
+                { key: crypto.randomUUID(), arg: "", description: "" },
+              ])
+            }
+          >
+            <PlusIcon data-icon="inline-start" />
+            {t("scriptsUi.addArgument")}
+          </Button>
+        </div>
+
+        <label className="flex items-center gap-2 text-xs">
+          <Switch
+            checked={confirmBeforeRun}
+            onCheckedChange={setConfirmBeforeRun}
+          />
+          <span>{t("scriptsUi.confirmBeforeRun")}</span>
+        </label>
+
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            // The label rides the retained task, so the dispatch carries the
+            // liveness: after close `save()` would write under an unmatched id
+            // and still toast "Saved".
+            onClick={() => {
+              if (task === null) return;
+              save();
+            }}
+            disabled={!canSave}
+          >
+            {shownEditing ? t("common.save") : t("scriptsUi.createTask")}
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => onOpenChange(false)}>
+            {t("common.cancel")}
+          </Button>
+          <span className="flex-1" />
+          {shownEditing &&
+            (confirmDelete ? (
+              <>
+                <span className="text-xs text-muted-foreground">{t("scriptsUi.deletePrompt")}</span>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setConfirmDelete(false)}
+                >
+                  {t("scriptsUi.keep")}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  onClick={() => {
+                    if (editing) onDelete(editing.id);
+                  }}
+                >
+                  {t("common.delete")}
+                </Button>
+              </>
+            ) : (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setConfirmDelete(true)}
+              >
+                {t("scriptsUi.deleteEllipsis")}
+              </Button>
+            ))}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}

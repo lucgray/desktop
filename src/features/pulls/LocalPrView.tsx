@@ -1,0 +1,1326 @@
+import { Popover } from "@base-ui/react/popover";
+import {
+  ArrowClockwiseIcon,
+  ArrowCounterClockwiseIcon,
+  CaretDownIcon,
+  CheckCircleIcon,
+  CheckIcon,
+  DotsThreeIcon,
+  GitMergeIcon,
+  InfoIcon,
+  PencilSimpleIcon,
+  SparkleIcon,
+  TagIcon,
+  WarningIcon,
+  XIcon,
+} from "@phosphor-icons/react";
+import type { ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { toast } from "sonner";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { Markdown } from "@/components/markdown/markdown";
+import { usePanelPortalContainer } from "@/components/panel-portal";
+import { ProviderIcon } from "@/components/provider-icon";
+import { RelativeTime } from "@/components/relative-time";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { BranchDiffView } from "@/features/compare/BranchDiffView";
+import { CommentComposer } from "@/features/conversations/CommentComposer";
+import { CommitsList } from "@/features/conversations/CommitsList";
+import { ConversationScrollArea } from "@/features/conversations/ConversationScrollArea";
+import { DeleteCommentDialog } from "@/features/conversations/DeleteCommentDialog";
+import {
+  EditTitleBodyDialog,
+  useEditTitleBody,
+} from "@/features/conversations/EditTitleBodyDialog";
+import { LocalComment } from "@/features/conversations/LocalComment";
+import { useCancelOnIdentityChange } from "@/features/conversations/useAiStream";
+import { useLocalConversation } from "@/features/conversations/useLocalConversation";
+import { useMentionCandidates } from "@/features/conversations/useMentionCandidates";
+import { useThreadJumpHotkeys } from "@/features/conversations/useThreadJumpHotkeys";
+import { DiffPlaceholder } from "@/features/diff/DiffPlaceholder";
+import { CommitDetailView } from "@/features/history/CommitDetailView";
+import { JiraRefRow } from "@/features/issues/JiraRefRow";
+import { useStashReapplyRecovery } from "@/features/repository/useStashReapplyRecovery";
+import {
+  isMergeMethodAllowed,
+  isPromotionBranch,
+} from "@/lib/branch-rules/match";
+import {
+  useEffectiveBranchRules,
+  useEffectiveBranchRulesSettling,
+} from "@/lib/branch-rules/queries";
+import { copyText } from "@/lib/clipboard";
+import { gitBranchDiff, type MergeStrategy } from "@/lib/git/api";
+import {
+  forgeFeatureReady,
+  useBranchDiffFiles,
+  useCompareBranches,
+  useConflictPreview,
+  useDefaultBranch,
+  useForgeStatus,
+  useMergeLocalPr,
+  useRepoStatus,
+  useUpdateBranchFrom,
+} from "@/lib/git/queries";
+import { providerLabel } from "@/lib/git/types";
+import { useHotkeyAction } from "@/lib/hotkeys/hotkeys";
+import { useGenerateChordHint } from "@/lib/hotkeys/useGenerateChord";
+import type { PrSection } from "@/lib/pulls/pr-section";
+import { useLocalPrs, useUpdateLocalPr } from "@/lib/pulls/queries";
+import { useAiEnabled } from "@/lib/settings/queries";
+import { useUiStore } from "@/lib/stores/ui";
+import { toastError } from "@/lib/toast";
+import { useTranslation } from "@/lib/i18n";
+import { LinkedIssuesField } from "./LinkedIssuesField";
+import { LocalPrLifecycleRow } from "./LocalPrTimeline";
+import { type PromotionKind } from "./PrMergeabilityBanner";
+import { PromoteLocalPrDialog } from "./PromoteLocalPrDialog";
+import { PrReviewPanel } from "./PrReviewPanel";
+import {
+  coalesceCommitRuns,
+  PushedCommitsRow,
+  sortTimeline,
+  type TimelineEntry,
+} from "./PrTimeline";
+import { ResolveConflictsView } from "./ResolveConflictsView";
+import { useGeneratePrDescription } from "./useGeneratePrDescription";
+import {
+  composeBodyWithRefs,
+  splitBodyRefBlock,
+  useLinkedIssueChips,
+} from "./useLinkedIssueChips";
+
+/** The verb a completed merge reports, per strategy. */
+const MERGED_VERB: Record<MergeStrategy, string> = {
+  merge: "Merged",
+  squash: "Squashed and merged",
+  rebase: "Rebased and merged",
+  fast_forward: "Merged",
+};
+
+/** Tab labels for this view's sections. `files` is undefined until the branch-diff
+ *  read lands, and the tab then shows no count rather than a wrong one. */
+const SECTION_LABEL: Record<
+  PrSection,
+  (counts: {
+    comments: number;
+    commits: number;
+    files: number | undefined;
+  }) => string
+> = {
+  conversation: (c) => `Conversation (${c.comments})`,
+  commits: (c) => `Commits (${c.commits})`,
+  files: (c) => `Files${c.files === undefined ? "" : ` (${c.files})`}`,
+  review: () => "Review",
+};
+
+export function LocalPrView({
+  repoPath,
+  id,
+}: {
+  repoPath: string;
+  id: string;
+}) {
+  const { t } = useTranslation();
+  const prs = useLocalPrs(repoPath);
+  const pr = prs.data?.find((p) => p.id === id);
+  const update = useUpdateLocalPr(repoPath);
+  const merge = useMergeLocalPr(repoPath);
+  const updateBranchFrom = useUpdateBranchFrom(repoPath);
+  const recovery = useStashReapplyRecovery(repoPath);
+  const status = useRepoStatus(repoPath);
+  const selectedPr = useUiStore((s) => s.selectedPr);
+  const pendingPrSection = useUiStore((s) => s.pendingPrSection);
+  const setPendingPrSection = useUiStore((s) => s.setPendingPrSection);
+  const [section, setSection] = useState<PrSection>("conversation");
+  // Commits-tab drill-in: the selected commit's hash, or null for the list.
+  // Reset when the viewed PR changes (below).
+  const [selectedCommitHash, setSelectedCommitHash] = useState<string | null>(
+    null,
+  );
+  const aiEnabled = useAiEnabled();
+  const portalContainer = usePanelPortalContainer();
+  // The sub-tabs the strip renders — every writer of `section` gates on this, so
+  // no path can select a tab that isn't there. A local PR has no forge, so the
+  // Review tab rides the AI setting alone (no capability axis to consult).
+  const availableSections = useMemo<PrSection[]>(
+    () =>
+      aiEnabled
+        ? ["conversation", "commits", "files", "review"]
+        : ["conversation", "commits", "files"],
+    [aiEnabled],
+  );
+  // A notification's click-through lands here via a pending hint; switch to the
+  // hinted sub-tab once if it's available, then clear the hint either way — an
+  // unusable hint must not survive to fire against a later PR. Guarded on this
+  // being the *selected* PR so a still-mounted lagging view (deferredPr) can't
+  // swallow the hint first.
+  useEffect(() => {
+    const isSelected = selectedPr?.kind === "local" && selectedPr.id === id;
+    if (pendingPrSection !== null && isSelected) {
+      if (availableSections.includes(pendingPrSection))
+        setSection(pendingPrSection);
+      setPendingPrSection(null);
+    }
+  }, [
+    pendingPrSection,
+    setPendingPrSection,
+    selectedPr,
+    id,
+    availableSections,
+  ]);
+  // Availability can drop away under the selection (Hide AI toggled), which
+  // would leave a blank body under a strip with no pressed tab — fall back to
+  // the tab every PR always has. Layout effect: a passive one paints that empty
+  // frame before reconciling.
+  useLayoutEffect(() => {
+    if (!availableSections.includes(section)) setSection("conversation");
+  }, [availableSections, section]);
+  const rulesConfig = useEffectiveBranchRules(repoPath);
+  const rulesSettling = useEffectiveBranchRulesSettling(repoPath);
+  const {
+    comment,
+    setComment,
+    labelInput,
+    setLabelInput,
+    deletingCommentId,
+    setDeletingCommentId,
+    composerRef,
+    quoteReply,
+    addComment,
+    editComment,
+    deleteComment,
+    setCommentHidden,
+    addLabel,
+    removeLabel,
+  } = useLocalConversation(id, pr, (mutate) => {
+    if (pr) update.mutate({ id: pr.id, mutate });
+  });
+  const [promoteOpen, setPromoteOpen] = useState(false);
+  // Close/Reopen's and the review post's single-flight holds: the pinned update
+  // mutation detaches on a repo switch, so `update.isPending` alone can go idle
+  // while the write runs on. The panel's `post` gates re-entry on `posting`.
+  const [settingStatus, setSettingStatus] = useState(false);
+  const [postingReview, setPostingReview] = useState(false);
+  const ghStatus = useForgeStatus(repoPath);
+  const provider = ghStatus.data?.provider;
+  // A local PR's body and comments autolink the forge's references like any other
+  // body, and its editors complete them. Local PRs have no lens, so "origin".
+  const mentions = useMentionCandidates({ repoPath, lens: "origin", provider });
+  // Promote copy names the detected forge. The label spans all three providers;
+  // the noun stays two-way because only GitLab calls it a merge request.
+  const promoteLabel = providerLabel(provider);
+  const promoteNoun = provider === "gitlab" ? "merge request" : "pull request";
+  // Linked-issue chips on the local-PR edit path: the chips OWN the trailing ref
+  // block (peeled at open, re-composed on save). A local PR's `Closes #N` lines
+  // survive promotion verbatim into the real forge PR, so these become real
+  // closing refs later — that's intended.
+  const canLinkIssues =
+    !!ghStatus.data && forgeFeatureReady(ghStatus.data, "issues");
+  const edit = useEditTitleBody({
+    onSave: async ({ title, body }) => {
+      if (!pr) return;
+      const finalBody = canLinkIssues
+        ? composeBodyWithRefs(body, linkedIssues)
+        : body;
+      await update.mutateAsync({
+        id: pr.id,
+        mutate: (cur) => ({ ...cur, title, body: finalBody }),
+      });
+    },
+  });
+  // A different PR must never inherit this one's drill-in, half-typed label, or
+  // open delete/promote/edit dialogs — a render-time state adjustment, not an
+  // effect.
+  const [lastId, setLastId] = useState(id);
+  if (id !== lastId) {
+    setLastId(id);
+    setSelectedCommitHash(null);
+    setLabelInput("");
+    setDeletingCommentId(null);
+    setPromoteOpen(false);
+    edit.setOpen(false);
+  }
+  const prGen = useGeneratePrDescription(repoPath);
+  // The edit dialog's in-flight generation belongs to the PR it was started on; the
+  // cancel is imperative, so it rides an effect rather than the block above.
+  useCancelOnIdentityChange(id, prGen.cancel);
+  // The generate-commit-message binding's title suffix. The chord itself lives in
+  // EditTitleBodyDialog; this is only the label, so a rebinding drives both.
+  const generateHint = useGenerateChordHint();
+
+  const comparison = useCompareBranches(
+    repoPath,
+    pr?.base ?? null,
+    pr?.head ?? null,
+  );
+  // Shared chip state machine — enabled only while the edit dialog is open (and
+  // the tracker is usable). Local PRs have no lens concept, so read the forge's
+  // own issues ("origin"). Body refs are peeled into chips at open (`resetWith`
+  // in openEdit), so the body and the chips are never two sources of truth.
+  const {
+    chips: linkedIssues,
+    resetWith: resetLinkedIssues,
+    toggleKeyword: toggleIssueKeyword,
+    remove: removeIssue,
+    pick: pickIssue,
+    buildCandidates: buildIssueCandidates,
+    upsertFromDraft: upsertAiIssues,
+  } = useLinkedIssueChips({
+    repoPath,
+    lens: "origin",
+    enabled: canLinkIssues && edit.open,
+    headBranch: pr?.head ?? null,
+    commitSubjects: comparison.data?.ahead?.map((c) => c.subject) ?? [],
+  });
+  const diffFiles = useBranchDiffFiles(
+    repoPath,
+    pr?.base ?? null,
+    pr?.head ?? null,
+  );
+  // The merge runs in an isolated worktree, so a dirty working tree only blocks
+  // it when `base` IS the branch you're currently on (git won't check that ref
+  // out into a second worktree while it has uncommitted tracked changes). When
+  // base is some other branch, the merge never touches your tree.
+  const baseIsCurrent =
+    pr !== undefined && status.data?.branch?.name === pr.base;
+  const hasTrackedChanges = (status.data?.entries ?? []).some(
+    (e) =>
+      e.staged !== null || (e.unstaged !== null && e.unstaged !== "untracked"),
+  );
+  const dirtyBlocks = baseIsCurrent && hasTrackedChanges;
+  const canMerge = pr?.status === "open" && pr.approved;
+  // Predict whether the merge will conflict, shown as a calm line by the Merge
+  // button. `git_conflict_preview` is a read-only merge-tree prediction, so run
+  // it whenever the PR is open — even when merging is currently blocked (not
+  // approved / dirty tree), the user still wants to see the prediction.
+  const conflictPreview = useConflictPreview(
+    repoPath,
+    pr?.base ?? "",
+    pr?.head ?? "",
+    pr?.status === "open",
+  );
+  const defaultBranch = useDefaultBranch(repoPath);
+
+  const threadActive =
+    selectedPr?.kind === "local" &&
+    selectedPr.id === id &&
+    section === "conversation" &&
+    !!pr &&
+    !pr.pendingMerge?.worktreePath;
+  const jumpRef = useThreadJumpHotkeys(threadActive);
+  // The palette's route to the comment box. Every term the composer itself is
+  // gated on rides here too: a paused merge takes the whole view over, and the
+  // other sub-tabs have no composer.
+  useHotkeyAction(
+    "focus-comment",
+    () => composerRef.current?.focus(),
+    threadActive,
+  );
+
+  if (!pr) {
+    return (
+      <DiffPlaceholder message={t("localPull.missing")} />
+    );
+  }
+
+  const ahead = comparison.data?.ahead ?? [];
+  // Commits on `base` that `head` lacks — i.e. how far the PR's head branch has
+  // fallen behind base. Non-empty ⇒ offer GitHub's "Update branch".
+  const behind = comparison.data?.behind ?? [];
+  // A promotion pull request (main → staging): the head carries work onward, so it
+  // stays permanently behind its base and "Update branch" would merge the base back
+  // INTO it, inverting the flow. Either the head IS this repository's default branch
+  // — a topology probe would false-positive on stacked pull requests, so that name
+  // comparison is the whole test — or the repo's rules name it a promotion branch,
+  // which is what covers staging → production. Which kind it is decides only the
+  // words the note uses; a configured head is no claim about the default branch.
+  const promotionKind: PromotionKind = (() => {
+    switch (true) {
+      case !!defaultBranch.data && pr.head === defaultBranch.data:
+        return "default";
+      case isPromotionBranch(rulesConfig, pr.head):
+        return "configured";
+      default:
+        return null;
+    }
+  })();
+  const promotionLike = promotionKind !== null;
+
+  // AI title+description generation — shared by the Edit dialog's Generate button
+  // and its mod+g chord. Verbatim the button's prior onClick body. `pr` is aliased
+  // to a narrowed const so the (hoisted) function body sees it as defined.
+  const prForGen = pr;
+  function runGenerate() {
+    // Local PRs have real local branches — the base..head branch-diff path works,
+    // and (like create) keeps base GitHub prompt wording (no provider) and
+    // proposes no labels. The trailing args are reviewer notes (none on an edit)
+    // and the grounded issue candidates.
+    prGen.generate(
+      prForGen.base,
+      prForGen.head,
+      ahead.map((c) => c.subject),
+      (d) => {
+        edit.form.setFieldValue("title", d.title);
+        edit.form.setFieldValue("body", d.body);
+        // Union the model's proposed issue links into the chip cluster (same
+        // rules as create — relate-default, dismissed-set, AI sparkle).
+        upsertAiIssues({ closes: d.closes, relates: d.relates });
+      },
+      undefined,
+      [],
+      undefined,
+      buildIssueCandidates(),
+    );
+  }
+  const fileCount = diffFiles.data?.length;
+  // Shared JiraRefRow sources for both header branches (conflict-takeover +
+  // normal) so the two can't diverge. Branch name LAST so title/description
+  // attribution wins a key that also appears in the branch name.
+  const jiraRefSources = [
+    { label: "title", text: pr.title },
+    { label: "description", text: pr.body },
+    { label: "branch name", text: pr.head },
+  ];
+
+  function toggleApprove() {
+    if (!pr) return;
+    update.mutate({
+      id: pr.id,
+      mutate: (cur) => ({ ...cur, approved: !cur.approved }),
+    });
+  }
+
+  // A typed note rides Close/Reopen rather than being discarded by them.
+  const draftRidesStateChange = !!comment.trim();
+
+  /** Close/Reopen, carrying any typed note. The note is appended in the SAME
+   *  record mutation as the status flip, so the store can never persist one
+   *  without the other; the draft clears only once that write lands. */
+  async function setStatus(next: "open" | "closed") {
+    // Appending the note makes this non-idempotent, and the mutate callback
+    // re-reads the record from disk — so a second click lands after the first
+    // note is already stored and would post it twice.
+    if (!pr || update.isPending || settingStatus) return;
+    const note = comment.trim();
+    setSettingStatus(true);
+    try {
+      await update.mutateAsync({
+        id: pr.id,
+        mutate: (cur) => ({
+          ...cur,
+          comments: note
+            ? [
+                ...cur.comments,
+                {
+                  id: crypto.randomUUID(),
+                  body: note,
+                  createdAt: new Date().toISOString(),
+                },
+              ]
+            : cur.comments,
+          status: next,
+          closedAt: next === "closed" ? new Date().toISOString() : undefined,
+        }),
+      });
+      setComment("");
+    } catch (e) {
+      // Nothing was written, the note included — say so rather than leave a
+      // silent no-op behind a button that promised to post it.
+      toastError(e);
+    } finally {
+      setSettingStatus(false);
+    }
+  }
+
+  function openEdit() {
+    if (!pr) return;
+    // The chips OWN the trailing ref block: peel any exact `Closes #N` /
+    // `Relates to #N` lines off the end of the body into chips (keyword
+    // preserved) and open the editor with the STRIPPED text. On save the block is
+    // re-appended from chips. With the tracker unavailable there are no chips.
+    if (canLinkIssues) {
+      const { text, refs } = splitBodyRefBlock(pr.body, "native");
+      edit.openEdit({ title: pr.title, body: text });
+      resetLinkedIssues(refs);
+    } else {
+      edit.openEdit({ title: pr.title, body: pr.body });
+    }
+  }
+
+  // Awaited, not per-call callbacks: this view's effects tear down when the
+  // selection or the repo tab changes, and react-query drops per-call callbacks
+  // once the observer has no listeners. Here that would lose the record write —
+  // a landed merge still reading open, or a paused one with no `pendingMerge`
+  // to reach its resolver by.
+  async function doMerge(strategy: MergeStrategy) {
+    if (!pr) return;
+    const message = pr.body.trim() ? `${pr.title}\n\n${pr.body}` : pr.title;
+    try {
+      const outcome = await merge.mutateAsync({
+        base: pr.base,
+        head: pr.head,
+        message,
+        strategy,
+      });
+      if (outcome.status === "merged") {
+        // The record write is awaited ahead of its toast: a store write can
+        // reject (a concurrent MCP writer, a locked store), and a merge
+        // reported as landed while the record still reads open is the exact
+        // desync this view has no second chance to repair.
+        await update.mutateAsync({
+          id: pr.id,
+          mutate: (cur) => ({
+            ...cur,
+            status: "merged",
+            mergedAt: new Date().toISOString(),
+          }),
+        });
+        toast.success(`${MERGED_VERB[strategy]} ${pr.head} into ${pr.base}`);
+        return;
+      }
+      // Conflicts: the merge is paused in an isolated worktree (the user's
+      // branch and working tree are untouched). Record it on the PR so this
+      // view swaps to the in-place ResolveConflictsView, where the conflict
+      // editor is pointed at that worktree — awaited because a lost write
+      // strands that worktree with nothing left pointing at it.
+      if (!outcome.worktreePath || !outcome.worktreeId) {
+        toastError(
+          new Error("Merge paused on conflicts but returned no worktree"),
+        );
+        return;
+      }
+      await update.mutateAsync({
+        id: pr.id,
+        mutate: (cur) => ({
+          ...cur,
+          pendingMerge: {
+            base: pr.base,
+            head: pr.head,
+            strategy: strategy as "merge" | "squash" | "rebase",
+            message,
+            worktreePath: outcome.worktreePath as string,
+            worktreeId: outcome.worktreeId as string,
+            opId: outcome.opId,
+            startedAt: new Date().toISOString(),
+          },
+        }),
+      });
+      toast.warning(t("pullDetail.mergeConflicts"));
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  /** The "Update branch" button's action. Awaited because the dirty-tree refusal
+   *  reaches the stash-and-reapply prompt only through this rejection; dropping
+   *  it on teardown would withdraw the offer entirely. */
+  async function doUpdateBranch() {
+    if (!pr) return;
+    try {
+      await updateBranchFrom.mutateAsync({ branch: pr.head, base: pr.base });
+      toast.success(`Updated ${pr.head} from ${pr.base}`);
+    } catch (e) {
+      // Only an in-place update (head IS the current branch) can be refused
+      // over uncommitted changes — the throwaway worktree path is always
+      // clean. Anything else toasts.
+      if (
+        status.data?.branch?.name === pr.head &&
+        recovery.handleError(e, {
+          operationLabel: "update",
+          detail: pr.base,
+          reappliedMessage: `Updated from ${pr.base} and reapplied your changes.`,
+          plainMessage: `Updated ${pr.head} from ${pr.base}`,
+          run: { op: "merge", ref: pr.base },
+        })
+      ) {
+        return;
+      }
+      toastError(e);
+    }
+  }
+
+  // A calm status block above the Merge button: up to three INDEPENDENT lines —
+  // the in-memory conflict prediction, the promotion note that stands in for the
+  // Update branch button this shape hides, and (when merging is currently
+  // blocked) the visible reason it's disabled. The reason is shown here because a
+  // disabled <Button>'s `title` never surfaces a tooltip (the repo's
+  // explain-disabled-actions gotcha).
+  function renderMergeStatus() {
+    if (!pr) return null;
+    const p = conflictPreview.data;
+    const blocked = !canMerge || dirtyBlocks;
+
+    // Prediction line — nothing for up-to-date / fast-forward / unknown.
+    let prediction: ReactNode = null;
+    if (p?.status === "conflict") {
+      const files = p.conflicts;
+      const shown = files.slice(0, 3);
+      const list =
+        files.length <= 3
+          ? shown.join(", ")
+          : `${shown.join(", ")} and ${files.length - 3} more`;
+      prediction = (
+        <>
+          <div className="flex items-start gap-1.5 text-warning">
+            <WarningIcon className="mt-px size-3.5 shrink-0" />
+            <span className="min-w-0">
+              {t("localPull.mergeConflictFiles", { files: list })}
+            </span>
+          </div>
+          <div className="pl-5 text-muted-foreground">
+            {t("localPull.resolveInEditor")}
+          </div>
+        </>
+      );
+    } else if (p?.status === "clean") {
+      prediction = (
+        <div className="flex items-center gap-1.5 text-muted-foreground">
+          <CheckIcon className="size-3.5 shrink-0" />
+          {t("localPull.mergesCleanly")}
+        </div>
+      );
+    }
+
+    // Blocked-reason line — independent of the prediction.
+    const reason = blocked ? (
+      <div className="flex items-center gap-1.5 text-muted-foreground">
+        <InfoIcon className="size-3.5 shrink-0" />
+        {!canMerge
+          ? t("localPull.approveToMerge")
+          : t("localPull.dirtyToMerge")}
+      </div>
+    ) : null;
+
+    // Names the direction the work travels, in place of the Update branch button
+    // this arm hides. The count is true and stays visible; only the implied
+    // catch-up goes away. The gap does NOT close on merge — merging the head into
+    // the base ADDS a commit the head lacks — so the copy says it needs no closing.
+    const promotion =
+      promotionKind !== null && behind.length > 0 ? (
+        <div className="flex items-start gap-1.5 text-muted-foreground">
+          <InfoIcon className="mt-px size-3.5 shrink-0" />
+          <span className="min-w-0">
+            {t("localPull.promotionGap", {
+              base: pr.base,
+              count: behind.length,
+              head: pr.head,
+              reason: t(promotionKind === "default" ? "localPull.promotionDefault" : "localPull.promotionConfigured"),
+            })}
+          </span>
+        </div>
+      ) : null;
+
+    if (!prediction && !reason && !promotion) return null;
+    return (
+      <div className="space-y-1 border-t px-3 py-1.5 text-xs">
+        {prediction}
+        {promotion}
+        {reason}
+      </div>
+    );
+  }
+
+  // A merge paused on conflicts takes over the whole PR view: the merge lives in
+  // an isolated worktree, and ResolveConflictsView drives its file list + editor +
+  // Finish/Abort in place of the PR's normal sections and footer actions.
+  if (pr.pendingMerge?.worktreePath) {
+    return (
+      <div className="flex h-full flex-col">
+        <header className="space-y-2 border-b px-4 py-3">
+          {/* `flex-auto`, not `flex-1`: a basis-0 title never triggers the wrap,
+              so the badge would stay put and the title collapse instead. Growing
+              also replaces the spacer that used to right-align it. */}
+          <div className="flex flex-wrap items-start gap-2">
+            <h2 className="min-w-0 flex-auto text-sm font-medium break-words">
+              {pr.title}
+            </h2>
+            <Badge variant="secondary" className="capitalize">
+              {pr.status}
+            </Badge>
+          </div>
+          <JiraRefRow repoPath={repoPath} sources={jiraRefSources} />
+          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            <span className="font-mono">{pr.head}</span>
+            <span>→</span>
+            <span className="font-mono">{pr.base}</span>
+            <span>•</span>
+            <span>
+              {t("localPull.localTimePrefix")} <RelativeTime date={pr.createdAt} />
+            </span>
+          </div>
+        </header>
+        <ResolveConflictsView repoPath={repoPath} pr={pr} />
+      </div>
+    );
+  }
+
+  // The Merge control's state. `disabled`/`reason` land on the rendered
+  // DisabledReasonButton, never the trigger — its own inner useButton swallows
+  // activation while blocked, which is what actually keeps the menu shut.
+  const mergeBlocked = !canMerge || merge.isPending || dirtyBlocks;
+  // This same string doubles as the hover title while nothing blocks. The
+  // active merge outranks `dirtyBlocks`: a merge already in flight can't be
+  // unblocked by committing or stashing, so a dirty tree that shows up mid-merge
+  // must not override "Merging…" with a remedy that doesn't apply.
+  const mergeReason = (() => {
+    switch (true) {
+      case !canMerge:
+        return t("pullDetail.approveBeforeMerge");
+      case merge.isPending:
+        return t("localPull.merging");
+      case dirtyBlocks:
+        return t("pullDetail.commitOrStashBeforeMerge");
+      default:
+        return t("localPull.mergeTitle", { head: pr.head, base: pr.base });
+    }
+  })();
+
+  return (
+    <div className="flex h-full flex-col">
+      <header className="space-y-2 border-b px-4 py-3">
+        {/* `flex-auto`, not `flex-1`: a basis-0 title never triggers the wrap, so
+            the actions would stay put and the title collapse instead. Growing also
+            replaces the spacer that used to right-align them. */}
+        <div className="flex flex-wrap items-start gap-2">
+          <h2 className="min-w-0 flex-auto text-sm font-medium break-words">
+            {pr.title}
+          </h2>
+          {pr.status === "open" && (
+            <Button
+              variant="outline"
+              size="xs"
+              onClick={openEdit}
+              title={t("pullDetail.editTitleDescription")}
+            >
+              <PencilSimpleIcon data-icon="inline-start" />
+              {t("localPull.edit")}
+            </Button>
+          )}
+          <Badge
+            variant={pr.status === "open" ? "default" : "secondary"}
+            className="capitalize"
+          >
+            {pr.status}
+          </Badge>
+          {pr.approved && pr.status === "open" && (
+            <Badge variant="secondary">{t("localPull.approved")}</Badge>
+          )}
+          {pr.archived && <Badge variant="secondary">{t("localPull.archived")}</Badge>}
+        </div>
+        <JiraRefRow repoPath={repoPath} sources={jiraRefSources} />
+        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+          <span className="font-mono">{pr.head}</span>
+          <span>→</span>
+          <span className="font-mono">{pr.base}</span>
+          <span>•</span>
+          <span>
+            {t("localPull.localTimePrefix")} <RelativeTime date={pr.createdAt} />
+          </span>
+        </div>
+        {(pr.labels.length > 0 || pr.status === "open") && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {/* Trigger first, so it never shifts as chips come and go. */}
+            {pr.status === "open" && (
+              <Popover.Root>
+                <Popover.Trigger
+                  render={
+                    <Button variant="ghost" size="xs" aria-label={t("pullDetail.addLabel")} />
+                  }
+                >
+                  <TagIcon data-icon="inline-start" />
+                  {t("pullDetail.labels")}
+                </Popover.Trigger>
+                <Popover.Portal container={portalContainer}>
+                  <Popover.Positioner
+                    align="start"
+                    sideOffset={4}
+                    className="isolate z-50"
+                  >
+                    <Popover.Popup className="w-60 rounded-none bg-popover p-2 text-popover-foreground shadow-md ring-1 ring-foreground/10">
+                      <p className="px-1 pb-1.5 text-xs font-medium">
+                        {t("localPull.addLabel")}
+                      </p>
+                      <div className="flex gap-2 px-1">
+                        <Input
+                          value={labelInput}
+                          onChange={(e) => setLabelInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              addLabel();
+                            }
+                          }}
+                          placeholder={t("localPull.addLabelPlaceholder")}
+                          className="h-7 flex-1"
+                          autoComplete="off"
+                        />
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={!labelInput.trim()}
+                          onClick={addLabel}
+                        >
+                          {t("localPull.add")}
+                        </Button>
+                      </div>
+                    </Popover.Popup>
+                  </Popover.Positioner>
+                </Popover.Portal>
+              </Popover.Root>
+            )}
+            {pr.labels.map((label) => (
+              <span
+                key={label}
+                className="flex items-center gap-1 border px-1.5 py-0.5 text-[11px]"
+              >
+                {label}
+                {pr.status === "open" && (
+                  <button
+                    type="button"
+                    aria-label={`Remove label ${label}`}
+                    className="text-muted-foreground hover:text-foreground"
+                    onClick={() => removeLabel(label)}
+                  >
+                    <XIcon className="size-3" />
+                  </button>
+                )}
+              </span>
+            ))}
+          </div>
+        )}
+        <div className="flex flex-wrap gap-1 pt-1">
+          {availableSections.map((s) => (
+            <Button
+              key={s}
+              variant={section === s ? "secondary" : "ghost"}
+              size="xs"
+              aria-pressed={section === s}
+              onClick={() => setSection(s)}
+            >
+              {SECTION_LABEL[s]({
+                comments: pr.comments.length,
+                commits: ahead.length,
+                files: fileCount,
+              })}
+            </Button>
+          ))}
+        </div>
+      </header>
+
+      {aiEnabled && section === "review" && (
+        <PrReviewPanel
+          prKind="local"
+          prRef={id}
+          context={{
+            title: pr.title,
+            body: pr.body,
+            commitSubjects: ahead.map((c) => c.subject),
+            repoPath,
+            // A local PR has no forge lens; "origin" keeps its per-PR review stores
+            // on the keys they used before the lens dimension existed.
+            lens: "origin",
+            // `ahead` (git log) is newest-first, so the head is the first entry.
+            headSha: ahead[0]?.hash,
+            loadDiff: () =>
+              gitBranchDiff(repoPath, pr.base, pr.head, 200000).then((d) => ({
+                text: d.text,
+                truncated: d.truncated,
+                files: d.files,
+              })),
+          }}
+          posting={update.isPending || postingReview}
+          // The body arrives pre-branded from the panel; stamp the synthetic
+          // author so it renders as a GitDesktop-posted review, not authorless.
+          // `opts` (asBot) is a remote-forge concern — ignored for local PRs.
+          onPost={async (body) => {
+            setPostingReview(true);
+            try {
+              await update.mutateAsync({
+                id: pr.id,
+                mutate: (cur) => ({
+                  ...cur,
+                  comments: [
+                    ...cur.comments,
+                    {
+                      id: crypto.randomUUID(),
+                      body,
+                      author: "GitDesktop",
+                      createdAt: new Date().toISOString(),
+                    },
+                  ],
+                }),
+              });
+            } catch (e) {
+              toastError(e);
+              throw e; // let the panel skip its success toast / text clear
+            } finally {
+              setPostingReview(false);
+            }
+          }}
+        />
+      )}
+
+      {section === "conversation" && (
+        <>
+          <ConversationScrollArea ref={jumpRef} className="flex-1">
+            <div className="space-y-4 p-4">
+              <div className="group flex items-start justify-between gap-2 border-b pb-3">
+                <div className="min-w-0 flex-1">
+                  {pr.body.trim() ? (
+                    <Markdown refs={mentions.refs}>{pr.body}</Markdown>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      {t("localPull.noDescription")}
+                    </p>
+                  )}
+                </div>
+                <DropdownMenu>
+                  <DropdownMenuTrigger
+                    render={
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label={t("settingsAdvanced.descriptionActions")}
+                        className="shrink-0 text-muted-foreground hover:text-foreground data-popup-open:text-foreground"
+                      />
+                    }
+                  >
+                    <DotsThreeIcon className="size-4" weight="bold" />
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="min-w-44">
+                    <DropdownMenuItem onClick={() => quoteReply(pr.body)}>
+                      {t("localPull.quoteReply")}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={() => copyText(pr.body, t("localPull.markdownCopied"))}
+                    >
+                      {t("localPull.copyMarkdown")}
+                    </DropdownMenuItem>
+                    {pr.status === "open" && (
+                      <DropdownMenuItem onClick={openEdit}>
+                        {t("localPull.edit")}
+                      </DropdownMenuItem>
+                    )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+              {/* The merged activity feed: the created lifecycle marker +
+                  commits + comments + a merged/closed marker, date-sorted
+                  oldest→newest (matching the remote PR timeline). Each source
+                  maps to a {date, sortKey, node} entry — comments keep every
+                  callback they had before (they're relocated, not rewritten);
+                  commits ride as bare markers that coalesce into a grouped
+                  "pushed N commits" row. There's always a created row, so the
+                  feed is never empty. */}
+              {(() => {
+                const entries: TimelineEntry[] = [];
+
+                // Created — always present (there's always a createdAt).
+                entries.push({
+                  date: pr.createdAt,
+                  sortKey: 0,
+                  node: (
+                    <LocalPrLifecycleRow
+                      key="lifecycle-created"
+                      kind="created"
+                      date={pr.createdAt}
+                    />
+                  ),
+                });
+
+                // Commits from `ahead` — carried as bare markers; adjacent runs
+                // coalesce into a single "pushed N commits" row after sorting.
+                for (const c of ahead) {
+                  entries.push({
+                    date: c.date,
+                    sortKey: 1,
+                    commit: {
+                      id: c.hash,
+                      subject: c.subject,
+                      shortSha: c.hash.slice(0, 7),
+                      author: c.author,
+                      date: c.date,
+                    },
+                  });
+                }
+
+                // Comments (existing cards, every callback preserved).
+                for (const c of pr.comments) {
+                  entries.push({
+                    date: c.createdAt,
+                    sortKey: 2,
+                    node: (
+                      <LocalComment
+                        key={c.id}
+                        comment={c}
+                        onQuote={() => quoteReply(c.body)}
+                        onSaveEdit={(body) => editComment(c.id, body)}
+                        onDelete={() => setDeletingCommentId(c.id)}
+                        onHide={() => setCommentHidden(c.id, true)}
+                        onUnhide={() => setCommentHidden(c.id, false)}
+                        mentions={mentions}
+                      />
+                    ),
+                  });
+                }
+
+                // Terminal lifecycle marker: merged, or closed (with a graceful
+                // timestamp-less marker for older records that predate closedAt).
+                if (pr.status === "merged") {
+                  entries.push({
+                    date: pr.mergedAt ?? "",
+                    sortKey: 3,
+                    node: (
+                      <LocalPrLifecycleRow
+                        key="lifecycle-merged"
+                        kind="merged"
+                        date={pr.mergedAt}
+                      />
+                    ),
+                  });
+                } else if (pr.status === "closed" && pr.closedAt) {
+                  entries.push({
+                    date: pr.closedAt,
+                    sortKey: 3,
+                    node: (
+                      <LocalPrLifecycleRow
+                        key="lifecycle-closed"
+                        kind="closed"
+                        date={pr.closedAt}
+                      />
+                    ),
+                  });
+                }
+
+                // Coalesce adjacent commit markers into grouped "pushed N" rows;
+                // everything else renders its own node.
+                const rendered = coalesceCommitRuns(
+                  sortTimeline(entries),
+                  (run, runStart) => (
+                    <PushedCommitsRow
+                      key={`push-${runStart}-${run[0].id}`}
+                      commits={run}
+                      onSelectCommit={(hash) => {
+                        setSelectedCommitHash(hash);
+                        setSection("commits");
+                      }}
+                    />
+                  ),
+                );
+
+                return <div className="space-y-4">{rendered}</div>;
+              })()}
+            </div>
+          </ConversationScrollArea>
+          {/* Shown for closed PRs too, so you can comment / quote-reply after
+              closing; approving stays open-only. */}
+          <CommentComposer
+            ref={composerRef}
+            value={comment}
+            onChange={setComment}
+            onSubmit={addComment}
+            onClear={() => setComment("")}
+            submitLabel={t("pullDetail.comment")}
+            ariaLabel={t("settingsAdvanced.leaveNote")}
+            placeholder={t("settingsAdvanced.leaveNote")}
+            mentions={mentions}
+            actions={
+              pr.status === "open" && (
+                <Button
+                  variant={pr.approved ? "secondary" : "outline"}
+                  size="sm"
+                  aria-pressed={pr.approved}
+                  onClick={toggleApprove}
+                >
+                  <CheckCircleIcon data-icon="inline-start" />
+                  {pr.approved ? t("pullDetail.approved") : t("pullDetail.approve")}
+                </Button>
+              )
+            }
+          />
+        </>
+      )}
+
+      {section === "commits" &&
+        (selectedCommitHash ? (
+          <div className="flex min-h-0 flex-1 flex-col">
+            <div className="border-b px-4 py-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setSelectedCommitHash(null)}
+                aria-label={t("pullDetail.backToCommits")}
+                className="-ml-2 h-7 text-muted-foreground hover:text-foreground"
+              >
+                ‹ {t("pullDetail.backToCommits")}
+              </Button>
+            </div>
+            {/* Local commits exist in the repo, so the full commit detail (with
+                its actions menu — checkout/revert/cherry-pick/amend) applies. */}
+            <div className="min-h-0 flex-1">
+              <CommitDetailView repoPath={repoPath} hash={selectedCommitHash} />
+            </div>
+          </div>
+        ) : (
+          <CommitsList
+            commits={ahead.map((c) => ({
+              id: c.hash,
+              subject: c.subject,
+              shortSha: c.hash.slice(0, 7),
+              author: c.author,
+              date: c.date,
+            }))}
+            emptyMessage={t("pullDetail.noCommitsToMerge")}
+            onSelect={setSelectedCommitHash}
+            selectedId={selectedCommitHash}
+          />
+        ))}
+
+      {section === "files" && (
+        <div className="min-h-0 flex-1">
+          <BranchDiffView
+            repoPath={repoPath}
+            base={pr.base}
+            compare={pr.head}
+          />
+        </div>
+      )}
+
+      {pr.status === "open" && renderMergeStatus()}
+
+      <div className="flex flex-wrap items-center gap-2 border-t p-3">
+        {pr.status === "open" && (
+          <>
+            {forgeFeatureReady(ghStatus.data, "mrCreate") && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setPromoteOpen(true)}
+                title={`Push the branch and open this ${promoteNoun} on ${promoteLabel}`}
+              >
+                {/* ProviderIcon forwards no attributes, so the wrapper carries the
+                    `data-icon` the button's leading-icon padding keys off. An unset
+                    provider takes the same GitHub default providerLabel does. */}
+                <span data-icon="inline-start" className="flex">
+                  <ProviderIcon provider={provider ?? "github"} />
+                </span>
+                {t("localPull.publishTo", { provider: promoteLabel })}
+              </Button>
+            )}
+            {/* The label swaps while a note rides along: the action changed
+                meaning, and only the label reaches a viewer before the click. */}
+            <DisabledReasonButton
+              variant="outline"
+              size="sm"
+              disabled={update.isPending || settingStatus}
+              reason={t("localPull.saving")}
+              onClick={() => void setStatus("closed")}
+              title={
+                draftRidesStateChange
+                  ? "Closes and posts your draft as a comment"
+                  : undefined
+              }
+            >
+              {draftRidesStateChange ? t("localPull.closeWithComment") : t("localPull.close")}
+            </DisabledReasonButton>
+            <span className="flex-1" />
+            {/* GitHub-style "Update branch": only when head has fallen behind
+                base. Merges base into head (in a throwaway worktree, so it
+                doesn't touch your working tree unless head IS your current
+                branch) so the branch catches up; the repo-scoped invalidation
+                then refreshes the comparison (behind → 0, this button hides)
+                and the conflict preview. */}
+            {behind.length > 0 && !promotionLike && (
+              <DisabledReasonButton
+                variant="outline"
+                size="sm"
+                // `promotionLike` reads false until BOTH its inputs land — the
+                // default branch and the repo's promotion-branch rules — so the
+                // button holds rather than deciding early. PENDING only (neither
+                // query is ever disabled): a FAILED read falls open to the ordinary
+                // button instead of disabling forever behind a stale "checking…".
+                disabled={
+                  updateBranchFrom.isPending ||
+                  recovery.pending ||
+                  defaultBranch.isPending ||
+                  rulesSettling
+                }
+                reason={(() => {
+                  switch (true) {
+                    case updateBranchFrom.isPending:
+                      return t("pullDetail.updatingBranch");
+                    case recovery.pending:
+                      return t("pullDetail.operationRunning");
+                    case defaultBranch.isPending:
+                      return "Checking which branch is the default…";
+                    case rulesSettling:
+                      return "Checking this repository's promotion branches…";
+                    default:
+                      return undefined;
+                  }
+                })()}
+                title={`Merge ${pr.base} into ${pr.head} to catch it up`}
+                onClick={() => void doUpdateBranch()}
+              >
+                <ArrowClockwiseIcon data-icon="inline-start" />
+                {t("localPull.updateBranch")}
+              </DisabledReasonButton>
+            )}
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={
+                  <DisabledReasonButton
+                    size="sm"
+                    disabled={mergeBlocked}
+                    reason={mergeReason}
+                    title={mergeReason}
+                  />
+                }
+              >
+                <GitMergeIcon data-icon="inline-start" />
+                {t("pullDetail.mergeAction")}
+                <CaretDownIcon data-icon="inline-end" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-56">
+                <DropdownMenuItem
+                  disabled={
+                    !isMergeMethodAllowed(rulesConfig, pr.base, "merge")
+                  }
+                  onClick={() => void doMerge("merge")}
+                >
+                  {t("localPull.createMergeCommit")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  disabled={
+                    !isMergeMethodAllowed(rulesConfig, pr.base, "squash")
+                  }
+                  onClick={() => void doMerge("squash")}
+                >
+                  {t("localPull.squashMerge")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  disabled={
+                    !isMergeMethodAllowed(rulesConfig, pr.base, "rebase")
+                  }
+                  onClick={() => void doMerge("rebase")}
+                >
+                  {t("localPull.rebaseMerge")}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </>
+        )}
+        {pr.status === "closed" && (
+          <>
+            <span className="flex-1" />
+            <DisabledReasonButton
+              variant="outline"
+              size="sm"
+              disabled={update.isPending || settingStatus}
+              reason={t("localPull.saving")}
+              onClick={() => void setStatus("open")}
+              title={
+                draftRidesStateChange
+                  ? "Reopens and posts your draft as a comment"
+                  : undefined
+              }
+            >
+              <ArrowCounterClockwiseIcon data-icon="inline-start" />
+              {draftRidesStateChange ? t("localPull.reopenWithComment") : t("localPull.reopen")}
+            </DisabledReasonButton>
+          </>
+        )}
+      </div>
+
+      <PromoteLocalPrDialog
+        repoPath={repoPath}
+        pr={pr}
+        open={promoteOpen}
+        onOpenChange={setPromoteOpen}
+      />
+
+      <EditTitleBodyDialog
+        form={edit.form}
+        open={edit.open}
+        onOpenChange={(open) => {
+          // The dialog stays mounted, so cancel any in-flight generation on close.
+          if (!open) prGen.cancel();
+          edit.setOpen(open);
+        }}
+        title={t("pullDetail.editPullRequest")}
+        description={t("localPull.editDescription")}
+        contentClassName={undefined}
+        bodyTextareaClassName="max-h-72"
+        mentions={mentions}
+        onGenerate={aiEnabled ? runGenerate : undefined}
+        generating={prGen.generating}
+        generateDisabled={ahead.length === 0}
+        belowBody={
+          canLinkIssues ? (
+            <LinkedIssuesField
+              repoPath={repoPath}
+              lens="origin"
+              chips={linkedIssues}
+              onToggleKeyword={toggleIssueKeyword}
+              onRemove={removeIssue}
+              onPick={pickIssue}
+              disabled={prGen.generating}
+            />
+          ) : undefined
+        }
+        bodyActions={
+          !aiEnabled ? undefined : prGen.generating ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              onClick={prGen.cancel}
+            >
+              <XIcon data-icon="inline-start" />
+              {t("localPull.cancel")}
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              disabled={ahead.length === 0}
+              onClick={runGenerate}
+              // The chord is only offered while it would do something — a
+              // disabled Generate's shortcut is dead too.
+              title={
+                ahead.length > 0
+                  ? t("localPull.generateTitleDescription", { hint: generateHint })
+                  : t("localPull.generateTitleDescription", { hint: "" })
+              }
+            >
+              <SparkleIcon data-icon="inline-start" />
+              {t("localPull.generate")}
+            </Button>
+          )
+        }
+      />
+
+      <DeleteCommentDialog
+        commentId={deletingCommentId}
+        onClose={() => setDeletingCommentId(null)}
+        description={t("localPull.deleteCommentDescription")}
+        onConfirm={(commentId) => {
+          deleteComment(commentId);
+          setDeletingCommentId(null);
+        }}
+      />
+
+      {recovery.dialog}
+    </div>
+  );
+}

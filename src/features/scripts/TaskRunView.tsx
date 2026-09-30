@@ -1,0 +1,161 @@
+import {
+  ArrowClockwiseIcon,
+  CheckCircleIcon,
+  CircleNotchIcon,
+  PlayCircleIcon,
+  StopIcon,
+  WarningCircleIcon,
+  XIcon,
+} from "@phosphor-icons/react";
+import { lazy, Suspense } from "react";
+import { LazyPanelFallback } from "@/components/lazy-panel-fallback";
+import { PathText } from "@/components/path-text";
+import { Button } from "@/components/ui/button";
+import { DiffPlaceholder } from "@/features/diff/DiffPlaceholder";
+import { clipTitle } from "@/lib/clip-title";
+import { ptyClose } from "@/lib/pty";
+import { useResolvedTaskScript } from "@/lib/scripts/queries";
+import { INTERPRETERS, parseArgs } from "@/lib/scripts/types";
+import { taskPtyId, useTaskRunStore } from "@/lib/stores/taskRun";
+import { useUiStore } from "@/lib/stores/ui";
+import { useTranslation } from "@/lib/i18n";
+
+// Reuse the interactive PTY terminal (xterm + Rust PTY). Lazy so its chunk loads
+// with the first run rather than on boot.
+const Terminal = lazy(() =>
+  import("@/features/terminal/Terminal").then((m) => ({ default: m.Terminal })),
+);
+
+const INTERPRETER_LABELS: Record<string, string> = Object.fromEntries(
+  INTERPRETERS.map((i) => [i.id, i.label]),
+);
+
+export function TaskRunView() {
+  const { t } = useTranslation();
+  const repoPath = useUiStore((s) => s.repoPath);
+  const activeRun = useTaskRunStore((s) => s.activeRun);
+  const rerun = useTaskRunStore((s) => s.rerun);
+  const markExited = useTaskRunStore((s) => s.markExited);
+  const clear = useTaskRunStore((s) => s.clear);
+  // Above the empty state so the hook order is stable; the query disables itself
+  // without a run (and for an inline task).
+  const resolved = useResolvedTaskScript(activeRun?.task ?? null, repoPath);
+
+  if (!activeRun || !repoPath) {
+    return (
+      <DiffPlaceholder
+        icon={PlayCircleIcon}
+        message={t("scriptsUi.runTaskToSeeOutput")}
+      />
+    );
+  }
+
+  const { task, args, status, code, token } = activeRun;
+  const ptyId = taskPtyId(activeRun);
+  const running = status === "running";
+  const succeeded = status === "exited" && code === 0;
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex shrink-0 items-center gap-2 border-b px-3 py-2 text-xs">
+        <span className="shrink-0 truncate font-medium">{task.name}</span>
+        {task.source.kind === "file" && (
+          // The resolved file this run executes; the stored path can be
+          // repo-relative, so it stands in only until the resolve lands.
+          <PathText
+            path={resolved.data?.path ?? task.source.path}
+            className="font-mono text-[10px] text-muted-foreground"
+          />
+        )}
+        {args !== "" && (
+          <span
+            className="min-w-0 truncate font-mono text-[10px] text-muted-foreground"
+            onMouseEnter={clipTitle(args)}
+          >
+            {args}
+          </span>
+        )}
+        <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+          {INTERPRETER_LABELS[task.interpreter] ?? task.interpreter}
+        </span>
+
+        {/* Status — icon + text, never color alone (WCAG AA). */}
+        {running ? (
+          <span className="flex items-center gap-1 text-muted-foreground">
+            <CircleNotchIcon className="size-3.5 animate-spin" />
+            {t("scriptsUi.running")}
+          </span>
+        ) : succeeded ? (
+          <span className="flex items-center gap-1 text-success">
+            <CheckCircleIcon className="size-3.5" />
+            {t("scriptsUi.exitedCode", { code: 0 })}
+          </span>
+        ) : (
+          <span className="flex items-center gap-1 text-destructive">
+            <WarningCircleIcon className="size-3.5" />
+            {code === null ? t("scriptsUi.stopped") : t("scriptsUi.exitedCode", { code })}
+          </span>
+        )}
+
+        <span className="flex-1" />
+
+        {running ? (
+          <Button
+            size="xs"
+            variant="ghost"
+            onClick={() => ptyClose(ptyId).catch(() => undefined)}
+            title={t("scriptsUi.stopRunningTask")}
+          >
+            <StopIcon data-icon="inline-start" />
+            {t("scriptsUi.stop")}
+          </Button>
+        ) : (
+          <>
+            <Button
+              size="xs"
+              variant="ghost"
+              onClick={rerun}
+              title={t("scriptsUi.runTaskAgain")}
+            >
+              <ArrowClockwiseIcon data-icon="inline-start" />
+              {t("scriptsUi.rerun")}
+            </Button>
+            <Button
+              size="icon-xs"
+              variant="ghost"
+              className="text-muted-foreground"
+              onClick={clear}
+              title={t("scriptsUi.clearRun")}
+              aria-label={t("scriptsUi.clearRun")}
+            >
+              <XIcon />
+            </Button>
+          </>
+        )}
+      </div>
+
+      <Suspense
+        fallback={
+          <LazyPanelFallback
+            name="the task output"
+            className="min-h-0 flex-1 p-1"
+          />
+        }
+      >
+        <Terminal
+          key={ptyId}
+          ptyId={ptyId}
+          kind="task"
+          cwd={repoPath}
+          ports={[]}
+          interpreter={task.interpreter}
+          body={task.source.kind === "inline" ? task.source.body : undefined}
+          path={task.source.kind === "file" ? task.source.path : undefined}
+          args={parseArgs(args)}
+          onExit={(c) => markExited(token, c)}
+          className="min-h-0 flex-1 px-1 pb-1"
+        />
+      </Suspense>
+    </div>
+  );
+}

@@ -1,0 +1,90 @@
+name: site
+
+# Builds the marketing site on PRs that touch it. Nothing else did: frontend.yml
+# watches the root app only, rust-tests.yml covers src-tauri/**, and
+# changelog.yml only checks fragments — so until this job existed, a broken
+# site/ build first surfaced as a red Cloudflare Pages PRODUCTION deploy.
+#
+# site/ is a pnpm workspace member with NO lockfile of its own (pnpm-workspace.yaml
+# lists it; site/node_modules/astro is a symlink into the root store), which is why
+# the root pnpm-lock.yaml is a trigger path here. The content collection makes this
+# gate load-bearing: a zod schema violation, a duplicate route, a missing hero
+# image, or an uncoercible date in a blog post are all build-time failures.
+# The job also carries assertions about the BUILT output, for regressions a
+# successful build cannot express on its own — see the whitespace step below.
+
+on:
+  pull_request:
+    paths:
+      - "site/**"
+      # /changelog/ renders it at build time, so a changelog edit is a site change.
+      - "CHANGELOG.md"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "biome.json"
+      - ".github/workflows/site.yml"
+      # The guard script is a trigger path for the same reason this workflow
+      # lists itself: quality.yml's fixtures cover its exported predicate, but
+      # only a run here exercises its CLI against a real build.
+      - "scripts/check-built-whitespace.mjs"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Distinct display name: master's ruleset requires the context "build"
+    # (frontend.yml); same-named check runs would make site's build gate it too.
+    name: site build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6.1.0
+
+      - name: Install Node
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        # The filtered install still selects the workspace ROOT (pnpm ≥11
+        # always includes it), so root devDeps — notably biome for the lint
+        # step below — are present. Verified live: this workflow's first run
+        # ("Checked 30 files") plus an isolated pnpm-11 probe.
+        run: pnpm install --frozen-lockfile --filter site
+
+      - name: Build the marketing site
+        run: pnpm --filter site build
+
+      # The predicate lives in scripts/ with the other guards so its fixtures run
+      # in quality.yml — a scanner's worst failure is a silent fail-open. It is
+      # invoked here rather than from the `checks` alias because it reads a built
+      # site/dist. PR gate only: Cloudflare Pages builds production from its own
+      # copy, so a direct push to master ships unguarded.
+      - name: Assert inline whitespace survived HTML compression
+        run: |
+          node scripts/check-built-whitespace.mjs \
+            site/dist/index.html site/dist/about/index.html
+
+      # A second build with unpublished posts (drafts + future-dated) visible,
+      # so a scheduled post's own route renders BEFORE its publication day —
+      # the cron publish is unattended, and this is the only pre-merge render
+      # of that page (getStaticPaths filters it from the plain build).
+      # Overwrites site/dist, which is safe while nothing after this uploads
+      # or deploys it; if an artifact step is ever added, run this variant
+      # first or give it its own --outDir.
+      - name: Build with unpublished posts
+        env:
+          PUBLIC_SHOW_DRAFTS: "true"
+        run: pnpm --filter site build
+
+      # Check-only (biome ci never writes); `pnpm lint` locally is --write.
+      # Verified green against git's LF blobs — a Windows checkout reports CRLF
+      # format diffs on untouched files, but CI checks out LF.
+      - name: Lint and format check
+        run: pnpm exec biome ci ./site/

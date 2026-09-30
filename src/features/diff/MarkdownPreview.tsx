@@ -1,0 +1,173 @@
+import { InfoIcon } from "@phosphor-icons/react";
+import { type ReactNode, useMemo } from "react";
+import { Markdown } from "@/components/markdown/markdown";
+import { useTranslation } from "@/lib/i18n";
+import { Button } from "@/components/ui/button";
+import { ButtonGroup } from "@/components/ui/button-group";
+import { decodeBase64Utf8 } from "@/lib/git/api";
+import { useFileAtRev } from "@/lib/git/queries";
+import { DiffPlaceholder } from "./DiffPlaceholder";
+import type { DiffContentRevs } from "./DiffSurface";
+import {
+  cleanMarkdownForPreview,
+  isMarkdownPath,
+  isMdxPath,
+  PREVIEW_MAX_CHARS,
+} from "./markdown-preview";
+
+/** The diff pane's view of a markdown file. A later rich-diff mode joins this
+ *  union as a third toggle segment. */
+export type MarkdownDiffView = "raw" | "preview";
+
+/** Preview needs somewhere to read the file's text from — surfaces that supply
+ *  neither a rev pair nor a new-side preview rev keep the plain raw diff, with
+ *  no inert control. */
+export function canPreviewMarkdown(
+  filePath: string,
+  repoPath: string | undefined,
+  revs: DiffContentRevs | undefined,
+): boolean {
+  return (
+    isMarkdownPath(filePath) &&
+    !!repoPath &&
+    revs !== undefined &&
+    (revs.oldRev !== undefined || revs.newRev !== undefined)
+  );
+}
+
+/** The Raw ⇄ Preview segment pair, same vocabulary as {@link DiffModeToggle}. */
+export function MarkdownViewToggle({
+  view,
+  onChange,
+}: {
+  view: MarkdownDiffView;
+  onChange: (view: MarkdownDiffView) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <ButtonGroup aria-label={t("diffUi.markdownView")}>
+      <Button
+        variant={view === "raw" ? "secondary" : "ghost"}
+        size="xs"
+        aria-pressed={view === "raw"}
+        onClick={() => onChange("raw")}
+      >
+        {t("diffUi.raw")}
+      </Button>
+      <Button
+        variant={view === "preview" ? "secondary" : "ghost"}
+        size="xs"
+        aria-pressed={view === "preview"}
+        onClick={() => onChange("preview")}
+      >
+        {t("diffUi.preview")}
+      </Button>
+    </ButtonGroup>
+  );
+}
+
+/** One-line disclosure strip above the rendered body (same treatment as the
+ *  working-tree line-stage hint). */
+function PreviewNote({ children }: { children: ReactNode }) {
+  return (
+    <div className="flex items-center gap-2 border-b bg-muted/40 px-3 py-1.5 text-[11px] text-muted-foreground">
+      <InfoIcon className="size-3.5 shrink-0" />
+      <span className="leading-snug">{children}</span>
+    </div>
+  );
+}
+
+/**
+ * Rendered view of a markdown/MDX file for the diff pane's Preview mode: the
+ * NEW side of the change (a deleted file falls back to the old side, with a
+ * note). Reads share content mode's file-at-rev cache but deliberately don't
+ * depend on content mode itself — a long README past its line/char caps (or a
+ * truncated diff) is exactly the file that most wants a preview.
+ */
+export function MarkdownDocPreview({
+  repoPath,
+  filePath,
+  revs,
+}: {
+  repoPath: string;
+  filePath: string;
+  /** The versions the diff itself shows. Omit a side rather than passing `null`
+   *  unless the working tree really is that side — `null` reads the checkout. */
+  revs: DiffContentRevs;
+}) {
+  const { t } = useTranslation();
+  const hasNew = revs.newRev !== undefined;
+  const hasOld = revs.oldRev !== undefined;
+  const newQ = useFileAtRev(repoPath, revs.newRev ?? null, filePath, hasNew);
+  // The old side is read only once it's the side to show, so the common case
+  // costs one IPC read. Every ENABLED read has a defined rev, which is what
+  // keeps a disabled null-rev read from cache-hitting the other side.
+  const newAbsent =
+    hasNew && !newQ.isPending && !newQ.isError && newQ.data === null;
+  const showOld = hasOld && (!hasNew || newAbsent);
+  const oldQ = useFileAtRev(repoPath, revs.oldRev ?? null, filePath, showOld);
+  const activeQ = showOld ? oldQ : newQ;
+  const b64 = activeQ.data?.base64 ?? null;
+  // The backend's own refusal (its 20MB cap, far past the preview cap) ships
+  // without bytes. Under it, a clearly oversized file is rejected on its base64
+  // length instead of being decoded first: UTF-8 yields at least one UTF-16 unit
+  // per 3 bytes, so past 4× the cap in base64 (3× in bytes) the decoded length
+  // cannot come in under it.
+  const tooLarge =
+    activeQ.data?.tooLarge === true ||
+    (typeof b64 === "string" && b64.length > PREVIEW_MAX_CHARS * 4);
+  const text = useMemo(
+    () => (typeof b64 === "string" && !tooLarge ? decodeBase64Utf8(b64) : null),
+    [b64, tooLarge],
+  );
+  const cleaned = useMemo(
+    () =>
+      text !== null && text.length <= PREVIEW_MAX_CHARS
+        ? cleanMarkdownForPreview(text, filePath)
+        : null,
+    [text, filePath],
+  );
+
+  if (!hasNew && !hasOld) {
+    return <DiffPlaceholder message={t("diffUi.nothingToPreview")} />;
+  }
+  // Local reads settle near-instantly — render nothing on the way, the same
+  // no-flash rule as the diff itself.
+  if (activeQ.isPending) return null;
+  if (activeQ.isError) {
+    return <DiffPlaceholder message={t("diffUi.loadPreviewFailed")} />;
+  }
+  if (tooLarge) {
+    return <DiffPlaceholder message={t("diffUi.fileTooLarge")} />;
+  }
+  if (text === null) {
+    return <DiffPlaceholder message={t("diffUi.nothingToPreview")} />;
+  }
+  if (cleaned === null) {
+    return <DiffPlaceholder message={t("diffUi.fileTooLarge")} />;
+  }
+  if (cleaned.trim() === "") {
+    return <DiffPlaceholder message={t("diffUi.nothingToPreview")} />;
+  }
+  return (
+    <>
+      {showOld && (
+        <PreviewNote>
+          {t("diffUi.fileDeletedPreviewingOld")}
+        </PreviewNote>
+      )}
+      {isMdxPath(filePath) && (
+        <PreviewNote>
+          {t("diffUi.approximateMdx")}
+        </PreviewNote>
+      )}
+      {/* Same reading measure as the in-app guide's rendered pages. */}
+      <div className="mx-auto w-full max-w-2xl p-6">
+        {/* No forge context: repo docs routinely carry repository-relative
+            hrefs (LICENSE, docs/…), and with nothing to resolve them against
+            the renderer leaves them inert with an explanatory card. */}
+        <Markdown>{cleaned}</Markdown>
+      </div>
+    </>
+  );
+}

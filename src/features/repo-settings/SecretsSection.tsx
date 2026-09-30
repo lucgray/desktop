@@ -1,0 +1,450 @@
+import { PlusIcon, TrashIcon } from "@phosphor-icons/react";
+import { useId, useState } from "react";
+import { toast } from "sonner";
+import { useRelativeNow } from "@/components/relative-time";
+import { SelectClipText } from "@/components/select-clip-text";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Spinner } from "@/components/ui/spinner";
+import { useTranslation } from "@/lib/i18n";
+import { clipTitleFromText } from "@/lib/clip-title";
+import {
+  useDeleteSecret,
+  useDeleteVariable,
+  useEnvironments,
+  useSecrets,
+  useSetSecret,
+  useSetVariable,
+  useVariables,
+} from "@/lib/git/queries";
+import type { SecretApp } from "@/lib/git/types";
+import { formatRelativeTime, parseableDate } from "@/lib/time";
+import { toastError } from "@/lib/toast";
+import { cn } from "@/lib/utils";
+import { AsyncListBody, InlineConfirm } from "./parts";
+
+const APPS: { value: SecretApp; label: string }[] = [
+  { value: "actions", label: "Actions" },
+  { value: "dependabot", label: "Dependabot" },
+  { value: "codespaces", label: "Codespaces" },
+];
+
+const REPO_SCOPE = "$repo";
+
+/** Trigger labels for the store select — without them Base UI shows the raw
+ *  value ("codespaces"). */
+const APP_ITEMS: Record<string, string> = Object.fromEntries(
+  APPS.map((a) => [a.value, a.label]),
+);
+
+/** GitHub's rule: letters/digits/underscore, not starting with a digit, and not
+ *  starting with GITHUB_. */
+function nameError(name: string, t: ReturnType<typeof useTranslation>["t"]): string | null {
+  if (!name) return null;
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    return t("repoSecretsUi.invalidNameFormat");
+  }
+  if (/^github_/i.test(name)) return t("repoSecretsUi.githubPrefixReserved");
+  return null;
+}
+
+export function SecretsSection({
+  repoPath,
+  open,
+}: {
+  repoPath: string;
+  open: boolean;
+}) {
+  const { t } = useTranslation();
+  const [kind, setKind] = useState<"secrets" | "variables">("secrets");
+  const [app, setApp] = useState<SecretApp>("actions");
+  const [scope, setScope] = useState<string>(REPO_SCOPE);
+  const storeSelectId = useId();
+  const scopeSelectId = useId();
+
+  const envs = useEnvironments(repoPath, open);
+  // Environment scope exists only for Actions (secrets and variables).
+  const envAllowed = kind === "variables" || app === "actions";
+  const env = envAllowed && scope !== REPO_SCOPE ? scope : null;
+
+  return (
+    <div className="min-w-0 space-y-4">
+      <div className="flex flex-wrap items-end gap-2">
+        <div className="flex rounded-md border p-0.5">
+          {(["secrets", "variables"] as const).map((k) => (
+            <button
+              key={k}
+              type="button"
+              onClick={() => setKind(k)}
+              className={cn(
+                "cursor-pointer rounded px-2.5 py-1 text-xs capitalize",
+                kind === k
+                  ? "bg-accent font-medium text-accent-foreground"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {t(k === "secrets" ? "repoSecretsUi.secrets" : "repoSecretsUi.variables")}
+            </button>
+          ))}
+        </div>
+
+        {kind === "secrets" && (
+          <div className="space-y-1">
+            <Label
+              htmlFor={storeSelectId}
+              className="text-[11px] text-muted-foreground"
+            >
+              {t("repoSecretsUi.store")}
+            </Label>
+            <Select
+              items={APP_ITEMS}
+              value={app}
+              onValueChange={(v) => v && setApp(v as SecretApp)}
+            >
+              <SelectTrigger id={storeSelectId} size="sm" className="w-36">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {APPS.map((a) => (
+                  <SelectItem key={a.value} value={a.value}>
+                    {a.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        )}
+
+        <div className="space-y-1">
+          <Label
+            htmlFor={scopeSelectId}
+            className="text-[11px] text-muted-foreground"
+          >
+            {t("repoSecretsUi.scope")}
+          </Label>
+          <Select
+            items={{ [REPO_SCOPE]: t("repoSecretsUi.repository") }}
+            value={env ?? REPO_SCOPE}
+            onValueChange={(v) => v && setScope(v)}
+            disabled={!envAllowed}
+          >
+            <SelectTrigger id={scopeSelectId} size="sm" className="w-40">
+              <SelectValue onMouseEnter={clipTitleFromText} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={REPO_SCOPE}>{t("repoSecretsUi.repository")}</SelectItem>
+              {(envs.data ?? []).map((e) => (
+                <SelectItem key={e} value={e}>
+                  <SelectClipText>{e}</SelectClipText>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      {kind === "secrets" ? (
+        <SecretsList repoPath={repoPath} app={app} env={env} open={open} />
+      ) : (
+        <VariablesList repoPath={repoPath} env={env} open={open} />
+      )}
+    </div>
+  );
+}
+
+function SecretsList({
+  repoPath,
+  app,
+  env,
+  open,
+}: {
+  repoPath: string;
+  app: SecretApp;
+  env: string | null;
+  open: boolean;
+}) {
+  const { t } = useTranslation();
+  const secrets = useSecrets(repoPath, app, env, open);
+  const set = useSetSecret(repoPath);
+  const del = useDeleteSecret(repoPath);
+
+  const [name, setName] = useState("");
+  const [value, setValue] = useState("");
+  const [confirming, setConfirming] = useState<string | null>(null);
+  // `meta` is a plain string prop, so the shared clock has to be threaded in by
+  // hand — `<RelativeTime>` can't render there.
+  const now = useRelativeNow();
+  const invalid = nameError(name, t);
+  const canAdd = !!name && !!value && !invalid && !set.isPending;
+
+  // Awaited, not per-call callbacks: react-query drops those when this subtree
+  // unmounts mid-flight — closing the dialog or switching the rail's section —
+  // so the outcome would never reach the user.
+  async function add() {
+    try {
+      await set.mutateAsync({ app, env, name: name.trim(), value });
+      toast.success(t("repoSecretsUi.secretSaved"));
+      setName("");
+      setValue("");
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  async function remove(secretName: string) {
+    try {
+      await del.mutateAsync({ app, env, name: secretName });
+      toast.success(t("repoSecretsUi.secretRemoved"));
+      setConfirming(null);
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-md border p-3">
+        <div className="grid grid-cols-[1fr_1fr_auto] items-start gap-2">
+          <div className="space-y-1">
+            <Input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="SECRET_NAME"
+              className="font-mono"
+              autoComplete="off"
+              spellCheck={false}
+            />
+            {invalid && (
+              <p className="text-[11px] text-destructive">{invalid}</p>
+            )}
+          </div>
+          <Input
+            type="password"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            placeholder={t("repoSecretsUi.value")}
+            autoComplete="off"
+          />
+          <Button size="sm" disabled={!canAdd} onClick={add}>
+            {set.isPending ? (
+              <Spinner data-icon="inline-start" />
+            ) : (
+              <PlusIcon data-icon="inline-start" />
+            )}
+            {t("common.add")}
+          </Button>
+        </div>
+        <p className="mt-1.5 text-[11px] text-muted-foreground">
+          {t("repoSecretsUi.secretEncryptionNote")}
+        </p>
+      </div>
+
+      <AsyncListBody
+        loading={secrets.isPending}
+        error={secrets.error}
+        empty={secrets.data?.length === 0}
+        emptyLabel={t("repoSecretsUi.noSecrets")}
+        errorScope="repo"
+      >
+        {secrets.data?.map((s) => (
+          <Row
+            key={s.name}
+            name={s.name}
+            meta={
+              s.updatedAt && parseableDate(s.updatedAt)
+                ? t("repoSecretsUi.updatedAt", { time: formatRelativeTime(s.updatedAt, now) })
+                : ""
+            }
+            confirming={confirming === s.name}
+            pending={del.isPending}
+            onConfirm={() => setConfirming(s.name)}
+            onCancel={() => setConfirming(null)}
+            onDelete={() => remove(s.name)}
+          />
+        ))}
+      </AsyncListBody>
+    </div>
+  );
+}
+
+function VariablesList({
+  repoPath,
+  env,
+  open,
+}: {
+  repoPath: string;
+  env: string | null;
+  open: boolean;
+}) {
+  const { t } = useTranslation();
+  const variables = useVariables(repoPath, env, open);
+  const set = useSetVariable(repoPath);
+  const del = useDeleteVariable(repoPath);
+
+  const [name, setName] = useState("");
+  const [value, setValue] = useState("");
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const invalid = nameError(name, t);
+  const canAdd = !!name && !invalid && !set.isPending;
+
+  async function add() {
+    try {
+      await set.mutateAsync({ env, name: name.trim(), value });
+      toast.success(t("repoSecretsUi.variableSaved"));
+      setName("");
+      setValue("");
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  async function remove(variableName: string) {
+    try {
+      await del.mutateAsync({ env, name: variableName });
+      toast.success(t("repoSecretsUi.variableRemoved"));
+      setConfirming(null);
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-md border p-3">
+        <div className="grid grid-cols-[1fr_1fr_auto] items-start gap-2">
+          <div className="space-y-1">
+            <Input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="VARIABLE_NAME"
+              className="font-mono"
+              autoComplete="off"
+              spellCheck={false}
+            />
+            {invalid && (
+              <p className="text-[11px] text-destructive">{invalid}</p>
+            )}
+          </div>
+          <Input
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            placeholder="Value"
+            autoComplete="off"
+          />
+          <Button size="sm" disabled={!canAdd} onClick={add}>
+            {set.isPending ? (
+              <Spinner data-icon="inline-start" />
+            ) : (
+              <PlusIcon data-icon="inline-start" />
+            )}
+            {t("common.save")}
+          </Button>
+        </div>
+        <p className="mt-1.5 text-[11px] text-muted-foreground">
+          {t("repoSecretsUi.variableUpdateNote")}
+        </p>
+      </div>
+
+      <AsyncListBody
+        loading={variables.isPending}
+        error={variables.error}
+        empty={variables.data?.length === 0}
+        emptyLabel={t("repoSecretsUi.noVariables")}
+        errorScope="repo"
+      >
+        {variables.data?.map((v) => (
+          <Row
+            key={v.name}
+            name={v.name}
+            meta={v.value}
+            metaMono
+            confirming={confirming === v.name}
+            pending={del.isPending}
+            onConfirm={() => setConfirming(v.name)}
+            onCancel={() => setConfirming(null)}
+            onEdit={() => {
+              setName(v.name);
+              setValue(v.value);
+            }}
+            onDelete={() => remove(v.name)}
+          />
+        ))}
+      </AsyncListBody>
+    </div>
+  );
+}
+
+function Row({
+  name,
+  meta,
+  metaMono,
+  confirming,
+  pending,
+  onConfirm,
+  onCancel,
+  onDelete,
+  onEdit,
+}: {
+  name: string;
+  meta: string;
+  metaMono?: boolean;
+  confirming: boolean;
+  pending: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+  onDelete: () => void;
+  onEdit?: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex items-center gap-2 rounded-md border p-2.5 text-xs">
+      <div className="min-w-0 flex-1">
+        <p className="truncate font-mono font-medium">{name}</p>
+        {meta && (
+          <p
+            className={cn(
+              "truncate text-muted-foreground",
+              metaMono && "font-mono",
+            )}
+          >
+            {meta}
+          </p>
+        )}
+      </div>
+      {confirming ? (
+        <InlineConfirm
+          prompt={t("repoSettings.deleteQuestion")}
+          actLabel={t("repoSettings.delete")}
+          pending={pending}
+          onCancel={onCancel}
+          onAct={onDelete}
+        />
+      ) : (
+        <>
+          {onEdit && (
+            <Button size="sm" variant="ghost" onClick={onEdit}>
+              {t("common.edit")}
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant="ghost"
+            className="text-destructive hover:text-destructive"
+            aria-label={t("repoSecretsUi.deleteNamed", { name })}
+            onClick={onConfirm}
+          >
+            <TrashIcon />
+          </Button>
+        </>
+      )}
+    </div>
+  );
+}

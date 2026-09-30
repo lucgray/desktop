@@ -1,0 +1,92 @@
+import { useLayoutEffect } from "react";
+import { DIALOG_SCROLL_X_HIDDEN } from "@/components/dialog-scroll";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Skeleton } from "@/components/ui/skeleton";
+import { useGenerateChord } from "@/lib/hotkeys/useGenerateChord";
+import { registerRepoSettingsOpenMarker } from "@/lib/stores/repo-description-generation";
+import { cn } from "@/lib/utils";
+import { useTranslation } from "@/lib/i18n";
+
+/** Six rows: the shortest provider rail (GitLab) offers six sections, and the
+ *  real count isn't knowable until the provider tables load with the chunk. */
+const RAIL_ROW_WIDTHS = ["w-16", "w-20", "w-14", "w-24", "w-12", "w-18"];
+
+/**
+ * The repository-settings dialog's frame while its lazy chunk loads, so the
+ * click paints a dialog instead of nothing and the loaded dialog fills the same
+ * frame rather than arriving from an empty screen. Provider-worded copy (the
+ * description, the rail's section names) lives inside the lazy module, so it
+ * stays skeletal here rather than flashing a label the repo's forge contradicts.
+ */
+export function RepoSettingsDialogFallback({
+  repoPath,
+  onOpenChange,
+}: {
+  repoPath: string;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  // This frame is a dialog-open period like any other, so it carries the marker
+  // too: a description generation settling here would otherwise offer a "View"
+  // deep link that the open dialog's own host drops.
+  useLayoutEffect(() => registerRepoSettingsOpenMarker(repoPath), [repoPath]);
+
+  // The Changes-tab generator must not run behind this frame. A defined `run`
+  // is what arms the hook's swallow at all, and the chord is then swallowed
+  // whenever it may fire (the hook mirrors the global listener's own guards);
+  // `enabled: false` is what keeps it from generating before the real dialog
+  // owns the chord.
+  const generateChord = useGenerateChord({
+    enabled: false,
+    run: () => undefined,
+  });
+
+  return (
+    <Dialog open onOpenChange={onOpenChange}>
+      {/* Frame classes mirror RepoSettingsDialog's DialogContent: the swap to
+          the loaded dialog must not resize or reposition the box. */}
+      <DialogContent
+        className="flex h-150 max-h-[85vh] flex-col sm:max-w-3xl"
+        onKeyDown={generateChord.onKeyDown}
+      >
+        <DialogHeader>
+          <DialogTitle>{t("repoSettings.title")}</DialogTitle>
+          <Skeleton className="h-4 w-2/3" />
+        </DialogHeader>
+        <div className="flex min-h-0 min-w-0 flex-1 gap-4">
+          <div className="w-40 shrink-0 space-y-0.5">
+            {RAIL_ROW_WIDTHS.map((width) => (
+              // Mirrors a rail row's geometry (h-7 row, px-2 label inset); the
+              // loaded rail is taller, since its groups carry headers.
+              <div key={width} className="flex h-7 items-center px-2">
+                <Skeleton className={cn("h-3", width)} />
+              </div>
+            ))}
+          </div>
+          <div
+            aria-busy
+            className={cn(DIALOG_SCROLL_X_HIDDEN, "min-h-0 min-w-0 flex-1")}
+          >
+            {/* aria-busy alone has no text; role="status" gives the busy
+                region words for readers that announce it. */}
+            <span role="status" className="sr-only">
+              {t("repoSettings.loading")}
+            </span>
+            {/* The General section's own loading shape, so fallback → dialog →
+                section reads as one progressive fill, not three layouts. */}
+            <div className="min-w-0 space-y-3">
+              <Skeleton className="h-9 w-full" />
+              <Skeleton className="h-9 w-full" />
+              <Skeleton className="h-20 w-full" />
+            </div>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}

@@ -1,0 +1,852 @@
+import { CheckIcon, MinusIcon } from "@phosphor-icons/react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
+import { toast } from "sonner";
+import { ConfirmDialog } from "@/components/confirm-dialog";
+import { RelativeTime, useRelativeNow } from "@/components/relative-time";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import * as api from "@/lib/git/api";
+import { repoKeys, useBranchDivergence } from "@/lib/git/queries";
+import type { Branch } from "@/lib/git/types";
+import { useRovingRows } from "@/lib/list-keyboard-nav";
+import { errorMessage } from "@/lib/tauri/invoke";
+import { cn } from "@/lib/utils";
+import { useTranslation } from "@/lib/i18n";
+
+type Mode = "archive" | "delete";
+
+/** Candidate windows offered for the "no commits in N days" staleness signal. */
+const AGE_WINDOWS = [30, 60, 90] as const;
+const DAY_MS = 86_400_000;
+
+interface Candidate {
+  branch: Branch;
+  /** Fully merged into the default branch (0 commits it doesn't have). */
+  merged: boolean;
+  /** Label of the merged pull request this branch's name maps to ("#123"), or
+   *  null. Squash and rebase merges leave no ancestor link, so the PR is the
+   *  only evidence they landed. */
+  prMerged: string | null;
+  /** Whole days since the branch tip's commit. */
+  ageDays: number;
+  /** Idle beyond the selected age window. */
+  old: boolean;
+}
+
+/**
+ * What the dialog is entitled to say about the pull-request half of merged
+ * detection: `"unavailable"` — it never ran, so pull requests go unmentioned;
+ * `"pending"` — still reading; `"failed"` — the read failed, which is a coverage
+ * gap worth naming; `"checked"` — read and complete.
+ */
+export type PrCheckState = "unavailable" | "pending" | "failed" | "checked";
+
+/**
+ * Derives that state from the forge capability and the closed-PR query. It takes
+ * `canGh` rather than the query flags alone because a repo whose forge has no
+ * pull requests never STARTS the query: its flags are indistinguishable from a
+ * finished, empty read, and "we looked and found none" is a claim the app hasn't
+ * earned there.
+ *
+ * `isPending` carries the same weight for a query that HAS started: status-pending
+ * means no data yet, which is also how an offline read looks, since react-query's
+ * default `networkMode: "online"` PAUSES the fetch rather than failing it
+ * (`isFetching` false, `isError` false). Without that arm an offline dialog would
+ * claim the pull requests came back clean.
+ */
+export function prCheckStateFrom(
+  canGh: boolean,
+  closedPrs: {
+    isError: boolean;
+    isPending: boolean;
+    isFetching: boolean;
+    isPlaceholderData: boolean;
+  },
+): PrCheckState {
+  if (!canGh) return "unavailable";
+  if (closedPrs.isError) return "failed";
+  if (closedPrs.isPending) return "pending";
+  // Data in hand, but a background refetch or a previous key's rows: still not an
+  // answer about THIS repo's pull requests.
+  if (closedPrs.isFetching || closedPrs.isPlaceholderData) return "pending";
+  return "checked";
+}
+
+/**
+ * How far the worktree read behind the `isInWorktree` exclusion got. That
+ * predicate answers false for every branch until the read lands, so its state is
+ * what the dialog holds on: `"pending"` — no answer yet, and a list painted from
+ * it could offer a branch the settled answer excludes; `"failed"` — no answer is
+ * coming, a coverage gap the dialog names; `"checked"` — the exclusion is real.
+ */
+export type WorktreeCheckState = "pending" | "failed" | "checked";
+
+/** Derives that state from the worktree query. Absent data covers both a read in
+ *  flight and one that never started — the same thing to a caller that has no
+ *  answer to act on.
+ *
+ *  A PARKED read (react-query's offline mode) counts as failed rather than
+ *  pending: nothing will resolve it on its own, so the list must paint with the
+ *  caveat instead of waiting out the session. `userWorktreesOptions` sets
+ *  `networkMode: "always"` for that local git read — shared by the hook and by
+ *  the switcher's imperative `fetchQuery` — which should keep that arm
+ *  unreachable; this is the net for a caller that doesn't.
+ *
+ *  Placeholder data is a stand-in for another key's rows, never an answer about
+ *  this repo, so it reads as pending. That query sets no placeholder today; this
+ *  is the same net. */
+export function worktreeCheckStateFrom(q: {
+  isError: boolean;
+  fetchStatus: "fetching" | "paused" | "idle";
+  isPlaceholderData: boolean;
+  data: unknown;
+}): WorktreeCheckState {
+  if (q.isError) return "failed";
+  // Data in hand answers the exclusion even while a refetch is parked behind it.
+  if (q.data !== undefined && !q.isPlaceholderData) return "checked";
+  if (q.fetchStatus === "paused") return "failed";
+  return "pending";
+}
+
+/** Why a stale branch can still be off the list, per mode — the empty state
+ *  names it rather than claiming nothing is stale, which the branches sitting on
+ *  disk would contradict. */
+/** The empty state's merged clause, per PR-check outcome. It names pull requests
+ *  only where they were actually read: a failed read gets its own caveat below,
+ *  and a check that never ran says nothing about them either way. The `pending`
+ *  arm is unreachable — `checkingMerged` paints the skeleton over this empty
+ *  state — and mirrors `checked` only to keep the record total. */
+/** What the candidate list is waiting on, per outstanding read. They settle
+ *  independently, so the line names the one actually running rather than
+ *  whichever came first. */
+/** The one-line status above the candidate list while a check it depends on
+ *  runs. A parked check has no progress to report, so it names what it's waiting
+ *  on rather than implying the read is underway — and only the pull-request half
+ *  can park, since the other reads work on local data. */
+function CheckingLine({
+  what,
+  paused,
+}: {
+  what: "merged" | "worktrees" | "rules";
+  paused: boolean;
+}) {
+  const { t } = useTranslation();
+  return (
+    <p className="px-1 py-1 text-[11px] text-muted-foreground">
+      {paused
+        ? t("cleanupBranches.waitingPr")
+        : t(`cleanupBranches.checking${what[0].toUpperCase()}${what.slice(1)}` as "cleanupBranches.checkingMerged" | "cleanupBranches.checkingWorktrees" | "cleanupBranches.checkingRules")}
+    </p>
+  );
+}
+
+/** First paint while a check the list depends on runs. An animated skeleton over
+ *  a parked pull-request read would be a false activity signal, so a parked read
+ *  paints nothing here — the status region above already names what it's waiting
+ *  on. */
+function CheckingPlaceholder({ paused }: { paused: boolean }) {
+  if (paused) return null;
+  return (
+    <div className="space-y-1 py-2" aria-busy>
+      {[0, 1, 2].map((i) => (
+        <div key={i} className="h-7 animate-pulse rounded-none bg-muted/50" />
+      ))}
+    </div>
+  );
+}
+
+/** The one state badge a row can carry, in precedence order. Text carries the
+ *  meaning — the color never stands alone. */
+function RowBadge({
+  error,
+  merged,
+  prMerged,
+}: {
+  error: string | undefined;
+  merged: boolean;
+  prMerged: string | null;
+}) {
+  const { t } = useTranslation();
+  if (error)
+    return (
+      <span className="text-destructive" title={error}>
+        {t("cleanupBranches.failed")}
+      </span>
+    );
+  if (merged) return <span className="text-merged">{t("cleanupBranches.merged")}</span>;
+  if (prMerged)
+    return (
+      <span
+        className="text-merged"
+        title={t("cleanupBranches.mergedViaPr", { pr: prMerged })}
+      >
+        {t("cleanupBranches.mergedPrBadge", { pr: prMerged })}
+      </span>
+    );
+  return null;
+}
+
+/**
+ * Bulk "clean up branches" dialog, launched from the branch switcher. Gathers
+ * local branches that are stale — **merged into the default branch** or **idle
+ * past the selected age window** — and lets the user Archive (reversible hide via
+ * the `gitdesktopArchived` flag) or Delete (`git branch -D`) the selected set in
+ * one pass. The current branch, the default branch, `gd/session/*` branches, and
+ * branches checked out in another worktree are never candidates — except that
+ * Archive takes back a branch whose worktree is already being removed; Archive
+ * also skips already-archived branches, and Delete skips rule-protected ones.
+ *
+ * Merged detection has two sources: branch divergence (`ahead === 0`, no extra
+ * backend) and the switcher's PR map, which catches the squash and rebase merges
+ * divergence can't see. The PR side matches by branch NAME only, so it badges a
+ * row but never pre-selects it for deletion.
+ */
+export function CleanupBranchesDialog({
+  repoPath,
+  open,
+  onClose,
+  branches,
+  defaultBranch,
+  currentBranch,
+  isProtected,
+  isInWorktree,
+  isWorktreeRemoving,
+  worktreeCheckState,
+  rulesSettling,
+  prMergedByBranch,
+  prCheckState,
+  prCheckPaused,
+}: {
+  repoPath: string;
+  open: boolean;
+  onClose: () => void;
+  branches: Branch[];
+  defaultBranch: string | null;
+  currentBranch: string | null;
+  /** True when a branch is blocked from deletion by an effective branch rule. */
+  isProtected: (name: string) => boolean;
+  /** True when a branch is checked out in another worktree — git can't delete it,
+   *  and archiving would hide a branch that's in use, so both modes drop it
+   *  unless {@link isWorktreeRemoving} takes it back. */
+  isInWorktree: (name: string) => boolean;
+  /** True when the worktree holding this branch is already being removed, read
+   *  from the removal store rather than the worktree list, which goes on listing
+   *  that worktree until the removal finishes. Archive takes it back — the
+   *  branch is on its way out of use — while Delete keeps excluding it: git
+   *  refuses `branch -D` on a checked-out branch, and the removal can still
+   *  fail. */
+  isWorktreeRemoving: (name: string) => boolean;
+  /** Whether {@link isInWorktree} has an answer yet. An advisory read that would
+   *  have refused an action must be held on, never acted around: while this is
+   *  `"pending"` the predicate is a stand-in that excludes nothing, so the list
+   *  neither paints nor pre-selects. (`useEffectiveBranchRulesSettling` carries
+   *  the same contract for the branch rules behind `isProtected`.) */
+  worktreeCheckState: WorktreeCheckState;
+  /** Whether {@link isProtected} has an answer yet — the branch-rules half of
+   *  that same contract, from `useEffectiveBranchRulesSettling`. While true the
+   *  effective rules stand in as empty, so the predicate excludes nothing and
+   *  the list neither paints nor pre-selects. A FAILED rules read is
+   *  deliberately not held on: it falls open inside that hook, since nothing
+   *  would ever arrive to lift the hold. */
+  rulesSettling: boolean;
+  /** Branch name → the label of the merged pull request it maps to ("#123").
+   *  Name-keyed and limited to the PRs the app has fetched, so it labels rows,
+   *  never selects them. */
+  prMergedByBranch: Map<string, string>;
+  /** How far the pull-request half of merged detection got. Every line that
+   *  mentions pull requests renders off this: a read that failed says so, and
+   *  one that never ran leaves them out rather than passing for a clean check. */
+  prCheckState: PrCheckState;
+  /** True when the pull-request read is parked on a missing connection rather
+   *  than in flight. It only retitles the waiting copy — the check itself
+   *  resumes on its own once the connection returns. */
+  prCheckPaused: boolean;
+}) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  // Shared 30s clock: the idle-past-the-window classification below must
+  // re-evaluate as time passes, and a render-position `Date.now()` is invisible
+  // to the React Compiler, so a branch crossing the window never becomes stale.
+  const now = useRelativeNow();
+  const [mode, setMode] = useState<Mode>("archive");
+  const [windowDays, setWindowDays] = useState<number>(60);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  // Batch progress + per-branch failures (kept visible so a partial run is honest).
+  const [progress, setProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
+  const [failed, setFailed] = useState<Map<string, string>>(new Map());
+  const running = progress !== null;
+
+  // Merged-into-default comes straight from divergence: a branch with 0 commits
+  // the default branch lacks is fully contained in it. Fetched only while open.
+  const divergence = useBranchDivergence(repoPath, defaultBranch, open);
+  const mergedSet = useMemo(
+    () =>
+      new Set(
+        (divergence.data ?? [])
+          // ahead 0 = no commits the default branch lacks, AND behind > 0 = the
+          // default has since moved past it. Requiring behind > 0 keeps a
+          // brand-new branch still sitting on the default tip (ahead 0, behind 0)
+          // from being mislabeled "merged".
+          .filter((d) => d.ahead === 0 && d.behind > 0)
+          .map((d) => d.name),
+      ),
+    [divergence.data],
+  );
+
+  // Branches eligible for cleanup, before the per-mode exclusions. Never the
+  // current or default branch, never the app-internal session branches.
+  const stale = useMemo(() => {
+    const out: Candidate[] = [];
+    for (const b of branches) {
+      if (
+        b.isCurrent ||
+        b.name === currentBranch ||
+        b.name === defaultBranch ||
+        b.name.startsWith("gd/session/")
+      )
+        continue;
+      const ts = Date.parse(b.lastCommitDate);
+      const ageDays = Number.isFinite(ts) ? Math.floor((now - ts) / DAY_MS) : 0;
+      const merged = mergedSet.has(b.name);
+      const prMerged = prMergedByBranch.get(b.name) ?? null;
+      const old = ageDays >= windowDays;
+      if (merged || old || prMerged)
+        out.push({ branch: b, merged, prMerged, ageDays, old });
+    }
+    return out;
+  }, [
+    branches,
+    currentBranch,
+    defaultBranch,
+    mergedSet,
+    now,
+    prMergedByBranch,
+    windowDays,
+  ]);
+
+  // Mode-specific candidates. Archive hides — drop already-archived branches
+  // (a no-op) and ones checked out in another worktree (in use; the row menu
+  // refuses those too), except where that worktree is already being removed.
+  // Delete is permanent — drop rule-protected branches (they'd fail anyway),
+  // but keep archived ones (a final sweep may want them).
+  const candidates = useMemo(() => {
+    const list =
+      mode === "archive"
+        ? stale.filter(
+            (c) =>
+              !c.branch.archived &&
+              (!isInWorktree(c.branch.name) ||
+                isWorktreeRemoving(c.branch.name)),
+          )
+        : stale.filter(
+            (c) => !isProtected(c.branch.name) && !isInWorktree(c.branch.name),
+          );
+    // Merged first (the safest to clean), then oldest first.
+    return list.sort((a, b) => {
+      if (a.merged !== b.merged) return a.merged ? -1 : 1;
+      return b.ageDays - a.ageDays;
+    });
+  }, [stale, mode, isProtected, isInWorktree, isWorktreeRemoving]);
+
+  // No `tabAdvances`: Tab must keep reaching the dialog's other controls (mode,
+  // window, select-all, footer buttons).
+  const nav = useRovingRows({
+    items: candidates,
+    rowKey: (c) => c.branch.name,
+  });
+
+  // Until the worktree read lands, `isInWorktree` excludes nothing, so every
+  // candidate below is provisional — the list stays behind the skeleton and the
+  // selection stays unseeded rather than offering a row the answer would remove.
+  const checkingWorktrees = worktreeCheckState === "pending";
+  // Settling rules hold exactly as a pending worktree read does — `isProtected`
+  // excludes nothing until they land. Held in BOTH modes: rules settle within
+  // moments of opening the repo while this dialog opens later, and the mode can
+  // flip while it is open, so a delete-only hold buys nothing and can miss.
+  const holdingReads = checkingWorktrees || rulesSettling;
+
+  // Re-check every candidate whenever the set itself changes — opening, switching
+  // mode, adjusting the window, or divergence resolving to reveal merged branches.
+  const candidateNames = useMemo(
+    () => candidates.map((c) => c.branch.name),
+    [candidates],
+  );
+  // Pre-checked rows: the ones this repo's own history proves are done with.
+  // A row that only a pull request calls merged is matched by branch NAME, which
+  // can't confirm the tip is what that PR merged, so it stays unchecked until the
+  // user says otherwise.
+  const autoSelectNames = useMemo(
+    () => candidates.filter((c) => c.merged || c.old).map((c) => c.branch.name),
+    [candidates],
+  );
+  // Re-seed the selection only when the SET of pre-checked names actually changes,
+  // keyed on their joined value rather than the array identity. A parent
+  // re-render that yields an equal-but-new `candidates` array — a fresh
+  // `isProtected` closure, a no-op branch refetch — would otherwise re-run this
+  // and silently wipe the user's deselections. Branch names can't contain
+  // newlines (git ref rules), so the join is unambiguous — and it joins a SORTED
+  // copy, because the render order shifts as ages tick on the shared 30s clock
+  // and a pure reorder must not read as a new set.
+  const autoSelectKey = [...autoSelectNames].sort().join("\n");
+  useEffect(() => {
+    if (running) return; // don't clobber a batch mid-flight
+    // Nothing may be pre-selected off a stand-in exclusion: the seed re-runs
+    // once those reads land and the excluded rows are really gone.
+    if (holdingReads) return;
+    setSelected(new Set(autoSelectKey ? autoSelectKey.split("\n") : []));
+  }, [autoSelectKey, running, holdingReads]);
+
+  // First load: a merged signal still in flight and nothing has surfaced yet.
+  // Age-based candidates already show instantly (branch data is cached), so this
+  // only gates the truly-empty first paint.
+  const checkingMerged =
+    (Boolean(defaultBranch) && divergence.isLoading) ||
+    prCheckState === "pending";
+  // Parked matters only while the merged check is still outstanding: a parked
+  // FIRST fetch keeps `checkingMerged` true (prCheckState "pending"), while a
+  // parked background refetch over settled data has nothing to wait for — and
+  // its connection copy would answer for the local reads still running.
+  const pausedMergedCheck = checkingMerged && prCheckPaused;
+  // Which of the status region's lines are DRAWN — it announces more than it
+  // shows: the check line stays sr-only on the empty first paint (the skeleton
+  // is the visual signal there).
+  const stillChecking = checkingMerged || holdingReads;
+  const showCheckLine =
+    stillChecking && (pausedMergedCheck || candidates.length > 0);
+  const showPrFailedLine = prCheckState === "failed" && candidates.length > 0;
+  // Unlike the pull-request caveat, this one shows on an empty list too: a
+  // failed read leaves the exclusion vacuous, which the empty state's own copy
+  // would otherwise assert as real.
+  const worktreeCheckFailed = worktreeCheckState === "failed";
+  // A provisional list is no list: the skeleton covers the whole exclusion wait,
+  // not just the empty first paint the merged check gates.
+  const showSkeleton =
+    holdingReads || (checkingMerged && candidates.length === 0);
+
+  const selectedCount = candidateNames.filter((n) => selected.has(n)).length;
+  const allChecked =
+    candidates.length > 0 && selectedCount === candidates.length;
+  const someChecked = selectedCount > 0;
+
+  function toggle(name: string) {
+    if (running) return;
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  }
+
+  function toggleAll() {
+    if (running) return;
+    setSelected(allChecked ? new Set() : new Set(candidateNames));
+  }
+
+  // Switching mode or window opens a fresh context, so drop any per-branch
+  // failures left from a previous batch — otherwise a "failed" badge from a
+  // delete attempt would bleed onto the same branch in archive mode. Done in the
+  // handlers (not an effect) so the post-batch refetch keeps the just-failed rows
+  // flagged.
+  function changeMode(next: Mode) {
+    if (running) return;
+    setMode(next);
+    setFailed(new Map());
+  }
+
+  function changeWindow(next: number) {
+    if (running) return;
+    setWindowDays(next);
+    setFailed(new Map());
+  }
+
+  async function runBatch() {
+    const names = candidateNames.filter((n) => selected.has(n));
+    if (names.length === 0) return;
+    const fails = new Map<string, string>();
+    setFailed(new Map());
+    setProgress({ done: 0, total: names.length });
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
+      try {
+        if (mode === "archive") {
+          await api.gitSetBranchArchived(repoPath, name, true);
+        } else if (isProtected(name)) {
+          // Defensive: `candidates` already excludes protected names in delete
+          // mode off this same predicate, so this arm is unreachable today — it
+          // exists so a future change to that filter can't silently reopen
+          // bulk-deleting a protected branch; failure rows beat silent success.
+          fails.set(name, t("cleanupBranches.protectedByRule"));
+        } else {
+          await api.gitDeleteBranch(repoPath, name);
+        }
+      } catch (e) {
+        fails.set(name, errorMessage(e));
+      }
+      setProgress({ done: i + 1, total: names.length });
+    }
+    // One reconciliation for the whole batch (branch mutations aren't optimistic
+    // here) — refreshes the switcher list, divergence, and archived section.
+    await queryClient.invalidateQueries({
+      queryKey: repoKeys.branches(repoPath),
+    });
+    await queryClient.invalidateQueries({
+      queryKey: ["repo", repoPath, "divergence"],
+    });
+    setProgress(null);
+
+    const ok = names.length - fails.size;
+    const verb = mode === "archive" ? t("cleanupBranches.archived") : t("cleanupBranches.deleted");
+    if (fails.size === 0) {
+      toast.success(t("cleanupBranches.batchSucceeded", { verb, count: ok }));
+      onClose();
+      return;
+    }
+    setFailed(fails);
+    // The successful ones drop out of the candidate list on refetch, leaving the
+    // failures on screen with their reason; the user can retry them.
+    toast.error(t("cleanupBranches.batchPartial", { verb, succeeded: ok, failed: fails.size }));
+  }
+
+  function onPrimary() {
+    if (mode === "delete") setConfirmDelete(true);
+    else void runBatch();
+  }
+
+  const verb = mode === "archive" ? t("cleanupBranches.archive") : t("cleanupBranches.delete");
+  const gerund = mode === "archive" ? t("cleanupBranches.archiving") : t("cleanupBranches.deleting");
+  const primaryLabel = running
+    ? `${gerund}… ${progress?.done ?? 0}/${progress?.total ?? 0}`
+    : t("cleanupBranches.modeCount", { verb, count: selectedCount });
+  // The mode's own exclusions can empty the list while stale branches remain, so
+  // both empty states name the exclusion instead of reporting none. One string
+  // for the prose and the live region — a reader and a listener get the same
+  // sentence.
+  const allStaleExcluded = candidates.length === 0 && stale.length > 0;
+  const emptyStatus = allStaleExcluded
+    ? t("cleanupBranches.staleExcluded", { count: stale.length, verb, reason: mode === "archive" ? t("cleanupBranches.excludedArchive") : t("cleanupBranches.excludedDelete") })
+    : t("cleanupBranches.noStaleBranches");
+
+  return (
+    <>
+      <Dialog
+        open={open}
+        onOpenChange={(o) => {
+          if (!o && !running) onClose();
+        }}
+      >
+        <DialogContent className="flex flex-col gap-4 sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t("cleanupBranches.title")}</DialogTitle>
+            <DialogDescription>
+              {t("cleanupBranches.localBranchesAlreadyMerged")} {" "}
+              <span className="font-mono">
+                {defaultBranch ?? t("cleanupBranches.defaultBranch")}
+              </span>
+              {/* The clause claims pull requests contribute, so it renders only
+                  while that is true or underway — a FAILED check's note below
+                  says the opposite, and the two must never disagree. */}
+              {prCheckState === "checked" || prCheckState === "pending"
+                ? ` — ${t("cleanupBranches.mergedIncludingPr")} — ${t("cleanupBranches.noCommitsRecently")}. `
+                : `, ${t("cleanupBranches.noCommitsRecently")}. `}
+              {mode === "archive"
+                ? t("cleanupBranches.archiveDescription")
+                : t("cleanupBranches.deleteDescription")}
+            </DialogDescription>
+          </DialogHeader>
+
+          {/* Mode + age controls */}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div
+              className="inline-flex rounded-none ring-1 ring-border"
+              role="group"
+              aria-label={t("cleanupBranches.action")}
+            >
+              {(["archive", "delete"] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  disabled={running}
+                  aria-pressed={mode === m}
+                  onClick={() => changeMode(m)}
+                  className={cn(
+                    "px-3 py-1 text-xs capitalize transition-colors first:border-r first:border-border disabled:opacity-50",
+                    mode === m
+                      ? m === "delete"
+                        ? "bg-destructive text-white"
+                        : "bg-primary text-primary-foreground"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {m === "archive" ? t("cleanupBranches.archive") : t("cleanupBranches.delete")}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <span>{t("cleanupBranches.idleFor")}</span>
+              <div
+                className="inline-flex rounded-none ring-1 ring-border"
+                role="group"
+                aria-label={t("cleanupBranches.inactivityWindow")}
+              >
+                {AGE_WINDOWS.map((d) => (
+                  <button
+                    key={d}
+                    type="button"
+                    disabled={running}
+                    aria-pressed={windowDays === d}
+                    onClick={() => changeWindow(d)}
+                    className={cn(
+                      "px-2 py-1 tabular-nums transition-colors not-last:border-r not-last:border-border disabled:opacity-50",
+                      windowDays === d
+                        ? "bg-primary text-primary-foreground"
+                        : "hover:text-foreground",
+                    )}
+                  >
+                    {d}
+                  </button>
+                ))}
+              </div>
+              <span>{t("cleanupBranches.days")}</span>
+            </div>
+          </div>
+
+          {/* Select-all header — a tri-state indicator (the vendored Checkbox
+              has no indeterminate visual, and components/ui/ is off-limits).
+              Withheld while the list is provisional — it would count rows an
+              outstanding exclusion read may still remove. */}
+          {candidates.length > 0 && !holdingReads && (
+            <button
+              type="button"
+              disabled={running}
+              onClick={toggleAll}
+              aria-label={allChecked ? t("cleanupBranches.deselectAll") : t("cleanupBranches.selectAll")}
+              className="flex items-center gap-2 text-xs text-muted-foreground disabled:opacity-50"
+            >
+              <span
+                aria-hidden
+                className={cn(
+                  "flex size-4 shrink-0 items-center justify-center rounded-none border border-input",
+                  (allChecked || someChecked) &&
+                    "border-primary bg-primary text-primary-foreground",
+                )}
+              >
+                {allChecked ? (
+                  <CheckIcon className="size-3.5" />
+                ) : someChecked ? (
+                  <MinusIcon className="size-3.5" />
+                ) : null}
+              </span>
+              <span>
+                {t("cleanupBranches.selectedCount", { selected: selectedCount, total: candidates.length })}
+              </span>
+            </button>
+          )}
+
+          {/* Merged-detection status + the list it describes. `gap` (not
+              `space-y`) spaces the two, so the status region contributes none
+              while it is sr-only and therefore out of flow. */}
+          <div className="flex flex-col gap-0.5">
+            {/* Mounted unconditionally: a live region created together with its
+                text announces unreliably, so the region pre-exists and only its
+                CONTENT changes. `sr-only` keeps the silent states out of layout.
+                No aria-busy — on a live region it tells a screen reader to hold
+                announcements back; it belongs on the skeleton, which sits
+                outside this region. */}
+            <div
+              role="status"
+              className={cn(
+                "flex flex-col gap-0.5",
+                !showCheckLine &&
+                  !showPrFailedLine &&
+                  !worktreeCheckFailed &&
+                  "sr-only",
+              )}
+            >
+              {/* A parked FIRST pull-request fetch is still waiting, so it keeps
+                  the waiting line; a parked refetch over settled data falls
+                  through to the resting line, which reports the count and claims
+                  nothing about the check — what a `role="status"` region can
+                  honestly repeat on every mode and window change. */}
+              {stillChecking ? (
+                (() => {
+                  // A RUNNING local read outranks the parked merged fetch — the
+                  // line names the one actually running, and the waiting copy
+                  // shows only when the parked check is the sole outstanding one.
+                  const what = ((): "merged" | "worktrees" | "rules" => {
+                    switch (true) {
+                      case checkingMerged && !pausedMergedCheck:
+                        return "merged";
+                      case checkingWorktrees:
+                        return "worktrees";
+                      case rulesSettling:
+                        return "rules";
+                      default:
+                        return "merged";
+                    }
+                  })();
+                  return (
+                    <CheckingLine
+                      what={what}
+                      paused={
+                        pausedMergedCheck &&
+                        !checkingWorktrees &&
+                        !rulesSettling
+                      }
+                    />
+                  );
+                })()
+              ) : (
+                <p className="sr-only">
+                  {candidates.length === 0
+                    ? emptyStatus
+                    : t("cleanupBranches.branchesToReview", { count: candidates.length })}
+                </p>
+              )}
+              {/* Announced even where the empty state carries it in prose: only
+                  the region's copy reaches a screen reader as it happens. */}
+              {prCheckState === "failed" ? (
+                <p
+                  className={
+                    showPrFailedLine
+                      ? "px-1 py-1 text-[11px] text-muted-foreground"
+                      : "sr-only"
+                  }
+                >
+                  {t("cleanupBranches.prCheckFailed")}
+                </p>
+              ) : null}
+              {worktreeCheckFailed ? (
+                <p className="px-1 py-1 text-[11px] text-muted-foreground">
+                  {t("cleanupBranches.worktreeCheckFailed")}
+                </p>
+              ) : null}
+            </div>
+
+            {/* List / skeleton / empty */}
+            {showSkeleton ? (
+              // A running local read (worktrees, branch rules) is real activity,
+              // so it earns the skeleton even while the pull-request fetch sits
+              // parked.
+              <CheckingPlaceholder
+                paused={pausedMergedCheck && !holdingReads}
+              />
+            ) : candidates.length === 0 ? (
+              <p className="py-6 text-center text-xs text-muted-foreground">
+                {allStaleExcluded ? (
+                  emptyStatus
+                ) : (
+                  <>
+                    {t("cleanupBranches.noStaleBranchesInto")} {" "}
+                    <span className="font-mono">
+                      {defaultBranch ?? t("cleanupBranches.defaultBranch")}
+                    </span>
+                    {t("cleanupBranches.noBranchesIdle", { days: windowDays })}
+                  </>
+                )}
+                {/* Carried by BOTH arms: an excluded-only list is just as
+                    incomplete when the pull-request read failed. */}
+                {prCheckState === "failed"
+                  ? ` ${t("cleanupBranches.prCheckFailedShort")}`
+                  : null}
+              </p>
+            ) : (
+              // py-2 contains the Checkbox touch-target's 8px vertical bleed
+              // (after:-inset-y-2) — without it the pseudo adds scrollable
+              // overflow and Windows draws a scrollbar for even one row.
+              <div
+                className="-mx-1 max-h-[45vh] space-y-0.5 overflow-x-hidden overflow-y-auto px-1 py-2"
+                onKeyDown={nav.onRowKeyDown}
+              >
+                {candidates.map((c) => {
+                  const name = c.branch.name;
+                  const checked = selected.has(name);
+                  const err = failed.get(name);
+                  return (
+                    <label
+                      key={name}
+                      className={cn(
+                        "flex cursor-pointer items-center gap-2 rounded-none px-1.5 py-1.5 text-xs transition-colors hover:bg-accent",
+                        nav.isActive(c) && "bg-accent",
+                      )}
+                    >
+                      <Checkbox
+                        {...nav.rowProps(c)}
+                        checked={checked}
+                        disabled={running}
+                        onCheckedChange={() => toggle(name)}
+                      />
+                      <span className="min-w-0 flex-1 truncate font-mono">
+                        {name}
+                      </span>
+                      <span className="flex shrink-0 items-center gap-2">
+                        <RowBadge
+                          error={err}
+                          merged={c.merged}
+                          prMerged={c.prMerged}
+                        />
+                        <span className="tabular-nums text-muted-foreground">
+                          <RelativeTime date={c.branch.lastCommitDate} />
+                        </span>
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={running}
+              onClick={onClose}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button
+              type="button"
+              variant={mode === "delete" ? "destructive" : "default"}
+              disabled={selectedCount === 0 || running || holdingReads}
+              onClick={onPrimary}
+            >
+              {primaryLabel}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <ConfirmDialog
+        open={confirmDelete}
+        onCancel={() => setConfirmDelete(false)}
+        title={t("cleanupBranches.deleteBranchesTitle")}
+        body={
+          <>
+            {t("cleanupBranches.deleteBranchesDescription", { count: selectedCount })}
+          </>
+        }
+        confirmLabel={t("cleanupBranches.deleteCount", { count: selectedCount })}
+        confirmVariant="destructive"
+        onConfirm={() => {
+          setConfirmDelete(false);
+          void runBatch();
+        }}
+      />
+    </>
+  );
+}

@@ -1,0 +1,843 @@
+import { CaretLeftIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react";
+import { useMemo, useState } from "react";
+import { toast } from "sonner";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { LabeledGroup } from "@/components/form/labeled-group";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
+import { Switch } from "@/components/ui/switch";
+import { useTranslation, type TranslationKey } from "@/lib/i18n";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  useCheckRunApps,
+  useCreateRuleset,
+  useDeleteRuleset,
+  useRuleset,
+  useRulesets,
+  useSetRulesetEnforcement,
+  useUpdateRuleset,
+} from "@/lib/git/queries";
+import type { RulesetEnforcement, RulesetFull } from "@/lib/git/types";
+import { toastError } from "@/lib/toast";
+import { AsyncErrorCard, AsyncListBody, InlineConfirm } from "./parts";
+
+const ENFORCEMENTS: RulesetEnforcement[] = ["active", "evaluate", "disabled"];
+
+function enforcementKey(value: string): TranslationKey | null {
+  if (value === "active") return "repoRulesUi.enforcement_active";
+  if (value === "evaluate") return "repoRulesUi.enforcement_evaluate";
+  if (value === "disabled") return "repoRulesUi.enforcement_disabled";
+  return null;
+}
+
+/** Trigger labels for the enforcement selects — without them Base UI shows the
+ *  raw value ("evaluate"). */
+const ADMIN_HINT_KEY = "repoRulesUi.adminRequired" as const;
+
+/** Rule types we model in the editor. Any others on an edited ruleset are
+ *  preserved untouched (so advanced rules aren't dropped). */
+const MANAGED_RULE_TYPES = [
+  "pull_request",
+  "required_status_checks",
+  "non_fast_forward",
+  "deletion",
+  "required_linear_history",
+  "required_signatures",
+];
+
+interface Draft {
+  name: string;
+  enforcement: RulesetEnforcement;
+  refScope: "default" | "all" | "custom";
+  customPatterns: string;
+  requirePr: boolean;
+  approvals: number;
+  dismissStale: boolean;
+  codeOwner: boolean;
+  lastPush: boolean;
+  requireChecks: boolean;
+  checkContexts: string;
+  strictChecks: boolean;
+  blockForcePush: boolean;
+  restrictDeletions: boolean;
+  linearHistory: boolean;
+  requireSignatures: boolean;
+}
+
+const BLANK: Draft = {
+  name: "",
+  enforcement: "active",
+  refScope: "default",
+  customPatterns: "",
+  requirePr: false,
+  approvals: 1,
+  dismissStale: false,
+  codeOwner: false,
+  lastPush: false,
+  requireChecks: false,
+  checkContexts: "",
+  strictChecks: false,
+  blockForcePush: false,
+  restrictDeletions: false,
+  linearHistory: false,
+  requireSignatures: false,
+};
+
+/** The one-per-line textareas split on newlines only, never commas: a check
+ *  context can carry one because GitHub Actions builds a matrix job's name by
+ *  joining its values with ", ", and a ref pattern can carry one because git
+ *  permits commas in refnames. Splitting there would save entries that nothing
+ *  ever matches. */
+const splitNonEmptyLines = (s: string) =>
+  s
+    .split(/\r?\n/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+function rulesetToDraft(rs: RulesetFull): Draft {
+  // Stored JSON, checked at the array AND the element: this runs in a useMemo on
+  // the render path, where a throw reaches no toast — and the patterns below are
+  // string-replaced.
+  const storedInclude = rs.conditions?.ref_name?.include;
+  const include = Array.isArray(storedInclude)
+    ? storedInclude.filter((p): p is string => typeof p === "string")
+    : [];
+  const refScope = include.includes("~DEFAULT_BRANCH")
+    ? "default"
+    : include.includes("~ALL")
+      ? "all"
+      : "custom";
+  const rules = storedRules(rs);
+  const byType = (t: string) => rules.find((r) => r.type === t);
+  const pr = byType("pull_request")?.parameters ?? {};
+  const checks = byType("required_status_checks")?.parameters ?? {};
+  // The number Input seeds only from a whole count of 0 or more; anything else
+  // (NaN, a fraction, Infinity, a negative) falls back to 1. draftToBody refuses
+  // anything but a whole 0-10 on save, so no rejected shape reaches the wire.
+  const approvals = Number(pr.required_approving_review_count ?? 1);
+  return {
+    name: rs.name ?? "",
+    enforcement: (rs.enforcement as RulesetEnforcement) ?? "active",
+    refScope,
+    customPatterns:
+      refScope === "custom"
+        ? include.map((p) => p.replace(/^refs\/heads\//, "")).join("\n")
+        : "",
+    requirePr: !!byType("pull_request"),
+    approvals: Number.isInteger(approvals) && approvals >= 0 ? approvals : 1,
+    dismissStale: !!pr.dismiss_stale_reviews_on_push,
+    codeOwner: !!pr.require_code_owner_review,
+    lastPush: !!pr.require_last_push_approval,
+    requireChecks: !!byType("required_status_checks"),
+    checkContexts: storedCheckEntries(rs)
+      .map((c) => c.context)
+      .join("\n"),
+    strictChecks: !!checks.strict_required_status_checks_policy,
+    blockForcePush: !!byType("non_fast_forward"),
+    restrictDeletions: !!byType("deletion"),
+    linearHistory: !!byType("required_linear_history"),
+    requireSignatures: !!byType("required_signatures"),
+  };
+}
+
+/** The ref-name include list each scope sends: the two fixed scopes are
+ *  GitHub's own tokens; "custom" qualifies bare patterns as branch refs. */
+const REF_INCLUDES: Record<Draft["refScope"], (d: Draft) => string[]> = {
+  default: () => ["~DEFAULT_BRANCH"],
+  all: () => ["~ALL"],
+  custom: (d) =>
+    splitNonEmptyLines(d.customPatterns).map((p) =>
+      p.startsWith("refs/") ? p : `refs/heads/${p}`,
+    ),
+};
+
+type StoredRule = NonNullable<RulesetFull["rules"]>[number];
+
+/** The stored rules, normalized: a non-array `rules` or a null element throws on
+ *  the render path, where the seed runs inside a useMemo with no toast to catch
+ *  it. Neither shape is reachable from GitHub, which types every rule — and a
+ *  typeless element is unusable anyway, since the editor and the unmodeled-rule
+ *  `extra` pass both key on `type`. */
+const storedRules = (original: RulesetFull | undefined): StoredRule[] => {
+  const rules = original?.rules;
+  return Array.isArray(rules)
+    ? rules.filter((r) => typeof r?.type === "string")
+    : [];
+};
+
+/** The stored parameters of one rule on the ruleset being edited. A save is a full
+ *  PUT replace, so every managed rule is rebuilt FROM these rather than from the
+ *  draft alone — the draft models a subset of each rule's fields. */
+const storedParameters = (original: RulesetFull | undefined, type: string) =>
+  storedRules(original).find((r) => r.type === type)?.parameters;
+
+/** The stored required-status-check entries — the frontend's one reader of that
+ *  raw array (the branch-rules surface reads it again in `github/rulesets.rs`),
+ *  so the seed, the repeat check and the save can't diverge on its shape.
+ *  Contexts are trimmed here and blank ones dropped, matching
+ *  `splitNonEmptyLines` on both axes: the save looks a stored entry up BY this
+ *  context, so an untrimmed " ci " would miss the lookup for the "ci" its own
+ *  textarea line round-trips and rebuild the entry without its `integration_id`
+ *  pin. A blank entry names no check and would seed an invisible line that still
+ *  counts toward the repeated-context hint (unmodeled RULES ride along via
+ *  `extra`). A non-array value — never seen from GitHub, whose schema always
+ *  sends an array — normalizes to empty instead of blocking the editor. */
+const storedCheckEntries = (
+  original: RulesetFull | undefined,
+): ({ context: string } & Record<string, unknown>)[] => {
+  const stored = storedParameters(
+    original,
+    "required_status_checks",
+  )?.required_status_checks;
+  if (!Array.isArray(stored)) return [];
+  return stored.flatMap((entry) => {
+    if (typeof entry?.context !== "string") return [];
+    const context = entry.context.trim();
+    // Spread first: an entry's unmodeled fields (`integration_id`) are the whole
+    // reason the save reuses it rather than rebuilding from the context alone.
+    return context === "" ? [] : [{ ...entry, context }];
+  });
+};
+
+/** Whether the stored ruleset requires one check context through several entries.
+ *  Those usually differ only by their app pin (`integration_id`), which the pin lines
+ *  beneath the hint name when any entry carries one — repeats with no pin at all get
+ *  the hint alone. */
+const hasRepeatedCheckContexts = (original: RulesetFull | undefined) => {
+  const contexts = storedCheckEntries(original).map((c) => c.context);
+  return new Set(contexts).size !== contexts.length;
+};
+
+/** The stored check entries that pin their context to one app, in stored order.
+ *  `integration_id` is unmodeled JSON off the wire, so the number check is a type
+ *  guard rather than a formality. */
+const pinnedCheckEntries = (original: RulesetFull | undefined) =>
+  storedCheckEntries(original).flatMap((entry) =>
+    typeof entry.integration_id === "number" &&
+    Number.isFinite(entry.integration_id)
+      ? [{ context: entry.context, integrationId: entry.integration_id }]
+      : [],
+  );
+
+function draftToBody(
+  d: Draft,
+  original?: RulesetFull,
+): Record<string, unknown> {
+  // Refused at the boundary the approvals input already draws, so a count outside
+  // it fails loudly here rather than as a 422 from GitHub.
+  if (
+    d.requirePr &&
+    (!Number.isInteger(d.approvals) || d.approvals < 0 || d.approvals > 10)
+  ) {
+    throw new Error("Required approvals must be a whole number from 0 to 10.");
+  }
+  const include = REF_INCLUDES[d.refScope](d);
+  const rules: Record<string, unknown>[] = [];
+  if (d.requirePr) {
+    rules.push({
+      type: "pull_request",
+      parameters: {
+        // Seeds a new ruleset only: GitHub's schema demands the field and the
+        // editor has no control for it, so a stored value must win the spread.
+        required_review_thread_resolution: false,
+        ...storedParameters(original, "pull_request"),
+        required_approving_review_count: d.approvals,
+        dismiss_stale_reviews_on_push: d.dismissStale,
+        require_code_owner_review: d.codeOwner,
+        require_last_push_approval: d.lastPush,
+      },
+    });
+  }
+  if (d.requireChecks) {
+    const checks = storedParameters(original, "required_status_checks");
+    // Kept lines consume their stored entries in order. An entry can pin the check
+    // to one app (`integration_id`) and GitHub accepts several pins under a single
+    // context, neither of which this editor displays, so a save must preserve every
+    // entry rather than reduce a context to one. Fresh lines have no pin to keep.
+    const storedChecks = new Map<
+      string,
+      ({ context: string } & Record<string, unknown>)[]
+    >();
+    for (const entry of storedCheckEntries(original)) {
+      const queue = storedChecks.get(entry.context);
+      if (queue) queue.push(entry);
+      else storedChecks.set(entry.context, [entry]);
+    }
+    rules.push({
+      type: "required_status_checks",
+      parameters: {
+        do_not_enforce_on_create: false,
+        ...checks,
+        strict_required_status_checks_policy: d.strictChecks,
+        // After the spread on purpose: it replaces the raw stored array.
+        required_status_checks: splitNonEmptyLines(d.checkContexts).map(
+          (context) => storedChecks.get(context)?.shift() ?? { context },
+        ),
+      },
+    });
+  }
+  if (d.blockForcePush) rules.push({ type: "non_fast_forward" });
+  if (d.restrictDeletions) rules.push({ type: "deletion" });
+  if (d.linearHistory) rules.push({ type: "required_linear_history" });
+  if (d.requireSignatures) rules.push({ type: "required_signatures" });
+  // Preserve rule types the editor doesn't model.
+  const extra = storedRules(original).filter(
+    (r) => !MANAGED_RULE_TYPES.includes(r.type),
+  );
+  return {
+    name: d.name.trim(),
+    // Target, ref excludes and any other condition are the ruleset's own state,
+    // not the draft's: an edit rewrites what it models and resends the rest.
+    target: original?.target ?? "branch",
+    enforcement: d.enforcement,
+    bypass_actors: original?.bypass_actors ?? [],
+    conditions: {
+      ...original?.conditions,
+      ref_name: {
+        include,
+        exclude: original?.conditions?.ref_name?.exclude ?? [],
+      },
+    },
+    rules: [...rules, ...extra],
+  };
+}
+
+export function RulesetsSection({
+  repoPath,
+  open,
+}: {
+  repoPath: string;
+  open: boolean;
+}) {
+  const [editing, setEditing] = useState<number | "new" | null>(null);
+
+  if (editing !== null) {
+    return (
+      <RulesetEditor
+        repoPath={repoPath}
+        id={editing === "new" ? null : editing}
+        onDone={() => setEditing(null)}
+      />
+    );
+  }
+  return (
+    <RulesetList
+      repoPath={repoPath}
+      open={open}
+      onNew={() => setEditing("new")}
+      onEdit={setEditing}
+    />
+  );
+}
+
+function RulesetList({
+  repoPath,
+  open,
+  onNew,
+  onEdit,
+}: {
+  repoPath: string;
+  open: boolean;
+  onNew: () => void;
+  onEdit: (id: number) => void;
+}) {
+  const { t } = useTranslation();
+  const enforcementItems: Record<string, string> = Object.fromEntries(
+    ENFORCEMENTS.map((value) => [value, t(`repoRulesUi.enforcement_${value}`)]),
+  );
+  const rulesets = useRulesets(repoPath, open);
+  const setEnforcement = useSetRulesetEnforcement(repoPath);
+  const del = useDeleteRuleset(repoPath);
+  const [confirming, setConfirming] = useState<number | null>(null);
+
+  // Awaited, not per-call callbacks: react-query drops those when this subtree
+  // unmounts mid-flight — closing the dialog or switching the rail's section —
+  // so the outcome would never reach the user.
+  async function handleDelete(id: number) {
+    try {
+      await del.mutateAsync(id);
+      toast.success(t("repoRulesUi.deleted"));
+      setConfirming(null);
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  async function handleEnforcement(
+    id: number,
+    enforcement: RulesetEnforcement,
+  ) {
+    try {
+      await setEnforcement.mutateAsync({ id, enforcement });
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  return (
+    <div className="min-w-0 space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs text-muted-foreground">
+          {t("repoRulesUi.description")}
+        </p>
+        <Button size="sm" variant="outline" onClick={onNew}>
+          <PlusIcon data-icon="inline-start" />
+          {t("repoRulesUi.newRuleset")}
+        </Button>
+      </div>
+
+      <AsyncListBody
+        loading={rulesets.isPending}
+        error={rulesets.error}
+        empty={rulesets.data?.length === 0}
+        emptyLabel={t("repoRulesUi.empty")}
+        skeletonClassName="h-12 w-full"
+        errorTitle={t("repoRulesUi.loadError")}
+        errorHint={t(ADMIN_HINT_KEY)}
+      >
+        {rulesets.data?.map((rs) => {
+          const org = rs.sourceType === "Organization";
+          // The editor models branch rulesets only — its scope control and rules
+          // are branch-shaped, and saving one converts a tag/push ruleset's target.
+          const canEdit = rs.target === "branch";
+          return (
+            <div
+              key={rs.id}
+              className="flex items-center gap-2 rounded-md border p-2.5 text-xs"
+            >
+              <div className="min-w-0 flex-1">
+                <p className="truncate font-medium">{rs.name}</p>
+                <p className="text-[11px] text-muted-foreground">
+                  {t(rs.target === "branch" ? "repoRulesUi.branchTarget" : rs.target === "tag" ? "repoRulesUi.tagTarget" : "repoRulesUi.pushTarget")}
+                  {org && ` · ${t("repoRulesUi.fromOrganization")}`}
+                </p>
+              </div>
+              {org ? (
+                <Badge variant="secondary" className="capitalize">
+                  {(() => {
+                    const key = enforcementKey(rs.enforcement);
+                    return key ? t(key) : rs.enforcement;
+                  })()}
+                </Badge>
+              ) : confirming === rs.id ? (
+                <InlineConfirm
+                  prompt={t("repoSettings.deleteQuestion")}
+                  actLabel={t("repoSettings.delete")}
+                  pending={del.isPending}
+                  onCancel={() => setConfirming(null)}
+                  onAct={() => handleDelete(rs.id)}
+                />
+              ) : (
+                <>
+                  <Select
+                    items={enforcementItems}
+                    value={rs.enforcement}
+                    disabled={setEnforcement.isPending}
+                    onValueChange={(v) =>
+                      v && handleEnforcement(rs.id, v as RulesetEnforcement)
+                    }
+                  >
+                    <SelectTrigger size="sm" className="w-28">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {ENFORCEMENTS.map((e) => (
+                        <SelectItem key={e} value={e}>
+                          {t(`repoRulesUi.enforcement_${e}`)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <DisabledReasonButton
+                    size="sm"
+                    variant="ghost"
+                    disabled={!canEdit}
+                    reason={t("repoRulesUi.branchRulesOnly")}
+                    onClick={() => onEdit(rs.id)}
+                  >
+                    {t("common.edit")}
+                  </DisabledReasonButton>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="text-muted-foreground hover:text-destructive"
+                    title={t("repoSettings.delete")}
+                    onClick={() => setConfirming(rs.id)}
+                  >
+                    <TrashIcon />
+                  </Button>
+                </>
+              )}
+            </div>
+          );
+        })}
+      </AsyncListBody>
+    </div>
+  );
+}
+
+function RulesetEditor({
+  repoPath,
+  id,
+  onDone,
+}: {
+  repoPath: string;
+  id: number | null;
+  onDone: () => void;
+}) {
+  const { t } = useTranslation();
+  const existing = useRuleset(repoPath, id);
+  // The form only ever mounts on loaded data: a save is a full-replace PUT built
+  // from `original`, so a form seeded blank would wipe the ruleset's bypass
+  // actors, unmodeled rules and conditions. (The create path fetches nothing.)
+  const body = (() => {
+    switch (true) {
+      // `isPending`, not `isLoading`: a fetch react-query paused for being
+      // offline is neither loading nor errored, and the error arm below would
+      // blame permissions for it.
+      case id != null && existing.isPending:
+        return <Skeleton className="h-64 w-full" />;
+      // Gated on absent data, not on `isError`: a failed background refetch keeps
+      // the last good ruleset, and unmounting the form there would silently
+      // discard a half-authored draft.
+      case id != null && !existing.data:
+        return (
+          <AsyncErrorCard
+            title={t("repoRulesUi.loadOneError")}
+            error={existing.error}
+            hint={t(ADMIN_HINT_KEY)}
+          />
+        );
+      default:
+        return (
+          <RulesetForm
+            repoPath={repoPath}
+            id={id}
+            original={existing.data}
+            onDone={onDone}
+          />
+        );
+    }
+  })();
+
+  return (
+    <div className="min-w-0 space-y-4">
+      <button
+        type="button"
+        onClick={onDone}
+        className="flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <CaretLeftIcon />
+        {t("repoRulesUi.backToRulesets")}
+      </button>
+      {body}
+    </div>
+  );
+}
+
+function RulesetForm({
+  repoPath,
+  id,
+  original,
+  onDone,
+}: {
+  repoPath: string;
+  id: number | null;
+  original?: RulesetFull;
+  onDone: () => void;
+}) {
+  const { t } = useTranslation();
+  const create = useCreateRuleset(repoPath);
+  const update = useUpdateRuleset(repoPath);
+  const pending = create.isPending || update.isPending;
+  const seed = useMemo(
+    () => (original ? rulesetToDraft(original) : BLANK),
+    [original],
+  );
+  const [d, setD] = useState<Draft>(seed);
+  const repeatedChecks = hasRepeatedCheckContexts(original);
+  const pins = pinnedCheckEntries(original);
+  // Advisory: an unnamed app still shows its pin, as the raw id it was stored as.
+  // Gated on the checks rule being ON as well: with it off the pin list isn't
+  // rendered, and the resolve costs two gh calls for names nothing displays.
+  const checkApps = useCheckRunApps(
+    repoPath,
+    d.requireChecks && pins.length > 0,
+  );
+  const appNames = new Map(
+    (checkApps.data ?? []).map((a) => [a.id, a.name || a.slug]),
+  );
+  const set = <K extends keyof Draft>(key: K, value: Draft[K]) =>
+    setD((p) => ({ ...p, [key]: value }));
+
+  async function save() {
+    try {
+      // Inside the try: building the body reads the stored ruleset's own shape,
+      // and a malformed one (a `rules` that isn't an array, say) throws here, as
+      // does an out-of-range approval count in the draft — a toast beats both a
+      // silent no-op and a 422. Check entries are the exception, normalized first.
+      const body = draftToBody(d, original);
+      if (id != null) await update.mutateAsync({ id, body });
+      else await create.mutateAsync(body);
+      toast.success(id != null ? t("repoRulesUi.updated") : t("repoRulesUi.created"));
+      onDone();
+    } catch (e) {
+      toastError(e);
+    }
+  }
+
+  // No wrapper of its own: RulesetEditor, the only place this renders, already
+  // owns the `min-w-0 space-y-4` column these fields flow in.
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-3">
+        <div className="space-y-1.5">
+          <Label htmlFor="ruleset-name">{t("repoRulesUi.name")}</Label>
+          <Input
+            id="ruleset-name"
+            value={d.name}
+            onChange={(e) => set("name", e.target.value)}
+            placeholder={t("repoRulesUi.namePlaceholder")}
+            autoComplete="off"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="ruleset-enforcement">{t("repoRulesUi.enforcement")}</Label>
+          <Select
+            items={Object.fromEntries(ENFORCEMENTS.map((value) => [value, t(`repoRulesUi.enforcement_${value}`)]))}
+            value={d.enforcement}
+            onValueChange={(v) =>
+              v && set("enforcement", v as RulesetEnforcement)
+            }
+          >
+            <SelectTrigger id="ruleset-enforcement" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {ENFORCEMENTS.map((e) => (
+                <SelectItem key={e} value={e}>
+                  {t(`repoRulesUi.enforcement_${e}`)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <div className="space-y-1.5">
+        <Label htmlFor="ruleset-scope">{t("repoRulesUi.targetBranches")}</Label>
+        <Select
+          items={{ default: t("repoRulesUi.defaultBranch"), all: t("repoRulesUi.allBranches"), custom: t("repoRulesUi.customPatterns") }}
+          value={d.refScope}
+          onValueChange={(v) => v && set("refScope", v as Draft["refScope"])}
+        >
+          <SelectTrigger id="ruleset-scope" className="w-56">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {Object.entries({ default: t("repoRulesUi.defaultBranch"), all: t("repoRulesUi.allBranches"), custom: t("repoRulesUi.customPatterns") }).map(([scope, label]) => (
+              <SelectItem key={scope} value={scope}>
+                {label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {d.refScope === "custom" && (
+          <Textarea
+            value={d.customPatterns}
+            onChange={(e) => set("customPatterns", e.target.value)}
+            placeholder={t("repoRulesUi.customPatternPlaceholder")}
+            rows={2}
+            autoComplete="off"
+            spellCheck={false}
+          />
+        )}
+      </div>
+
+      <LabeledGroup label={t("repoRulesUi.rules")}>
+        <RuleToggle
+          label={t("repoRulesUi.requirePullRequest")}
+          checked={d.requirePr}
+          onChange={(v) => set("requirePr", v)}
+        />
+        {d.requirePr && (
+          <div className="ml-6 space-y-2 border-l pl-3">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="ruleset-approvals" className="text-xs">
+                {t("repoRulesUi.requiredApprovals")}
+              </Label>
+              <ApprovalsInput
+                value={d.approvals}
+                onChange={(n) => set("approvals", n)}
+              />
+            </div>
+            <RuleToggle
+              label={t("repoRulesUi.dismissStaleApprovals")}
+              checked={d.dismissStale}
+              onChange={(v) => set("dismissStale", v)}
+            />
+            <RuleToggle
+              label={t("repoRulesUi.requireCodeOwnerReview")}
+              checked={d.codeOwner}
+              onChange={(v) => set("codeOwner", v)}
+            />
+            <RuleToggle
+              label={t("repoRulesUi.requireLatestPushApproval")}
+              checked={d.lastPush}
+              onChange={(v) => set("lastPush", v)}
+            />
+          </div>
+        )}
+
+        <RuleToggle
+          label={t("repoRulesUi.requireStatusChecks")}
+          checked={d.requireChecks}
+          onChange={(v) => set("requireChecks", v)}
+        />
+        {d.requireChecks && (
+          <div className="ml-6 space-y-2 border-l pl-3">
+            <Textarea
+              value={d.checkContexts}
+              onChange={(e) => set("checkContexts", e.target.value)}
+              placeholder={t("repoRulesUi.checkNamesPlaceholder")}
+              rows={2}
+              autoComplete="off"
+              spellCheck={false}
+            />
+            {repeatedChecks && (
+              <p className="text-[11px] text-muted-foreground">
+                {t("repoRulesUi.duplicateChecks")}
+              </p>
+            )}
+            {pins.length > 0 && (
+              <div className="space-y-0.5 text-[11px] text-muted-foreground">
+                <p>{t("repoRulesUi.checksPinnedToApp")}</p>
+                <ul className="space-y-0.5">
+                  {pins.map((pin, i) => (
+                    <li key={`${i}:${pin.integrationId}:${pin.context}`}>
+                      {pin.context} —{" "}
+                      {appNames.get(pin.integrationId) ||
+                        `app #${pin.integrationId}`}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <RuleToggle
+          label={t("repoRulesUi.requireUpToDateBranches")}
+              checked={d.strictChecks}
+              onChange={(v) => set("strictChecks", v)}
+            />
+          </div>
+        )}
+
+        <RuleToggle
+          label={t("repoRulesUi.blockForcePushes")}
+          checked={d.blockForcePush}
+          onChange={(v) => set("blockForcePush", v)}
+        />
+        <RuleToggle
+          label={t("repoRulesUi.restrictDeletions")}
+          checked={d.restrictDeletions}
+          onChange={(v) => set("restrictDeletions", v)}
+        />
+        <RuleToggle
+          label={t("repoRulesUi.requireLinearHistory")}
+          checked={d.linearHistory}
+          onChange={(v) => set("linearHistory", v)}
+        />
+        <RuleToggle
+          label={t("repoRulesUi.requireSignedCommits")}
+          checked={d.requireSignatures}
+          onChange={(v) => set("requireSignatures", v)}
+        />
+      </LabeledGroup>
+
+      <div className="flex items-center justify-end gap-2 pt-1">
+        <Button variant="outline" onClick={onDone} disabled={pending}>
+          {t("common.cancel")}
+        </Button>
+        <Button onClick={save} disabled={pending || !d.name.trim()}>
+          {pending && <Spinner data-icon="inline-start" />}
+          {id != null ? t("repoRulesUi.saveRuleset") : t("repoRulesUi.createRuleset")}
+        </Button>
+      </div>
+    </>
+  );
+}
+
+const clampApprovals = (n: number) => Math.min(10, Math.max(0, Math.round(n)));
+
+/**
+ * The required-approvals count. `typed` holds the raw string while the field is
+ * edited, so the display never rewrites itself mid-entry; every value committed
+ * to the draft is clamped instead, so no save can carry an out-of-range count
+ * whatever order a blur and a click arrive in — deliberately: a save that beats
+ * the blur lands the clamped count, not the raw text still shown. Blur then
+ * normalizes the display, falling back to the committed count for an emptied
+ * field.
+ */
+function ApprovalsInput({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (n: number) => void;
+}) {
+  const [typed, setTyped] = useState<string | null>(null);
+  return (
+    <Input
+      id="ruleset-approvals"
+      type="number"
+      min={0}
+      max={10}
+      value={typed ?? value}
+      onChange={(e) => {
+        setTyped(e.target.value);
+        const n = Number(e.target.value);
+        if (e.target.value.trim() !== "" && Number.isFinite(n))
+          onChange(clampApprovals(n));
+      }}
+      onBlur={() => {
+        // `null` means untouched: no keystroke landed, so nothing was committed
+        // and a focus-then-leave must not rewrite a stored count the user hasn't
+        // edited (`draftToBody` refuses one above 10 at save).
+        if (typed === null) return;
+        const parsed = Number(typed);
+        const base =
+          typed.trim() !== "" && Number.isFinite(parsed) ? parsed : value;
+        onChange(clampApprovals(base));
+        setTyped(null);
+      }}
+      className="h-7 w-16"
+    />
+  );
+}
+
+function RuleToggle({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <label className="flex cursor-pointer items-center justify-between gap-3 text-xs">
+      <span>{label}</span>
+      <Switch checked={checked} onCheckedChange={onChange} />
+    </label>
+  );
+}

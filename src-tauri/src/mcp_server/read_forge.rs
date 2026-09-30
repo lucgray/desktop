@@ -1,0 +1,674 @@
+//! Forge / CI READ tools (always available; no opt-in flag).
+//!
+//! The read-only tools that hit the repository's forge — PRs, issues, and CI runs
+//! /logs — routed through the forge abstraction (`crate::forge::forge_*`), which
+//! dispatches by the repo's git host, so one tool set serves GitHub, GitLab, and
+//! Bitbucket. Each requires the matching authenticated CLI/credential (GitHub `gh`,
+//! GitLab `glab`, Bitbucket a stored API token) and hits the network. GitHub behavior
+//! and serialized JSON are unchanged from the prior `gh_*`-only surface. Bitbucket's
+//! native issue tracker is deprecated, so the issue tools return an actionable error
+//! there (GitHub and GitLab only).
+
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{schemars, tool, tool_router, ErrorData as McpError};
+
+use super::{
+    app_err, cap_head, cap_hunk_lines, cap_tail, json_result, json_result_untrusted,
+    text_result_untrusted, GitDesktopMcp, JobIdArg, NumberArg, RunIdArg, GH_TEXT_MAX_BYTES,
+    HUNK_MAX_LINES,
+};
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct RunListArgs {
+    /// Max runs to return (default 20).
+    #[serde(default)]
+    limit: Option<u32>,
+    /// Limit to a branch name.
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PrListArgs {
+    /// "open" (default) or "closed".
+    #[serde(default)]
+    state: Option<String>,
+    /// Max pull requests to return. Omit for the provider default (GitHub ~30; GitLab
+    /// and Bitbucket a full page).
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct IssueListArgs {
+    /// "open" (default) or "closed".
+    #[serde(default)]
+    state: Option<String>,
+    /// Max issues to return. Omit for the provider default (GitHub ~30; GitLab a full page).
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// Default for `PrCommentsArgs::include_diff_hunk`: include the (capped) hunk.
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PrCommentsArgs {
+    /// The pull request number.
+    number: u64,
+    /// Include each review thread's `diffHunk` code-context excerpt, capped to the
+    /// last few lines (default true). Set false to drop hunks entirely — useful when
+    /// you only need the threads' structure (path, line, resolution, replies).
+    #[serde(default = "default_true")]
+    include_diff_hunk: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct TagArg {
+    /// The release's git tag (e.g. "v1.2.0"), as returned by list_releases.
+    tag: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DiscussionListArgs {
+    /// Optional category node id (from list_discussion_categories) to filter by;
+    /// omit for all categories.
+    #[serde(default)]
+    category: Option<String>,
+}
+
+/// Classify a git host into the neutral provider tag, GitHub-or-not being all that
+/// the discussion gate cares about. Pure so it's unit-testable without a repo —
+/// mirrors the classification `generate::provider_tag` runs (host →
+/// `provider_tag_for_host`), returning whether the host is GitHub.
+///
+/// `None` from `provider_tag_for_host` means an unrecognized host, which the app
+/// treats as GitHub throughout — so it's GitHub here too (the `gh` discussion calls
+/// surface their own actionable error if that guess is wrong).
+fn host_is_github(host: &str, glab_hosts: &[String]) -> bool {
+    matches!(
+        crate::forge::provider_tag_for_host(host, glab_hosts),
+        Some("github") | None
+    )
+}
+
+/// Guard for the GitHub-only discussion tools: resolve the bound repo's provider the
+/// same network-light way `generate::provider_tag` does (origin remote URL → host →
+/// tag) and error honestly on a non-GitHub remote. Every discussion tool calls this
+/// first (write tools AFTER their `--allow-remote-write` gate). Shared by both the
+/// read (`read_forge`) and write (`write_forge`) discussion tools.
+pub(super) async fn ensure_github(repo: &str) -> Result<(), McpError> {
+    // No remote / unparseable URL / unrecognized host → treated as GitHub (the app's
+    // resilient default), so the tool proceeds and the `gh` layer surfaces any real
+    // mismatch. Only a POSITIVELY-identified GitLab/Bitbucket host is refused here.
+    let url = crate::git::remote::git_remote_url(repo.to_string(), "origin".to_string())
+        .await
+        .ok();
+    let host = url.as_deref().and_then(crate::forge::remote_host);
+    if let Some(host) = host {
+        let glab_hosts = crate::forge::glab::known_hosts().await;
+        if !host_is_github(&host, &glab_hosts) {
+            let provider = match crate::forge::provider_tag_for_host(&host, &glab_hosts) {
+                Some("gitlab") => "GitLab",
+                Some("bitbucket") => "Bitbucket",
+                _ => "another provider",
+            };
+            return Err(McpError::invalid_request(
+                format!(
+                    "Discussions are a GitHub feature — this repository's remote is {provider}."
+                ),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[tool_router(router = read_forge_router, vis = "pub(crate)")]
+impl GitDesktopMcp {
+    #[tool(
+        description = "List pull requests from the repository's forge (GitHub, GitLab, or \
+                       Bitbucket, per its remote). `state` is \"open\" (default) or \"closed\". \
+                       Without `limit`, returns the provider default (GitHub ~30; GitLab and \
+                       Bitbucket a full page); pass `limit` to raise or lower that cap. Per-call \
+                       ceiling: GitHub 1000, GitLab 100, Bitbucket 50 — a larger `limit` returns \
+                       the ceiling (no pagination). Open rows carry a `stack` object \
+                       ({id, position, size}, position 1 = bottom and merges first) when the \
+                       PR belongs to a stack — GitHub stacks, or a chain of GitLab MRs each \
+                       targeting the next one's source branch; null otherwise. On GitHub, \
+                       `stackUnknown: true` on a row means the stack check itself failed — \
+                       null there is not proof the PR is unstacked. Requires the \
+                       forge's authenticated CLI/credential. Returns JSON."
+    )]
+    async fn list_pull_requests(
+        &self,
+        Parameters(args): Parameters<PrListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let prs = crate::forge::forge_pr_list(
+            self.repo.clone(),
+            args.state.unwrap_or_else(|| "open".to_string()),
+            args.limit,
+            // MCP stays origin-pinned in v1 (no lens surface): a fork's MCP server
+            // always answers for the fork itself. Documented gap, tracked for a later
+            // pass. Same for every `None` lens below.
+            None,
+            // The MCP tool surface exposes no list filter; the list is unfiltered.
+            None,
+        )
+        .await
+        .map_err(app_err)?;
+        json_result_untrusted(&prs)
+    }
+
+    #[tool(
+        description = "Get a pull request's full details (title, body, state, reviews, comments, \
+                       files) by number from the repository's forge (GitHub, GitLab, or Bitbucket, \
+                       per its remote). A stacked PR also carries `stack` ({id, position, size}) \
+                       and `stackMembers`, the whole stack bottom→top with each layer's state. On \
+                       GitHub merged layers stay listed, because merging one layer also merges \
+                       every unmerged layer below it; a GitLab chain is inferred from the open \
+                       MRs and each MR merges on its own. When `stack` is null AND `stackUnknown` \
+                       is true, the stack status could NOT be checked — that is not a guarantee \
+                       the PR is unstacked, so verify on GitHub before merging it. For just the \
+                       conversation — including file:line review \
+                       threads — see list_pull_request_comments. Returns JSON."
+    )]
+    async fn get_pull_request(
+        &self,
+        Parameters(args): Parameters<NumberArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let pr = crate::forge::forge_pr_view(self.repo.clone(), args.number, None)
+            .await
+            .map_err(app_err)?;
+        json_result_untrusted(&pr)
+    }
+
+    #[tool(
+        description = "Get the unified diff of a pull request by number from the repository's forge \
+                       (GitHub, GitLab, or Bitbucket, per its remote). Large diffs are truncated."
+    )]
+    async fn pull_request_diff(
+        &self,
+        Parameters(args): Parameters<NumberArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let diff = crate::forge::forge_pr_diff(self.repo.clone(), args.number, None)
+            .await
+            .map_err(app_err)?;
+        text_result_untrusted(cap_head(diff, GH_TEXT_MAX_BYTES))
+    }
+
+    #[tool(
+        description = "List a pull request's comments (by number) from the repository's forge \
+                       (GitHub, GitLab, or Bitbucket, per its remote): `comments` (the top-level \
+                       conversation), `reviews` (review summaries), and `review_threads` (file:line \
+                       -anchored threads, each with its full reply chain) — every entry carries the \
+                       author, date, and the original markdown body. Each thread's `diffHunk` \
+                       code-context excerpt (GitHub only) is capped to its last few lines; set \
+                       `include_diff_hunk` false to drop hunks entirely (default true). Read-only; \
+                       returns JSON. (For the PR's metadata + changed files use get_pull_request; \
+                       for its diff, pull_request_diff.)"
+    )]
+    async fn list_pull_request_comments(
+        &self,
+        Parameters(args): Parameters<PrCommentsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let pr = crate::forge::forge_pr_view(self.repo.clone(), args.number, None)
+            .await
+            .map_err(app_err)?;
+        let mut review_threads =
+            crate::forge::forge_pr_review_threads(self.repo.clone(), args.number, None)
+                .await
+                .map_err(app_err)?;
+        // Bound each thread's diffHunk so a comment on a new file can't drag the
+        // whole file into the payload (GitHub-only; GitLab/Bitbucket set it ""),
+        // or drop it entirely when the caller opts out. Mutating this OWNED Vec
+        // never touches the shared IPC struct's serialized shape.
+        for t in &mut review_threads {
+            t.diff_hunk = if args.include_diff_hunk {
+                cap_hunk_lines(std::mem::take(&mut t.diff_hunk), HUNK_MAX_LINES)
+            } else {
+                String::new()
+            };
+        }
+        // KEEP IN SYNC: src/lib/ai/review-tools.ts (`list_pull_request_comments`)
+        // mirrors this composed shape — the diffHunk cap AND the empty-field
+        // pruning below — for the HTTP review tool loop.
+        let mut payload = serde_json::json!({
+            "number": args.number,
+            "comments": pr.comments,
+            "reviews": pr.reviews,
+            "review_threads": review_threads,
+        });
+        // Prune always-default empty fields from every comment/thread object so
+        // agent consumers (the AI review eats the same JSON) don't pay tokens for
+        // e.g. `authorAvatarUrl:""` or `isMinimized:false`. Mutates the OWNED
+        // Value; the shared IPC struct's serialized shape is untouched.
+        if let Some(arr) = payload.get_mut("comments").and_then(|v| v.as_array_mut()) {
+            for c in arr {
+                strip_empty_comment_defaults(c);
+            }
+        }
+        if let Some(arr) = payload.get_mut("reviews").and_then(|v| v.as_array_mut()) {
+            for c in arr {
+                strip_empty_comment_defaults(c);
+            }
+        }
+        if let Some(arr) = payload
+            .get_mut("review_threads")
+            .and_then(|v| v.as_array_mut())
+        {
+            for thread in arr {
+                strip_empty_comment_defaults(thread);
+                if let Some(nested) = thread.get_mut("comments").and_then(|v| v.as_array_mut()) {
+                    for c in nested {
+                        strip_empty_comment_defaults(c);
+                    }
+                }
+            }
+        }
+        json_result_untrusted(&payload)
+    }
+
+    #[tool(
+        description = "List issues from the repository's forge (GitHub or GitLab, per its remote; \
+                       Bitbucket issues aren't supported — its native tracker is deprecated; for a \
+                       repo with a linked Jira project, use list_jira_issues instead). \
+                       `state` is \"open\" (default) or \"closed\". Without `limit`, returns the \
+                       provider default (GitHub ~30; GitLab a full page); pass `limit` to raise or \
+                       lower that cap. Per-call ceiling: GitHub 1000, GitLab 100 — a larger \
+                       `limit` returns the ceiling (no pagination). Requires the forge's \
+                       authenticated CLI/credential. Returns JSON."
+    )]
+    async fn list_issues(
+        &self,
+        Parameters(args): Parameters<IssueListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let issues = crate::forge::forge_issue_list(
+            self.repo.clone(),
+            args.state.unwrap_or_else(|| "open".to_string()),
+            args.limit,
+            None,
+            None,
+        )
+        .await
+        .map_err(app_err)?;
+        json_result_untrusted(&issues)
+    }
+
+    #[tool(
+        description = "Get an issue's full details (title, body, comments, labels, assignees) by \
+                       number from the repository's forge (GitHub or GitLab, per its remote; \
+                       Bitbucket issues aren't supported — its native tracker is deprecated; for a \
+                       repo with a linked Jira project, use get_jira_issue instead). \
+                       Returns JSON."
+    )]
+    async fn get_issue(
+        &self,
+        Parameters(args): Parameters<NumberArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let issue = crate::forge::forge_issue_view(self.repo.clone(), args.number, None)
+            .await
+            .map_err(app_err)?;
+        json_result_untrusted(&issue)
+    }
+
+    #[tool(
+        description = "List recent CI runs from the repository's forge (GitHub Actions, GitLab CI, \
+                       or Bitbucket Pipelines, per its remote), optionally filtered to a branch. \
+                       Returns JSON."
+    )]
+    async fn list_workflow_runs(
+        &self,
+        Parameters(args): Parameters<RunListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let runs = crate::forge::forge_ci_run_list(
+            self.repo.clone(),
+            args.limit.unwrap_or(20),
+            args.branch,
+        )
+        .await
+        .map_err(app_err)?;
+        json_result(&runs)
+    }
+
+    #[tool(
+        description = "Get a CI run's details (status, conclusion, jobs) by run id from the \
+                       repository's forge (GitHub Actions, GitLab CI, or Bitbucket Pipelines, per \
+                       its remote). Returns JSON."
+    )]
+    async fn get_workflow_run(
+        &self,
+        Parameters(args): Parameters<RunIdArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let run = crate::forge::forge_ci_run_view(self.repo.clone(), args.run_id.as_string())
+            .await
+            .map_err(app_err)?;
+        json_result(&run)
+    }
+
+    #[tool(
+        description = "Get the logs of the FAILED steps of a CI run by run id from the repository's \
+                       forge (GitHub Actions, GitLab CI, or Bitbucket Pipelines, per its remote) — \
+                       the most useful view for diagnosing a CI failure. Large logs are truncated \
+                       to the tail."
+    )]
+    async fn workflow_failed_logs(
+        &self,
+        Parameters(args): Parameters<RunIdArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let logs = crate::forge::forge_ci_run_failed_logs(self.repo.clone(), args.run_id.as_string())
+            .await
+            .map_err(app_err)?;
+        text_result_untrusted(cap_tail(logs, GH_TEXT_MAX_BYTES))
+    }
+
+    #[tool(
+        description = "Get the FULL log of a single CI job by job id (from a run's `jobs[].id`, as \
+                       returned by get_workflow_run) — the whole job's output, not just its failed \
+                       steps. Works for GitHub Actions and GitLab CI; Bitbucket step logs aren't \
+                       addressable by numeric id (use the run's web URL instead). Large logs are \
+                       truncated to the tail."
+    )]
+    async fn workflow_job_logs(
+        &self,
+        Parameters(args): Parameters<JobIdArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let logs = crate::forge::forge_ci_job_logs(self.repo.clone(), args.job_id.as_string())
+            .await
+            .map_err(app_err)?;
+        text_result_untrusted(cap_tail(logs, GH_TEXT_MAX_BYTES))
+    }
+
+    #[tool(
+        description = "List the repository's labels (name, color, description) from its forge \
+                       (GitHub or GitLab, per its remote; Bitbucket labels aren't supported). Use \
+                       these names when applying labels via edit_labels. Returns JSON."
+    )]
+    async fn list_labels(&self) -> Result<CallToolResult, McpError> {
+        let labels = crate::forge::forge_repo_labels(self.repo.clone(), None)
+            .await
+            .map_err(app_err)?;
+        json_result(&labels)
+    }
+
+    #[tool(
+        description = "List the repository's milestones from its forge (GitHub or GitLab, per its \
+                       remote; Bitbucket milestones aren't supported). Returns JSON."
+    )]
+    async fn list_milestones(&self) -> Result<CallToolResult, McpError> {
+        let milestones = crate::forge::forge_milestones(self.repo.clone(), None)
+            .await
+            .map_err(app_err)?;
+        json_result_untrusted(&milestones)
+    }
+
+    #[tool(
+        description = "List the repository's releases from its forge (GitHub or GitLab, per its \
+                       remote; Bitbucket releases aren't supported). Returns JSON. For one \
+                       release's full notes, use get_release."
+    )]
+    async fn list_releases(&self) -> Result<CallToolResult, McpError> {
+        let releases = crate::forge::forge_release_list(self.repo.clone())
+            .await
+            .map_err(app_err)?;
+        json_result_untrusted(&releases)
+    }
+
+    #[tool(
+        description = "Get one release's full details (title, notes, assets) by its git tag from \
+                       the repository's forge (GitHub or GitLab, per its remote; Bitbucket releases \
+                       aren't supported). Returns JSON."
+    )]
+    async fn get_release(
+        &self,
+        Parameters(args): Parameters<TagArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let release = crate::forge::forge_release_view(self.repo.clone(), args.tag)
+            .await
+            .map_err(app_err)?;
+        json_result_untrusted(&release)
+    }
+
+    #[tool(
+        description = "List users assignable to issues/pull requests in the repository, from its \
+                       forge (GitHub or GitLab, per its remote; Bitbucket assignees aren't \
+                       supported). Use these logins with set_issue_assignees / \
+                       set_pull_request_assignees. Returns JSON."
+    )]
+    async fn list_assignable_users(&self) -> Result<CallToolResult, McpError> {
+        let users = crate::forge::forge_assignable_users(self.repo.clone(), None)
+            .await
+            .map_err(app_err)?;
+        json_result(&users)
+    }
+
+    #[tool(
+        description = "Get a pull request's activity timeline (by number) from the repository's \
+                       forge (GitHub, GitLab, or Bitbucket, per its remote) — state changes, label \
+                       edits, approvals, and review events, oldest first. Returns JSON."
+    )]
+    async fn get_pull_request_timeline(
+        &self,
+        Parameters(args): Parameters<NumberArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let timeline = crate::forge::forge_pr_timeline(self.repo.clone(), args.number, None)
+            .await
+            .map_err(app_err)?;
+        json_result_untrusted(&timeline)
+    }
+
+    #[tool(
+        description = "List the repository's discussion categories (GitHub only — GitLab/Bitbucket \
+                       have no discussions; the tool errors on those remotes). Returns each \
+                       category's node id, name, emoji, and whether it accepts answers, plus the \
+                       repo's node id — the category id is required to create_discussion. Returns \
+                       JSON."
+    )]
+    async fn list_discussion_categories(&self) -> Result<CallToolResult, McpError> {
+        ensure_github(&self.repo).await?;
+        let meta = crate::github::discussion::gh_discussion_categories(self.repo.clone())
+            .await
+            .map_err(app_err)?;
+        json_result(&meta)
+    }
+
+    #[tool(
+        description = "List the repository's discussions, newest-updated first (GitHub only — \
+                       GitLab/Bitbucket have no discussions; the tool errors on those remotes). \
+                       Optionally filter by a category node id (see list_discussion_categories). \
+                       Returns JSON."
+    )]
+    async fn list_discussions(
+        &self,
+        Parameters(args): Parameters<DiscussionListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        ensure_github(&self.repo).await?;
+        let discussions =
+            crate::github::discussion::gh_discussion_list(self.repo.clone(), args.category, None)
+                .await
+                .map_err(app_err)?;
+        json_result_untrusted(&discussions)
+    }
+
+    #[tool(
+        description = "Get a discussion's full thread by number (GitHub only — GitLab/Bitbucket \
+                       have no discussions; the tool errors on those remotes): body, category, \
+                       answer/lock/close state, and every comment with its nested replies (each \
+                       carrying its node id, author, and body). Use a comment's id with \
+                       mark_discussion_answer. Returns JSON."
+    )]
+    async fn get_discussion(
+        &self,
+        Parameters(args): Parameters<NumberArg>,
+    ) -> Result<CallToolResult, McpError> {
+        ensure_github(&self.repo).await?;
+        let discussion =
+            crate::github::discussion::gh_discussion_view(self.repo.clone(), args.number)
+                .await
+                .map_err(app_err)?;
+        json_result_untrusted(&discussion)
+    }
+}
+
+/// Drop the always-default empty fields from one comment/thread JSON object,
+/// in place. Removes a key ONLY when it holds its empty default; every other
+/// key (including load-bearing `false`s like `isResolved`/`viewerDidAuthor`,
+/// and the `id` write tools consume even when empty) is left as-is. Explicit
+/// per-key list on purpose — a generic "remove falsy" strip would eat those
+/// load-bearing `false`s. Non-object values are ignored.
+///
+/// KEEP IN SYNC: src/lib/ai/review-tools.ts (`list_pull_request_comments`)
+/// mirrors this drop-list character-for-character.
+fn strip_empty_comment_defaults(v: &mut serde_json::Value) {
+    let serde_json::Value::Object(map) = v else {
+        return;
+    };
+    // (key, empty-default) pairs — remove the key only on an exact match.
+    if map.get("authorAvatarUrl") == Some(&serde_json::Value::String(String::new())) {
+        map.remove("authorAvatarUrl");
+    }
+    if map.get("state") == Some(&serde_json::Value::String(String::new())) {
+        map.remove("state");
+    }
+    if map.get("url") == Some(&serde_json::Value::String(String::new())) {
+        map.remove("url");
+    }
+    if map.get("minimizedReason") == Some(&serde_json::Value::String(String::new())) {
+        map.remove("minimizedReason");
+    }
+    if map.get("isMinimized") == Some(&serde_json::Value::Bool(false)) {
+        map.remove("isMinimized");
+    }
+    if map.get("reviewId") == Some(&serde_json::Value::String(String::new())) {
+        map.remove("reviewId");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The discussion gate's host classification: github.com passes; a known GitLab
+    /// or Bitbucket host is refused; an unrecognized host defaults to GitHub (the
+    /// app's resilient default). Mirrors how `generate::provider_tag` classifies a
+    /// host, minus the live remote read.
+    #[test]
+    fn host_is_github_classifies_by_host() {
+        // No self-managed GitLab hosts configured for this classification.
+        let no_glab_hosts: Vec<String> = Vec::new();
+        assert!(host_is_github("github.com", &no_glab_hosts));
+        // Canonical non-GitHub hosts are refused.
+        assert!(!host_is_github("gitlab.com", &no_glab_hosts));
+        assert!(!host_is_github("bitbucket.org", &no_glab_hosts));
+        // An unrecognized host → treated as GitHub (matches the app-wide default).
+        assert!(host_is_github("git.example.com", &no_glab_hosts));
+        // A host present in glab's known-hosts is a self-managed GitLab → refused.
+        let glab_hosts = vec!["gitlab.acme.com".to_string()];
+        assert!(!host_is_github("gitlab.acme.com", &glab_hosts));
+    }
+
+    /// The empty-default prune: a populated comment keeps every field; an
+    /// all-defaults comment loses exactly the six empty-default keys; nested
+    /// thread comments are pruned too; and load-bearing `false`s survive.
+    #[test]
+    fn strip_empty_comment_defaults_only_drops_empty_defaults() {
+        // A populated object: every field holds a non-default value → untouched.
+        let mut populated = serde_json::json!({
+            "author": "octocat",
+            "authorAvatarUrl": "https://example/avatar.png",
+            "state": "APPROVED",
+            "body": "looks good",
+            "date": "2026-07-15T00:00:00Z",
+            "id": "PRRC_1",
+            "url": "https://example/pr/1#c",
+            "viewerDidAuthor": true,
+            "isMinimized": true,
+            "minimizedReason": "spam",
+            "reviewId": "PRR_1",
+        });
+        let before = populated.clone();
+        strip_empty_comment_defaults(&mut populated);
+        assert_eq!(populated, before, "populated object must survive untouched");
+
+        // An all-defaults object: loses exactly the six empty-default keys, and
+        // keeps the load-bearing ones (including an empty-string `id`).
+        let mut defaults = serde_json::json!({
+            "author": "octocat",
+            "authorAvatarUrl": "",
+            "state": "",
+            "body": "hi",
+            "date": "2026-07-15T00:00:00Z",
+            "id": "",
+            "url": "",
+            "viewerDidAuthor": false,
+            "isMinimized": false,
+            "minimizedReason": "",
+            "reviewId": "",
+        });
+        strip_empty_comment_defaults(&mut defaults);
+        let obj = defaults.as_object().unwrap();
+        for dropped in [
+            "authorAvatarUrl",
+            "state",
+            "url",
+            "minimizedReason",
+            "isMinimized",
+            "reviewId",
+        ] {
+            assert!(!obj.contains_key(dropped), "{dropped} should be dropped");
+        }
+        // Load-bearing keys survive, including empty-string id and false viewerDidAuthor.
+        assert_eq!(obj.get("id"), Some(&serde_json::Value::String(String::new())));
+        assert_eq!(obj.get("viewerDidAuthor"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(obj.get("author"), Some(&serde_json::json!("octocat")));
+        assert_eq!(obj.get("body"), Some(&serde_json::json!("hi")));
+        assert_eq!(obj.len(), 5, "exactly six of eleven keys removed");
+
+        // Nested thread comments are pruned when the caller walks them, and a
+        // thread's own `isResolved:false` / `viewerDidAuthor:false` survive.
+        let mut thread = serde_json::json!({
+            "id": "T1",
+            "path": "src/main.rs",
+            "line": 10,
+            "isResolved": false,
+            "isOutdated": false,
+            "diffHunk": "@@ -1 +1 @@",
+            "reviewId": "",
+            "state": "",
+            "comments": [serde_json::json!({
+                "author": "octocat",
+                "authorAvatarUrl": "",
+                "state": "",
+                "body": "nit",
+                "viewerDidAuthor": false,
+                "isMinimized": false,
+                "minimizedReason": "",
+                "url": "",
+                "reviewId": "",
+                "id": "C1",
+            })],
+        });
+        strip_empty_comment_defaults(&mut thread);
+        if let Some(nested) = thread.get_mut("comments").and_then(|v| v.as_array_mut()) {
+            for c in nested {
+                strip_empty_comment_defaults(c);
+            }
+        }
+        let t = thread.as_object().unwrap();
+        // Thread-level empty defaults dropped; load-bearing false fields survive.
+        assert!(!t.contains_key("state"));
+        assert!(!t.contains_key("reviewId"));
+        assert_eq!(t.get("isResolved"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(t.get("isOutdated"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(t.get("diffHunk"), Some(&serde_json::json!("@@ -1 +1 @@")));
+        let nested = t.get("comments").unwrap().as_array().unwrap();
+        let nc = nested[0].as_object().unwrap();
+        assert!(!nc.contains_key("authorAvatarUrl"));
+        assert!(!nc.contains_key("isMinimized"));
+        assert_eq!(nc.get("viewerDidAuthor"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(nc.get("id"), Some(&serde_json::json!("C1")));
+    }
+}

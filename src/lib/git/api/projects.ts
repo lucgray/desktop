@@ -1,0 +1,466 @@
+import { invoke } from "@/lib/tauri/invoke";
+import type {
+  AvailableProjects,
+  BoardCandidates,
+  BoardItem,
+  BoardItemContent,
+  BoardItems,
+  BoardOrder,
+  BulkIssueFieldWrites,
+  BulkItemOutcomes,
+  ConvertedDraft,
+  DuplicateViewSource,
+  IssueFieldWrites,
+  ItemFieldValues,
+  ItemProjects,
+  ProjectFieldDefs,
+  ProjectFieldValueUpdate,
+  ProjectItemRemove,
+  ProjectPatch,
+  ProjectStatusContent,
+  ProjectStatusUpdate,
+  ProjectStatusUpdates,
+  ProjectStatusValue,
+  ProjectV2Ref,
+  ProjectViewDef,
+  ProjectViewLayout,
+  ProjectViewPatch,
+  ProjectViews,
+  RemoteLens,
+} from "../types";
+
+/** The GitHub Projects (v2) boards this repo's items can be added to — the repo's
+ *  own plus its owner's. Needs the `project` (or `read:project`) token scope; a
+ *  token without it fails with the scope hint rather than an empty list. */
+export const ghProjectsAvailable = (repoPath: string, lens: RemoteLens) =>
+  invoke<AvailableProjects>("gh_projects_available", { repoPath, lens });
+
+/** The boards one issue/PR currently belongs to, with each membership's item id,
+ *  and whether the item's capped memberships connection held more. */
+export const ghItemProjects = (
+  repoPath: string,
+  kind: "issue" | "pr",
+  number: number,
+  lens: RemoteLens,
+) =>
+  invoke<ItemProjects>("gh_item_projects", {
+    repoPath,
+    kind,
+    number,
+    lens,
+  });
+
+/** One issue/PR's project field values, one entry per board it belongs to. Same
+ *  scope need as the memberships read, and the same per-board shape, so the two
+ *  line up membership-for-membership. */
+export const ghItemFieldValues = (
+  repoPath: string,
+  kind: "issue" | "pr",
+  number: number,
+  lens: RemoteLens,
+) =>
+  invoke<ItemFieldValues>("gh_item_field_values", {
+    repoPath,
+    kind,
+    number,
+    lens,
+  });
+
+/** Links/unlinks an item's boards in one call. Adds address the project by id
+ *  (`contentId` is the issue/PR node id); removes need the membership's item id,
+ *  which only exists once the item is on that board. */
+export const ghEditItemProjects = (
+  repoPath: string,
+  contentId: string,
+  addProjectIds: string[],
+  removes: ProjectItemRemove[],
+) =>
+  invoke<void>("gh_edit_item_projects", {
+    repoPath,
+    contentId,
+    addProjectIds,
+    removes,
+  });
+
+/** One board's field definitions — every field it defines, writable or not. Board
+ *  state, not item state, so it takes no lens: a board is the same object whichever
+ *  remote the item was read through. */
+export const ghProjectFields = (repoPath: string, projectId: string) =>
+  invoke<ProjectFieldDefs>("gh_project_fields", { repoPath, projectId });
+
+/** One board's items, in the board's own position order. Auto-pages up to 500 per
+ *  call; more than that comes back `truncated` with the `endCursor` the next call
+ *  passes as `after`. Board state like the field definitions, so no lens. `query`
+ *  is the board's own filter grammar, passed VERBATIM for the server to parse —
+ *  a saved view's filter is what fills it, and null is the unfiltered board.
+ *
+ *  `includeArchived` false is the board's default read, which settles to the
+ *  NOT_ARCHIVED items alone; true asks for both states, and GitHub interleaves the
+ *  archived ones in POSITION order with their field values intact. `totalCount`
+ *  follows the read's own filter either way, so the two answers count different
+ *  sets (measured 2026-09-21). */
+export const ghProjectItems = (
+  repoPath: string,
+  projectId: string,
+  after: string | null,
+  query: string | null,
+  includeArchived: boolean,
+  /** Also read the connection-valued fields (users, labels, reviewers, linked
+   *  pull requests) — a table draws them, a board never does, and each one costs
+   *  rate limit per item. Omitted is the lean read. */
+  rich?: boolean,
+) =>
+  invoke<BoardItems>("gh_project_items", {
+    repoPath,
+    projectId,
+    after,
+    query,
+    includeArchived,
+    rich,
+  });
+
+/** One board's saved views — the lenses its owner set up on GitHub. Board state
+ *  like the field definitions, so no lens; capped server-side, which is what
+ *  `truncated` reports. */
+export const ghProjectViews = (repoPath: string, projectId: string) =>
+  invoke<ProjectViews>("gh_project_views", { repoPath, projectId });
+
+/** Creates a project under `ownerId`, linked to `repositoryId` when one is given,
+ *  and answers with it as GitHub stored it. The project write family needs the
+ *  `project` token scope. */
+export const ghCreateProject = (
+  repoPath: string,
+  ownerId: string,
+  title: string,
+  repositoryId: string | null,
+) =>
+  invoke<ProjectV2Ref>("gh_create_project", {
+    repoPath,
+    ownerId,
+    title,
+    repositoryId,
+  });
+
+/** Renames, describes, closes or reopens a project. Only the patch's PRESENT keys
+ *  are written; answers with the project as GitHub now holds it. */
+export const ghUpdateProject = (
+  repoPath: string,
+  projectId: string,
+  patch: ProjectPatch,
+) => invoke<ProjectV2Ref>("gh_update_project", { repoPath, projectId, patch });
+
+/** Deletes a project and every item on it. GitHub has no undelete. */
+export const ghDeleteProject = (repoPath: string, projectId: string) =>
+  invoke<void>("gh_delete_project", { repoPath, projectId });
+
+/** Adds a saved view in `layout` and answers with it as GitHub stored it. */
+export const ghCreateView = (
+  repoPath: string,
+  projectId: string,
+  name: string,
+  layout: ProjectViewLayout,
+) =>
+  invoke<ProjectViewDef>("gh_create_view", {
+    repoPath,
+    projectId,
+    name,
+    layout,
+  });
+
+/** Renames a view, changes its layout, or sets its visible fields. Only the
+ *  patch's PRESENT keys are written. */
+export const ghUpdateView = (
+  repoPath: string,
+  viewId: string,
+  patch: ProjectViewPatch,
+) => invoke<ProjectViewDef>("gh_update_view", { repoPath, viewId, patch });
+
+/** Deletes a saved view. GitHub has no undelete for views. */
+export const ghDeleteView = (repoPath: string, viewId: string) =>
+  invoke<void>("gh_delete_view", { repoPath, viewId });
+
+/** Copies a view as "Copy of <name>": its layout, filter and visible fields. Two
+ *  writes backend-side, since GitHub has no copy mutation; a failure between them
+ *  rejects with an error saying the copy exists without its filter and fields. */
+export const ghDuplicateView = (
+  repoPath: string,
+  projectId: string,
+  source: DuplicateViewSource,
+) =>
+  invoke<ProjectViewDef>("gh_duplicate_view", { repoPath, projectId, source });
+
+/** One project's status updates, newest first — the first page only, which is
+ *  what `truncated` reports. Project state like the saved views, so no lens. */
+export const ghProjectStatusUpdates = (repoPath: string, projectId: string) =>
+  invoke<ProjectStatusUpdates>("gh_project_status_updates", {
+    repoPath,
+    projectId,
+  });
+
+/** Posts a status update and answers with it as GitHub stored it. Absent fields
+ *  (null, or an empty string) are left out of the create. */
+export const ghCreateProjectStatusUpdate = (
+  repoPath: string,
+  projectId: string,
+  status: ProjectStatusValue,
+  content: ProjectStatusContent,
+) =>
+  invoke<ProjectStatusUpdate>("gh_create_project_status_update", {
+    repoPath,
+    projectId,
+    status,
+    ...content,
+  });
+
+/** Rewrites a status update WHOLE: every field rides explicitly, and null CLEARS
+ *  it (GitHub reads an omitted field as "leave it", which an editor holding the
+ *  full state never means). `status` stays a wide string so an edit can keep a
+ *  value this build doesn't name. */
+export const ghUpdateProjectStatusUpdate = (
+  repoPath: string,
+  statusUpdateId: string,
+  status: string | null,
+  content: ProjectStatusContent,
+) =>
+  invoke<ProjectStatusUpdate>("gh_update_project_status_update", {
+    repoPath,
+    statusUpdateId,
+    status,
+    ...content,
+  });
+
+/** Deletes one status update. */
+export const ghDeleteProjectStatusUpdate = (
+  repoPath: string,
+  statusUpdateId: string,
+) =>
+  invoke<void>("gh_delete_project_status_update", {
+    repoPath,
+    statusUpdateId,
+  });
+
+/** Writes one board's field values for one item in a single call. `updates` sets or
+ *  replaces; `clears` carries the field ids to UNSET, which no update shape can
+ *  express. Both address the item by its membership `itemId` on `projectId`.
+ *  `issueWrites` carries the item's org issue fields, addressed by the issue itself,
+ *  in the SAME call: the two halves land independently, so a failure may leave the
+ *  other half written. */
+export const ghSetItemFieldValues = (
+  repoPath: string,
+  projectId: string,
+  itemId: string,
+  updates: ProjectFieldValueUpdate[],
+  clears: string[],
+  issueWrites: IssueFieldWrites | null = null,
+) =>
+  invoke<void>("gh_set_item_field_values", {
+    repoPath,
+    projectId,
+    itemId,
+    updates,
+    clears,
+    issueWrites,
+  });
+
+/** Moves one card within the project's own item order, landing it directly after
+ *  `afterId`. Null is the TOP of the board — the key rides EXPLICITLY, since the
+ *  backend reads a dropped key and a null as the same `Option::None` only when the
+ *  serializer is the one deciding. Answers with the board's new order rather than
+ *  nothing, which is what lets the settle re-assert it without a read GitHub's
+ *  replicas can lag. */
+export const ghSetItemPosition = (
+  repoPath: string,
+  projectId: string,
+  itemId: string,
+  afterId: string | null,
+) =>
+  invoke<BoardOrder>("gh_set_item_position", {
+    repoPath,
+    projectId,
+    itemId,
+    afterId,
+  });
+
+/** Issues and pull requests in THIS repository a board could take, matching
+ *  `search`. Repo-scoped by design: an owner-wide search would offer items from
+ *  repositories this window isn't showing. The lens picks which repo "this" is. */
+export const ghSearchBoardCandidates = (
+  repoPath: string,
+  search: string,
+  lens: RemoteLens,
+) =>
+  invoke<BoardCandidates>("gh_search_board_candidates", {
+    repoPath,
+    search,
+    lens,
+  });
+
+/** Adds a DRAFT item — a note that lives only on this board — and returns the CARD
+ *  the board now holds. `body` rides verbatim as Markdown; the card's popover
+ *  renders it. The card comes back rather than a bare id because GitHub's read
+ *  replicas lag their own writes by seconds: the answer to the write is the only
+ *  reading of the new item that is guaranteed to exist. */
+export const ghAddDraftItem = (
+  repoPath: string,
+  projectId: string,
+  title: string,
+  body: string,
+) =>
+  invoke<BoardItem>("gh_add_draft_item", { repoPath, projectId, title, body });
+
+/** Puts one existing issue or pull request on a board and returns the card it
+ *  became. `contentId` is the issue/PR node id — a board item id addresses nothing
+ *  here. The card comes back for the reason {@link ghAddDraftItem} states. */
+export const ghAddBoardItem = (
+  repoPath: string,
+  projectId: string,
+  contentId: string,
+) => invoke<BoardItem>("gh_add_board_item", { repoPath, projectId, contentId });
+
+/** Rewrites one draft's title, notes and assignees, answering with the card's new
+ *  content — the DRAFT arm of {@link BoardItemContent}, tag included, which is why
+ *  this is typed as the whole union and narrowed at the patch site. `draftId` is the
+ *  DRAFT's own CONTENT id (the card's `content.id`), never the membership's item id.
+ *
+ *  `assigneeLogins` is TRI-STATE, and the distinction is what keeps a title-only edit
+ *  from deleting people: a list REPLACES the set, `[]` clears it, and `undefined`
+ *  omits the field from the mutation so the draft's assignees are not touched at all.
+ *  The board reads a draft's assignees through a CAPPED selection, so a seeded list
+ *  that round-tripped as a replacement would drop everyone past the cap. */
+export const ghUpdateDraftItem = (
+  repoPath: string,
+  draftId: string,
+  title: string,
+  body: string,
+  assigneeLogins: string[] | undefined,
+) =>
+  invoke<BoardItemContent>("gh_update_draft_item", {
+    repoPath,
+    draftId,
+    title,
+    body,
+    // Explicit null rather than a dropped key: both reach the backend's `Option` as
+    // `None`, and this one doesn't depend on the serializer omitting `undefined`.
+    assigneeLogins: assigneeLogins ?? null,
+  });
+
+/** Turns a draft into a real issue in the repo the lens names, keeping the card's
+ *  place on the board. Addressed by the membership's `itemId` — a draft's own
+ *  content id is a different thing and the backend rejects it. Answers with the
+ *  swapped card as well as the issue, for the reason {@link ghAddDraftItem} states. */
+export const ghConvertDraftItem = (
+  repoPath: string,
+  itemId: string,
+  lens: RemoteLens,
+) =>
+  invoke<ConvertedDraft>("gh_convert_draft_item", { repoPath, itemId, lens });
+
+/** Archives one card: it leaves the board's default read but stays on the project,
+ *  reachable again through {@link ghUnarchiveBoardItem}. Takes the membership's
+ *  `itemId`. */
+export const ghArchiveBoardItem = (
+  repoPath: string,
+  projectId: string,
+  itemId: string,
+) => invoke<void>("gh_archive_board_item", { repoPath, projectId, itemId });
+
+/** Puts an archived card back on the board — {@link ghArchiveBoardItem}'s reversal,
+ *  addressed the same way. GitHub's read replicas lag the write by seconds, so for a
+ *  moment afterwards the restored item can still answer the archived-filtered read
+ *  and be missing from the default one (measured ≤6s, 2026-09-21); the mutation's own
+ *  success is the transactional truth. */
+export const ghUnarchiveBoardItem = (
+  repoPath: string,
+  projectId: string,
+  itemId: string,
+) => invoke<void>("gh_unarchive_board_item", { repoPath, projectId, itemId });
+
+/** Removes one card from the project. For an issue or pull request that unlinks
+ *  the membership alone; for a DRAFT it destroys the note, which exists nowhere
+ *  else. Takes the membership's `itemId`. */
+export const ghRemoveBoardItem = (
+  repoPath: string,
+  projectId: string,
+  itemId: string,
+) => invoke<void>("gh_remove_board_item", { repoPath, projectId, itemId });
+
+/** The four BATCH siblings of the single-card writes above, for the board's bulk
+ *  verbs. Each answers with one {@link BulkItemOutcomes} entry per item IN INPUT
+ *  ORDER — a batch applies per item, so a caller reads which ones landed rather
+ *  than treating the call as all-or-nothing. An EMPTY `itemIds` is an error
+ *  backend-side, never an empty answer, so no caller may send one. */
+export const ghArchiveBoardItems = (
+  repoPath: string,
+  projectId: string,
+  itemIds: string[],
+) =>
+  invoke<BulkItemOutcomes>("gh_archive_board_items", {
+    repoPath,
+    projectId,
+    itemIds,
+  });
+
+/** {@link ghArchiveBoardItems}'s reversal, item for item. GitHub's read replicas
+ *  lag it the way they lag the single-card unarchive, so the answer is the
+ *  transactional truth and the caller patches from it rather than re-reading. */
+export const ghUnarchiveBoardItems = (
+  repoPath: string,
+  projectId: string,
+  itemIds: string[],
+) =>
+  invoke<BulkItemOutcomes>("gh_unarchive_board_items", {
+    repoPath,
+    projectId,
+    itemIds,
+  });
+
+/** Removes several cards from the project at once — an unlink per issue or pull
+ *  request, a deletion per draft, the same split {@link ghRemoveBoardItem} makes. */
+export const ghRemoveBoardItems = (
+  repoPath: string,
+  projectId: string,
+  itemIds: string[],
+) =>
+  invoke<BulkItemOutcomes>("gh_remove_board_items", {
+    repoPath,
+    projectId,
+    itemIds,
+  });
+
+/** Writes ONE set of field values across several items of a board:
+ *  {@link ghSetItemFieldValues} for a whole selection, with the same `updates`
+ *  and `clears` split. Every item takes the same write, which is what makes a bulk
+ *  column move expressible as a single call. `issueWrites` adds the org issue-field
+ *  half, one alias per item its `issueIds` names; an issue alias's refusal marks
+ *  that item's outcome like any other. */
+export const ghSetItemsFieldValues = (
+  repoPath: string,
+  projectId: string,
+  itemIds: string[],
+  updates: ProjectFieldValueUpdate[],
+  clears: string[],
+  issueWrites: BulkIssueFieldWrites | null = null,
+) =>
+  invoke<BulkItemOutcomes>("gh_set_items_field_values", {
+    repoPath,
+    projectId,
+    itemIds,
+    updates,
+    clears,
+    issueWrites,
+  });
+
+/** Adds one issue to boards by project id, addressed by issue NUMBER rather than
+ *  node id — the create flow has the number before it has anything else. */
+export const ghAddIssueToProjects = (
+  repoPath: string,
+  number: number,
+  addProjectIds: string[],
+  lens: RemoteLens,
+) =>
+  invoke<void>("gh_add_issue_to_projects", {
+    repoPath,
+    number,
+    addProjectIds,
+    lens,
+  });

@@ -1,0 +1,587 @@
+/** A GitHub Projects (v2) board an issue/PR can belong to. */
+export interface ProjectV2Ref {
+  id: string;
+  title: string;
+  number: number;
+  closed: boolean;
+  /** Whether the viewer may add/remove items — false rows stay visible but held. */
+  viewerCanUpdate: boolean;
+  /** GitHub's own verdicts for closing and reopening, which gate apart from
+   *  `viewerCanUpdate`. False when a read didn't carry them. */
+  viewerCanClose: boolean;
+  viewerCanReopen: boolean;
+  /** The project's one-line description. ABSENT (not null) when it has none. */
+  shortDescription?: string;
+}
+
+/** One membership: the item's own node id on that board, plus the board. The
+ *  `itemId` is what an unlink addresses, so it can't be derived from the project. */
+export interface ProjectItemRef {
+  itemId: string;
+  project: ProjectV2Ref;
+}
+
+/** One item's board memberships. `truncated` reports that the item's
+ *  `projectItems` connection had more pages than the read asked for, so the
+ *  picker says the list is partial rather than implying it is the whole set —
+ *  the same claim {@link AvailableProjects} makes about the catalog. */
+export interface ItemProjects {
+  items: ProjectItemRef[];
+  truncated: boolean;
+}
+
+/** The projects an item could be added to — the repo's plus its owner's. */
+export interface AvailableProjects {
+  projects: ProjectV2Ref[];
+  /** The server capped the list, or one catalog arm didn't answer (denied);
+   *  the UI says so rather than implying completeness. */
+  truncated: boolean;
+  /** The node ids a new project is created under (the owner) and linked to (the
+   *  repository). Null when the repository arm didn't answer. */
+  repositoryId: string | null;
+  /** The names a create shows for those ids, each read from the same arm as its
+   *  id: the repository a new project is linked to, and the account it's under. */
+  repositoryNameWithOwner: string | null;
+  ownerId: string | null;
+  ownerLogin: string | null;
+}
+
+/** A project details write. An ABSENT key leaves that detail as it is. A present
+ *  `shortDescription` must be non-blank: GitHub silently keeps the old text for
+ *  an emptied one (only github.com's project settings clears it), so the write
+ *  layer refuses a blank. */
+export interface ProjectPatch {
+  title?: string;
+  shortDescription?: string;
+  closed?: boolean;
+}
+
+/** An unlink target. Both ids are required: the mutation removes `itemId` from
+ *  `projectId`'s board. */
+export interface ProjectItemRemove {
+  projectId: string;
+  itemId: string;
+}
+
+/** One project field's value on an item, tagged by the field's kind. `isIssueField`
+ *  marks a value of an organization ISSUE field, owned on the issue itself and
+ *  bridged onto the board, rather than a board-defined field. Its `fieldId` is still
+ *  the board's wrapper id; a write routes through the definition's `issueFieldId`.
+ *  A kind this build doesn't know arrives as `unknown`, carrying only the name it
+ *  was given. */
+export type ProjectFieldValue =
+  | {
+      kind: "singleSelect";
+      fieldId: string;
+      fieldName: string;
+      optionId: string;
+      name: string;
+      /** GitHub color NAME (GRAY/BLUE/GREEN/YELLOW/ORANGE/RED/PINK/PURPLE). */
+      color: string;
+      isIssueField: boolean;
+      /** The org IssueField behind a bridged value — what ties it to its
+       *  definition where the two wrapper ids differ. ABSENT on a board-defined
+       *  value, and on a bridged one GitHub didn't serve it for. */
+      issueFieldId?: string;
+    }
+  | {
+      kind: "multiSelect";
+      fieldId: string;
+      fieldName: string;
+      options: { id: string; name: string; color: string }[];
+      isIssueField: boolean;
+      issueFieldId?: string;
+    }
+  | {
+      kind: "text";
+      fieldId: string;
+      fieldName: string;
+      text: string;
+      isIssueField: boolean;
+      issueFieldId?: string;
+    }
+  | {
+      kind: "number";
+      fieldId: string;
+      fieldName: string;
+      number: number;
+      isIssueField: boolean;
+      issueFieldId?: string;
+    }
+  | {
+      kind: "date";
+      fieldId: string;
+      fieldName: string;
+      /** A bare `YYYY-MM-DD` as GitHub's Date scalar sends it — no zone. */
+      date: string;
+      isIssueField: boolean;
+      issueFieldId?: string;
+    }
+  | {
+      kind: "iteration";
+      fieldId: string;
+      fieldName: string;
+      /** Which iteration of the field's configured set this is — the id a write
+       *  addresses it by, and the only stable identity it has: title and dates are
+       *  editable on the board. */
+      iterationId: string;
+      title: string;
+      startDate: string;
+      /** Length in DAYS, so the last day is `startDate + duration - 1`. */
+      duration: number;
+      isIssueField: boolean;
+    }
+  | {
+      kind: "users";
+      fieldId: string;
+      fieldName: string;
+      totalCount: number;
+      users: AssigneeRef[];
+      isIssueField: boolean;
+    }
+  | {
+      kind: "labels";
+      fieldId: string;
+      fieldName: string;
+      totalCount: number;
+      labels: LabelLite[];
+      isIssueField: boolean;
+    }
+  | {
+      kind: "milestone";
+      fieldId: string;
+      fieldName: string;
+      title: string;
+      /** GitHub's ISO-8601 due timestamp verbatim, absent when the milestone has
+       *  no due date — never a filled-in one. Untrusted: validate before use. */
+      dueOn?: string;
+      isIssueField: boolean;
+    }
+  | {
+      kind: "repository";
+      fieldId: string;
+      fieldName: string;
+      nameWithOwner: string;
+      isIssueField: boolean;
+    }
+  | {
+      kind: "reviewers";
+      fieldId: string;
+      fieldName: string;
+      totalCount: number;
+      reviewers: string[];
+      isIssueField: boolean;
+    }
+  | {
+      kind: "pullRequests";
+      fieldId: string;
+      fieldName: string;
+      totalCount: number;
+      pullRequests: LinkedPrLite[];
+      isIssueField: boolean;
+    }
+  | { kind: "unknown"; fieldName: string };
+
+export interface LabelLite {
+  name: string;
+  color: string;
+}
+
+export interface LinkedPrLite {
+  number: number;
+  repoNameWithOwner: string;
+}
+
+/** One board's field values for an item. `itemId` addresses the membership the
+ *  values hang off, which is what a write would target. */
+export interface ItemProjectFieldValues {
+  itemId: string;
+  project: ProjectV2Ref;
+  values: ProjectFieldValue[];
+}
+
+/** One item's per-board field values. `truncated` is the same claim
+ *  {@link ItemProjects} makes, off the same capped `projectItems` connection:
+ *  both reads page it identically, so a truncated membership list means a
+ *  truncated value list too. */
+export interface ItemFieldValues {
+  items: ItemProjectFieldValues[];
+  truncated: boolean;
+  /** The issue's node id, which an org issue-field write addresses. Present on an
+   *  ISSUE read only, and together with `viewerCanSetFields`. */
+  issueId?: string;
+  /** Whether the viewer may set this issue's org issue fields. Absent on a pull
+   *  request read; a reader gates on `=== true`. */
+  viewerCanSetFields?: boolean;
+}
+
+/** One option a board's single/multi-select field offers. */
+export interface ProjectFieldOptionDef {
+  id: string;
+  name: string;
+  /** GitHub color NAME (GRAY/BLUE/GREEN/YELLOW/ORANGE/RED/PINK/PURPLE). */
+  color: string;
+  description: string;
+}
+
+/** One iteration a board's iteration field offers. `duration` is a DAY count, so
+ *  the last day is `startDate + duration - 1` — the same shape the iteration VALUE
+ *  arm carries, plus the `id` a write addresses it by. */
+export interface ProjectIterationDef {
+  id: string;
+  title: string;
+  /** A bare `YYYY-MM-DD` as GitHub's Date scalar sends it — no zone. */
+  startDate: string;
+  duration: number;
+}
+
+/** One project field's DEFINITION, tagged by kind — what the editor offers, where
+ *  {@link ProjectFieldValue} is what an item currently holds. `system` is both the
+ *  built-ins bucket (title, assignees, labels, milestone, repository, reviewers,
+ *  tracking — GitHub owns those on the issue/PR itself) and the tolerant fallback
+ *  for a `dataType` this build doesn't know, which is how the editor excludes them:
+ *  by kind, never by name. */
+export type ProjectFieldDef =
+  | {
+      kind: "singleSelect";
+      id: string;
+      name: string;
+      /** An org issue field's options are the IssueField's own (`IFSSO_` ids),
+       *  which is what its values carry too. */
+      options: ProjectFieldOptionDef[];
+      isIssueField: boolean;
+      /** The org IssueField's node id — what an issue-field write addresses, the
+       *  wrapper `id` being refused there. ABSENT on a board-defined field, and on
+       *  an issue field GitHub didn't serve it for, which then can't be written. */
+      issueFieldId?: string;
+    }
+  | {
+      kind: "multiSelect";
+      id: string;
+      name: string;
+      options: ProjectFieldOptionDef[];
+      isIssueField: boolean;
+      issueFieldId?: string;
+    }
+  | {
+      kind: "iteration";
+      id: string;
+      name: string;
+      iterations: ProjectIterationDef[];
+      /** Past iterations, offered apart: still assignable, but not what a board
+       *  means by "the current one". */
+      completedIterations: ProjectIterationDef[];
+    }
+  | {
+      kind: "text";
+      id: string;
+      name: string;
+      isIssueField: boolean;
+      issueFieldId?: string;
+    }
+  | {
+      kind: "number";
+      id: string;
+      name: string;
+      isIssueField: boolean;
+      issueFieldId?: string;
+    }
+  | {
+      kind: "date";
+      id: string;
+      name: string;
+      isIssueField: boolean;
+      issueFieldId?: string;
+    }
+  | { kind: "system"; id: string; name: string; dataType: string };
+
+/** One board's field definitions. `truncated` reports that the server capped the
+ *  list, which the editor says rather than implying it offers every field — the
+ *  same claim {@link AvailableProjects} makes about the catalog. */
+export interface ProjectFieldDefs {
+  fields: ProjectFieldDef[];
+  truncated: boolean;
+}
+
+/** One sort key of a saved view: the field it orders by, and the direction the
+ *  backend has already mapped off GitHub's own enum. */
+export interface ProjectViewSort {
+  fieldId: string;
+  direction: "asc" | "desc";
+}
+
+/** One of a board's SAVED VIEWS, as this build can honour it. `layout` is mapped
+ *  to the shapes the board knows plus `unknown` for one GitHub adds later, and
+ *  every id list is a plain field-id sequence in the view's own order. `filter`
+ *  is the board's own filter grammar for the server to parse — GitHub reports an
+ *  unfiltered view as either null or the empty string, so a caller testing "has a
+ *  filter" has to test both. */
+export interface ProjectViewDef {
+  id: string;
+  name: string;
+  layout: "board" | "table" | "roadmap" | "unknown";
+  filter: string | null;
+  groupFieldIds: string[];
+  verticalGroupFieldIds: string[];
+  sortBy: ProjectViewSort[];
+  visibleFieldIds: string[];
+}
+
+/** One board's saved views. `truncated` reports that the server capped the list,
+ *  the same claim {@link ProjectFieldDefs} makes about the fields. */
+export interface ProjectViews {
+  views: ProjectViewDef[];
+  truncated: boolean;
+}
+
+/** A layout a view can be WRITTEN in — `unknown` is a read-side fallback only. */
+export type ProjectViewLayout = Exclude<ProjectViewDef["layout"], "unknown">;
+
+/** A saved view write. An ABSENT key leaves that part of the view as it is.
+ *  There is no filter here: the app never composes one. */
+export interface ProjectViewPatch {
+  name?: string;
+  layout?: ProjectViewLayout;
+  visibleFieldIds?: string[];
+}
+
+/** What a duplicate copies from its source. Grouping and sort aren't here:
+ *  GitHub's view writes have no input for either. */
+export interface DuplicateViewSource {
+  name: string;
+  layout: ProjectViewLayout;
+  filter: string | null;
+  visibleFieldIds: string[];
+}
+
+/** The status values GitHub offers a project status update today — the ones this
+ *  build can WRITE and names itself. */
+export type ProjectStatusValue =
+  | "INACTIVE"
+  | "ON_TRACK"
+  | "AT_RISK"
+  | "OFF_TRACK"
+  | "COMPLETE";
+
+/** One project status update. `status` is GitHub's enum spelling VERBATIM, typed
+ *  wide on purpose: null is a real state (an update posted or edited without one),
+ *  and a value GitHub adds later arrives as-is for the reader's fallback arm rather
+ *  than being dropped. Both dates are bare `YYYY-MM-DD`; the two timestamps are
+ *  ISO-8601 from the forge, so a reader validates before formatting. `creator` is
+ *  null where GitHub names no one (a deleted account). */
+export interface ProjectStatusUpdate {
+  id: string;
+  body: string | null;
+  status: string | null;
+  startDate: string | null;
+  targetDate: string | null;
+  creator: AssigneeRef | null;
+  createdAt: string;
+  updatedAt: string | null;
+}
+
+/** A status update write's content beside its status, which the create and the
+ *  edit type differently. Null is an absent field: left out of a create, and
+ *  CLEARED by an edit. */
+export interface ProjectStatusContent {
+  body: string | null;
+  startDate: string | null;
+  targetDate: string | null;
+}
+
+/** One project's status updates, NEWEST FIRST, capped server-side at the first
+ *  page — `truncated` says GitHub holds older ones this read didn't ask for, and
+ *  `totalCount` is GitHub's figure for all of them. */
+export interface ProjectStatusUpdates {
+  updates: ProjectStatusUpdate[];
+  totalCount: number;
+  truncated: boolean;
+}
+
+/** One field to SET on an item, tagged by the field's kind. These field names are
+ *  the wire the backend deserializes by — a renamed one reads as absent there.
+ *  Unsetting is not expressed here: a clear rides the write's separate id list. */
+export type ProjectFieldValueUpdate =
+  | { kind: "text"; fieldId: string; text: string }
+  | { kind: "number"; fieldId: string; number: number }
+  | { kind: "date"; fieldId: string; date: string }
+  | { kind: "singleSelect"; fieldId: string; optionId: string }
+  | { kind: "multiSelect"; fieldId: string; optionIds: string[] }
+  | { kind: "iteration"; fieldId: string; iterationId: string };
+
+/** One org issue field to SET on an issue: {@link ProjectFieldValueUpdate}'s shape
+ *  with `fieldId` the definition's `issueFieldId`, never the wrapper id. No
+ *  iteration arm — GitHub has no org iteration field. */
+export type IssueFieldValueUpdate = Exclude<
+  ProjectFieldValueUpdate,
+  { kind: "iteration" }
+>;
+
+/** The issue half of a single-item field write, riding the same call as the board
+ *  half. `clears` carries issue field ids to UNSET. */
+export interface IssueFieldWrites {
+  issueId: string;
+  updates: IssueFieldValueUpdate[];
+  clears: string[];
+}
+
+/** The issue half of a batch field write: one shared write, addressed per item by
+ *  `issueIds`, which pairs index-for-index with the batch's item ids. A null entry
+ *  (a pull request, a draft, an issue the viewer can't set) takes none. */
+export interface BulkIssueFieldWrites {
+  issueIds: (string | null)[];
+  updates: IssueFieldValueUpdate[];
+  clears: string[];
+}
+
+/** One item's result in a BATCH board write: the membership it addressed, and the
+ *  failure GitHub gave for it, or null when it landed. The message is already
+ *  presentable — the backend maps its own error there. */
+export interface BulkItemOutcome {
+  itemId: string;
+  error: string | null;
+}
+
+/** A batch board write's per-item results, in the order the request listed the
+ *  items. A batch PARTIALLY APPLIES — every item is attempted whatever the ones
+ *  before it did — so a caller rolls back the failures alone and leaves the rest
+ *  of its optimistic patch standing. An empty item list is refused by the backend
+ *  rather than answered with an empty list, so callers never send one. */
+export interface BulkItemOutcomes {
+  outcomes: BulkItemOutcome[];
+}
+
+/** One assignee on a board card — the login plus whatever avatar the forge gave
+ *  us. Deliberately narrower than `ForgeUserRef` (forge.ts): a board page carries
+ *  hundreds of these, and the card renders nothing else about a person. */
+export interface AssigneeRef {
+  login: string;
+  avatarUrl: string;
+}
+
+/** A DRAFT card's own content — the note that lives on this board and nowhere
+ *  else. Named apart from the union arm below because the draft EDIT command
+ *  answers with exactly these fields: the `kind` tag is the union's, not the
+ *  payload's. */
+export interface BoardDraftContent {
+  id: string;
+  title: string;
+  body: string;
+  assignees: AssigneeRef[];
+  /** When the draft was written, and when it last changed. ISO-8601 from the
+   *  forge, so a reader validates before formatting. */
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** What a board item IS. `draft` is a project-only note with no issue behind it,
+ *  and `redacted` is an item whose content the viewer may not see — a private
+ *  repo on a public board — which arrives with no fields at all rather than
+ *  being dropped, so the board's counts stay honest.
+ *
+ *  Every arm but `redacted` carries `createdAt`/`updatedAt` — the CONTENT's own
+ *  dates, which is a different claim from the membership's {@link BoardItem.addedAt}. */
+export type BoardItemContent =
+  | {
+      kind: "issue";
+      id: string;
+      number: number;
+      title: string;
+      state: string;
+      /** GitHub's issue state reason, or null when it carries none. COMPLETED /
+       *  NOT_PLANNED / DUPLICATE ride a CLOSED issue, but REOPENED rides an OPEN
+       *  one — so this is not a closed-only field, and a reader must not treat a
+       *  present reason as proof the issue is closed. */
+      stateReason: string | null;
+      repoNameWithOwner: string;
+      assignees: AssigneeRef[];
+      createdAt: string;
+      updatedAt: string;
+      /** Whether the viewer may set this issue's org issue fields — false when
+       *  GitHub named no verdict, so a reader gates on it as-is. */
+      viewerCanSetFields: boolean;
+    }
+  | {
+      kind: "pullRequest";
+      id: string;
+      number: number;
+      title: string;
+      state: string;
+      isDraft: boolean;
+      repoNameWithOwner: string;
+      assignees: AssigneeRef[];
+      createdAt: string;
+      updatedAt: string;
+    }
+  | ({ kind: "draft" } & BoardDraftContent)
+  | { kind: "redacted" };
+
+/** One card on a board: the membership's own id, whether the board has archived
+ *  it, what it holds, and its field values — the same per-item shape
+ *  {@link ItemProjectFieldValues} carries, which is what groups it into a
+ *  column. */
+export interface BoardItem {
+  itemId: string;
+  isArchived: boolean;
+  content: BoardItemContent;
+  fieldValues: ProjectFieldValue[];
+  /** When this item JOINED the board — the membership's own date, which for an
+   *  issue or pull request is nothing like the content's `createdAt`. ISO-8601
+   *  from the forge, so a reader validates before formatting. */
+  addedAt: string;
+}
+
+/** One page of a board's items, in the board's own POSITION order. `totalCount`
+ *  is the server's figure for THIS read's archived-state filter (measured: the
+ *  default read settles to live items only), so it can exceed what a partly
+ *  loaded board draws; `truncated` with `endCursor` is how the next page is
+ *  asked for. */
+export interface BoardItems {
+  items: BoardItem[];
+  totalCount: number;
+  truncated: boolean;
+  endCursor: string | null;
+}
+
+/** The board's own item order as a reposition answers with it: the project's
+ *  items in their NEW global order, capped at the first 100 with `truncated`
+ *  saying the rest weren't reached. The mutation's payload rather than a re-read
+ *  because GitHub answers item READS off replicas that lag their own writes by
+ *  seconds, where the payload is transactionally fresh. */
+export interface BoardOrder {
+  itemIds: string[];
+  truncated: boolean;
+}
+
+/** One issue or pull request the board could take, as the add-existing search
+ *  reports it. `id` is the CONTENT node id an add addresses — never a
+ *  {@link BoardItem}'s `itemId`, which only exists once the item is on a board.
+ *  `state`/`isDraft`/`stateReason` carry the same wire spellings
+ *  {@link BoardItemContent} does, so one presentation table serves both. */
+export interface BoardCandidate {
+  id: string;
+  kind: "issue" | "pr";
+  number: number;
+  title: string;
+  state: string;
+  isDraft: boolean;
+  stateReason: string | null;
+}
+
+/** One page of add-existing candidates. `truncated` reports that the search was
+ *  capped, the same claim {@link ProjectFieldDefs} and {@link ProjectViews} make
+ *  about their lists. */
+export interface BoardCandidates {
+  candidates: BoardCandidate[];
+  truncated: boolean;
+}
+
+/** What a converted draft became: the real issue's number, its web URL, and the
+ *  card as the board now holds it. The draft's card keeps its item id across the
+ *  conversion — only its content changes — so `item` is the board's own answer for
+ *  that same id, which is what lets the card flip without a re-read. */
+export interface ConvertedDraft {
+  number: number;
+  url: string;
+  item: BoardItem;
+}

@@ -1,0 +1,165 @@
+import { useQuery } from "@tanstack/react-query";
+import { useSelector } from "@tanstack/react-store";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { useState } from "react";
+import { PathText } from "@/components/path-text";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { withForm } from "@/lib/form";
+import { detectEditors } from "@/lib/git/api";
+import { isWindows, type Platform, platform } from "@/lib/hotkeys/binding";
+import { settingsFormOpts } from "./settings-form";
+import { useTranslation } from "@/lib/i18n";
+
+const CUSTOM = "__custom__";
+const NONE = "__none__";
+// The example path follows the platform's own convention for where programs live.
+const CUSTOM_PLACEHOLDERS: Record<Platform, string> = {
+  windows: "C:\\path\\to\\editor.exe",
+  mac: "/Applications/Visual Studio Code.app",
+  linux: "/usr/bin/code",
+};
+const CUSTOM_PLACEHOLDER = CUSTOM_PLACEHOLDERS[platform];
+
+export const EditorSection = withForm({
+  ...settingsFormOpts,
+  render: function EditorSectionRender({ form }) {
+    const { t } = useTranslation();
+    const detected = useQuery({
+      queryKey: ["detected-editors"],
+      queryFn: detectEditors,
+      staleTime: 5 * 60 * 1000,
+      // A local probe: react-query's default "online" mode would park it offline.
+      networkMode: "always",
+    });
+    // "Custom…" picked while a detected editor is still set: reveal the path
+    // input without changing the form values yet.
+    const [forceCustom, setForceCustom] = useState(false);
+
+    const externalEditor = useSelector(
+      form.store,
+      (s) => s.values.externalEditor,
+    );
+
+    const editors = detected.data ?? [];
+    const matched = editors.find((e) => e.path === externalEditor);
+    const selectValue = forceCustom
+      ? CUSTOM
+      : !externalEditor
+        ? NONE
+        : (matched?.path ?? CUSTOM);
+    const showCustom = selectValue === CUSTOM;
+
+    // Base UI's Select.Value renders the raw value unless given value→label items
+    const selectItems: Record<string, string> = {
+      [NONE]: t("editorSettings.none"),
+      [CUSTOM]: t("editorSettings.custom"),
+      ...Object.fromEntries(editors.map((e) => [e.path, e.name])),
+    };
+
+    function setEditor(path: string, name: string) {
+      form.setFieldValue("externalEditor", path);
+      form.setFieldValue("externalEditorName", name);
+    }
+
+    async function choose() {
+      const picked = await openDialog({
+        title: t("editorSettings.chooseProgram"),
+        // macOS editors are `.app` bundles and Linux ones are bare binaries;
+        // only Windows uses .exe/.cmd/.bat, so don't filter elsewhere.
+        filters: isWindows
+          ? [{ name: t("editorSettings.programs"), extensions: ["exe", "cmd", "bat"] }]
+          : undefined,
+      });
+      if (picked) setEditor(picked, programLabel(picked));
+    }
+
+    return (
+      <section className="space-y-4">
+        <div>
+          <h2 className="text-sm font-medium">{t("settings.panelEditor")}</h2>
+          <p className="text-xs text-muted-foreground">
+            {t("editorSettings.description")}
+          </p>
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="editor-select">{t("settings.editor")}</Label>
+          <Select
+            items={selectItems}
+            value={selectValue}
+            onValueChange={(value) => {
+              if (value === NONE) {
+                setForceCustom(false);
+                setEditor("", "");
+              } else if (value === CUSTOM) {
+                setForceCustom(true);
+              } else if (value) {
+                const editor = editors.find((e) => e.path === value);
+                if (editor) {
+                  setForceCustom(false);
+                  setEditor(editor.path, editor.name);
+                }
+              }
+            }}
+          >
+            <SelectTrigger id="editor-select" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={NONE}>{t("editorSettings.none")}</SelectItem>
+              {editors.map((editor) => (
+                <SelectItem key={editor.path} value={editor.path}>
+                  {editor.name}
+                </SelectItem>
+              ))}
+              <SelectItem value={CUSTOM}>{t("editorSettings.custom")}</SelectItem>
+            </SelectContent>
+          </Select>
+          {detected.isPending && (
+            <p className="text-xs text-muted-foreground">{t("editorSettings.detecting")}</p>
+          )}
+          {!showCustom && matched && (
+            <PathText
+              path={matched.path}
+              className="font-mono text-xs text-muted-foreground"
+            />
+          )}
+        </div>
+        {showCustom && (
+          <div className="space-y-2">
+            <Label htmlFor="external-editor">{t("settings.programPath")}</Label>
+            <div className="flex gap-2">
+              <Input
+                id="external-editor"
+                className="flex-1 font-mono"
+                placeholder={CUSTOM_PLACEHOLDER}
+                autoComplete="off"
+                value={externalEditor}
+                onChange={(e) =>
+                  setEditor(e.target.value, programLabel(e.target.value))
+                }
+              />
+              <Button type="button" variant="outline" onClick={choose}>
+                {t("editorSettings.choose")}
+              </Button>
+            </div>
+          </div>
+        )}
+      </section>
+    );
+  },
+});
+
+/** "C:\\apps\\Code.exe" or "/Applications/Cursor.app" -> "Code"/"Cursor". */
+function programLabel(program: string): string {
+  const base = program.replaceAll("\\", "/").split("/").pop() ?? program;
+  return base.replace(/\.(exe|cmd|bat|app)$/i, "") || "Custom";
+}

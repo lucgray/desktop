@@ -1,0 +1,624 @@
+import { Popover } from "@base-ui/react/popover";
+import { KanbanIcon } from "@phosphor-icons/react";
+import { type ReactNode, useEffect, useEffectEvent, useState } from "react";
+import { toast } from "sonner";
+import { CopyIconButton } from "@/components/CopyIconButton";
+import { DisabledReasonButton } from "@/components/disabled-reason-button";
+import { MetaValueCell } from "@/components/meta-field-cells";
+import { usePanelPortalContainer } from "@/components/panel-portal";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
+import { presentError } from "@/lib/error-summary";
+import {
+  isReconnectHostSafe,
+  reconnectHostArg,
+  useActiveGhHost,
+} from "@/lib/git/host";
+import {
+  useAvailableProjects,
+  useEditItemProjects,
+  useGhScopes,
+  useItemProjects,
+} from "@/lib/git/queries";
+import type {
+  GhScopes,
+  ProjectItemRemove,
+  ProjectV2Ref,
+  RemoteLens,
+} from "@/lib/git/types";
+import { useHotkeyAction } from "@/lib/hotkeys/hotkeys";
+import { useRovingRows } from "@/lib/list-keyboard-nav";
+import { useUiStore } from "@/lib/stores/ui";
+import { cn } from "@/lib/utils";
+import { useTranslation } from "@/lib/i18n";
+
+/** The two holds every Projects surface states the same way — exported beside
+ *  {@link projectScopeReadOnly} for the same reason that predicate is: a claim
+ *  about the sign-in, or about one board, must not be worded differently depending
+ *  on which picker the user happens to be looking at. */
+export const NO_ACCESS_REASON = "You don't have write access to this project";
+export const READ_ONLY_SCOPE_REASON =
+  "Your GitHub sign-in can read projects but not change them (needs the project scope)";
+
+function sameIds(a: Set<string>, b: Set<string>): boolean {
+  return a.size === b.size && [...a].every((id) => b.has(id));
+}
+
+/** Whether the signed-in GitHub token provably can't read Projects, which gates
+ *  every Projects read. Only a classic token has readable scopes; a
+ *  fine-grained/App token reports none, so an absent `project` there is
+ *  unknowable, not missing — those fire the reads and let the backend's own scope
+ *  hint speak if it really is absent. Shared so no Projects surface can drift into
+ *  firing reads another one withholds. */
+export function projectScopeMissing(scopes: GhScopes | undefined): boolean {
+  return (
+    scopes?.classic === true &&
+    !scopes.scopes.includes("project") &&
+    !scopes.scopes.includes("read:project")
+  );
+}
+
+/** Read-only classic token: the reads work, every write 403s. Hold the controls
+ *  rather than letting each edit round-trip to a rollback + toast. Shared so no
+ *  Projects surface can offer a write another one holds. */
+export function projectScopeReadOnly(scopes: GhScopes | undefined): boolean {
+  return (
+    scopes?.classic === true &&
+    scopes.scopes.includes("read:project") &&
+    !scopes.scopes.includes("project")
+  );
+}
+
+/** A closed board still holds items, so its rows and chips stay — the state rides
+ *  the label as words, never as a colour. */
+function projectLabel(project: ProjectV2Ref, closedLabel: string): string {
+  return project.closed ? `${project.title} · ${closedLabel}` : project.title;
+}
+
+/**
+ * GitHub Projects (v2) membership editor + chips, shared by the issue and PR
+ * views. Unlike the labels picker, memberships don't ride the parent entity, so
+ * this owns both reads and the write. Edits are drafted while the popover is open
+ * and committed as one batched mutation on close.
+ */
+export function ProjectsPopover({
+  repoPath,
+  enabled,
+  kind,
+  number,
+  contentId,
+  lens,
+  disabledReason,
+  cells = false,
+  paletteEnabled = false,
+}: {
+  repoPath: string;
+  /** Gates the reads. Both call sites pass `true`; the real gate is upstream, and
+   *  it is deliberately forgiving — it never mounts this on a KNOWN GitLab or
+   *  Bitbucket repo, but a not-yet-identified one can mount it for one contained
+   *  read rather than withholding the picker while detection settles. */
+  enabled: boolean;
+  /** Which surface this item is — the backend addresses issues and PRs apart. */
+  kind: "issue" | "pr";
+  number: number;
+  /** The issue/PR GraphQL node id, which is what an add addresses. */
+  contentId: string;
+  /** The origin|upstream lens the parent PR/issue surface resolved. */
+  lens: RemoteLens;
+  /** Set when this picker can't be edited right now — the viewer lacks the access
+   *  its action needs, or the surface is still loading the entity. The trigger
+   *  stays visible but disabled and this text explains why. Absent = editable. */
+  disabledReason?: string;
+  /** Emit the trigger and the chips as two SIBLING elements rather than one
+   *  inline row, so a caller's label/value grid can place each in its own
+   *  column. Default renders the inline row. */
+  cells?: boolean;
+  /** Whether the host surface owns the current selection, so this instance may
+   *  answer the palette's "Edit projects…". Off by default: a mount with no
+   *  selection of its own (a create dialog) registers nothing. */
+  paletteEnabled?: boolean;
+}) {
+  const { t } = useTranslation();
+  const host = useActiveGhHost();
+  const scopes = useGhScopes(host);
+  const openReconnect = useUiStore((s) => s.openReconnect);
+  const classicMissing = projectScopeMissing(scopes.data);
+  const readOnlyScope = projectScopeReadOnly(scopes.data);
+  const canRead = enabled && !classicMissing;
+
+  const [open, setOpen] = useState(false);
+  // The catalog is an owner-wide query; it waits for a first open rather than
+  // firing for every issue the user scrolls through.
+  const [hasOpened, setHasOpened] = useState(false);
+  const [draft, setDraft] = useState<Set<string>>(new Set());
+  // The memberships AS SEEN at open (or at the first settle after it — opening
+  // over an ERRORED read is allowed, and that snapshot stays empty until Retry
+  // lands). The close diffs draft-vs-SEEDED, never draft-vs-live, so a
+  // membership landing mid-open is in neither set and left alone; live items
+  // serve only as the item-id lookup for removes. Reseeding on settle can't
+  // lose a toggle: every row is locked for the whole pre-settle window.
+  const [seeded, setSeeded] = useState<Set<string>>(new Set());
+  const [seededSettled, setSeededSettled] = useState(false);
+  const portalContainer = usePanelPortalContainer();
+
+  const memberships = useItemProjects(repoPath, kind, number, canRead, lens);
+  const available = useAvailableProjects(repoPath, canRead && hasOpened, lens);
+  const editProjects = useEditItemProjects(repoPath, kind, number, lens);
+  // Gated on `canRead` so a disabled query — the missing-scope path, whose whole
+  // point is the popup's Reconnect button — can't hold the trigger shut forever.
+  // An ERRORED read likewise mustn't hold it: the popup owns the Retry.
+  const loadingMemberships = canRead && memberships.isPending;
+  // Ranked: the caller's reason outranks a write the viewer started, which
+  // outranks the first load.
+  const heldReason = (() => {
+    switch (true) {
+      case disabledReason !== undefined:
+        return disabledReason;
+      // No second edit may be drafted while one is in flight: the cache still
+      // holds `pending:` placeholders, and unlinking one has no item id to
+      // address. The mutation's `onSettled` returns its invalidate promise, so
+      // this hold spans the settle REFETCH too — the placeholders are always
+      // gone by the time it frees.
+      case editProjects.isPending:
+        return t("projectUi.saving");
+      case loadingMemberships:
+        return t("projectUi.loading");
+      default:
+        return undefined;
+    }
+  })();
+
+  const items = memberships.data?.items ?? [];
+  // Rows = the open catalog plus every membership, so a board beyond the server's
+  // cap — or a closed one — is still there to be unlinked. OPEN catalog entries win
+  // the dedup, that list being the authority on `viewerCanUpdate`; a closed board is
+  // filtered out of the catalog first, so its membership copy represents it.
+  const byId = new Map<string, ProjectV2Ref>();
+  for (const project of available.data?.projects ?? []) {
+    if (!project.closed) byId.set(project.id, project);
+  }
+  for (const item of items) {
+    if (!byId.has(item.project.id)) byId.set(item.project.id, item.project);
+  }
+  const rows = [...byId.values()];
+  const readError = memberships.error ?? available.error;
+  // Locked rows are skipped by the arrow keys rather than made focus black holes:
+  // a natively-disabled checkbox can't take focus. An unsettled memberships read
+  // outranks the scope: the catalog and the memberships are separate gh calls, so
+  // rows can render live while the close has no trustworthy set to diff against.
+  const rowLockedReason = (() => {
+    switch (true) {
+      // `!seededSettled` covers the one paint between the read settling and the
+      // reseed effect running — rows must not unlock over the stale snapshot.
+      case !memberships.isSuccess || !seededSettled:
+        return t("projectUi.unsettled");
+      case readOnlyScope:
+        return t("projectUi.readOnly");
+      default:
+        return undefined;
+    }
+  })();
+  const navRows = rowLockedReason
+    ? []
+    : rows.filter((project) => project.viewerCanUpdate);
+  // No `tabAdvances`: Tab must keep reaching this popup's other focusable
+  // elements, the Reconnect and Retry buttons.
+  const nav = useRovingRows({
+    items: navRows,
+    rowKey: (project) => project.id,
+  });
+  // The apply promise is only true while the rows can actually be toggled: a
+  // locked list discards everything on close, and both lock states already say
+  // why — and how to recover — above the rows. Truncation is a fact about the
+  // catalog, so it stands either way.
+  const showApplyNote = rows.length > 0 && rowLockedReason === undefined;
+  const showTruncated = available.data?.truncated === true;
+  // A separate claim from the catalog's: the CATALOG cap hides boards the item
+  // could join, this one hides boards it is already on — a hidden membership shows
+  // UNCHECKED when its board is in the catalog (the draft reseeds from the capped
+  // memberships alone), and has no row at all only when it is outside it too.
+  const showMembershipsTruncated = memberships.data?.truncated === true;
+  // Both scope gaps ask for the same scope, so both remedy blocks fire the same
+  // reconnect.
+  const reconnectForProjectScope = () =>
+    openReconnect({
+      provider: "github",
+      host,
+      mode: "refresh",
+      scopes: ["project"],
+    });
+
+  // Reads the settled memberships at fire time, so the effect below arms on the
+  // settle edge alone rather than re-arming per render.
+  const reseedFromSettled = useEffectEvent(() => {
+    const applied = new Set(items.map((item) => item.project.id));
+    setSeeded(applied);
+    setDraft(new Set(applied));
+    setSeededSettled(true);
+  });
+  useEffect(() => {
+    if (open && !seededSettled && memberships.isSuccess) reseedFromSettled();
+  }, [open, seededSettled, memberships.isSuccess]);
+
+  function toggleDraft(id: string, on: boolean) {
+    setDraft((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }
+
+  function handleOpenChange(o: boolean) {
+    if (o) {
+      setHasOpened(true);
+      const applied = new Set(items.map((item) => item.project.id));
+      setSeeded(applied);
+      setDraft(new Set(applied));
+      setSeededSettled(memberships.isSuccess);
+      setOpen(true);
+      return;
+    }
+    setOpen(false);
+    // An unsettled read is not an empty membership set, and an untrusted set must
+    // never mint removes. The rows are locked in this state, but a background
+    // refetch can fail under a draft made while it was still good — say so, since
+    // the checkboxes were showing that draft right up to the close.
+    if (!memberships.isSuccess) {
+      if (!sameIds(draft, seeded)) toast.info(t("projectUi.discarded"));
+      return;
+    }
+    const adds = [...draft]
+      .filter((id) => !seeded.has(id))
+      .map((id) => byId.get(id))
+      .filter((project): project is ProjectV2Ref => !!project);
+    const itemIdByProject = new Map(
+      items.map((item) => [item.project.id, item.itemId]),
+    );
+    const removes: ProjectItemRemove[] = [];
+    for (const id of seeded) {
+      if (draft.has(id)) continue;
+      const itemId = itemIdByProject.get(id);
+      // Absent = unlinked elsewhere since this opened; `pending:` = an add whose
+      // real item id doesn't exist yet, so the unlink the user drafted would be
+      // dropped right here without a word. The trigger's in-flight hold now spans
+      // the settle refetch, which puts a `pending:` id out of reach in practice.
+      if (itemId === undefined || itemId.startsWith("pending:")) continue;
+      removes.push({ projectId: id, itemId });
+    }
+    if (adds.length > 0 || removes.length > 0) {
+      editProjects.mutate({ contentId, adds, removes });
+    }
+  }
+
+  // Registered HERE, not in the parent views: the action's enabled state IS the
+  // trigger's hold, and only this component derives that. A parent's own gate
+  // can't see `heldReason`, so a palette row would outlive the disabled trigger.
+  useHotkeyAction(
+    "edit-projects",
+    () => {
+      if (open || heldReason !== undefined) return;
+      handleOpenChange(true);
+    },
+    paletteEnabled && heldReason === undefined,
+  );
+
+  // Trigger first, so it never shifts as chips come and go.
+  const trigger = (
+    <Popover.Root open={open} onOpenChange={handleOpenChange}>
+      <Popover.Trigger
+        render={
+          <DisabledReasonButton
+            variant="ghost"
+            size="xs"
+            aria-label={t("projectUi.editProjects")}
+            disabled={!!heldReason}
+            reason={heldReason}
+          />
+        }
+      >
+        {/* size-3 explicitly: the Button's own icon rule skips a sized
+            element, and a 16px swap would widen the label column mid-write. */}
+        {editProjects.isPending ? (
+          <Spinner className="size-3" data-icon="inline-start" />
+        ) : (
+          <KanbanIcon data-icon="inline-start" />
+        )}
+        {t("projectUi.projects")}
+      </Popover.Trigger>
+      <Popover.Portal container={portalContainer}>
+        <Popover.Positioner
+          align="start"
+          sideOffset={4}
+          className="isolate z-50"
+        >
+          <Popover.Popup className="w-80 rounded-none bg-popover p-2 text-popover-foreground shadow-md ring-1 ring-foreground/10">
+            {/* Title names the popup via aria-labelledby — a bare caption leaves the
+                dialog unnamed; render keeps the <p> off Title's default <h2>. */}
+            <Popover.Title
+              render={<p />}
+              className="px-1 pb-1.5 text-xs font-medium"
+            >
+              {t("projectUi.projects")}
+            </Popover.Title>
+            {classicMissing ? (
+              <ScopeGapBlock host={host} onReconnect={reconnectForProjectScope}>
+                {t("projectUi.needsScope")}
+              </ScopeGapBlock>
+            ) : (
+              <>
+                {readError !== null && (
+                  <div className="px-1 py-1 text-xs">
+                    <p className="text-muted-foreground">
+                      {presentError(readError).summary}
+                    </p>
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      className="mt-1.5"
+                      onClick={() => {
+                        memberships.refetch();
+                        available.refetch();
+                      }}
+                    >
+                      {t("projectUi.retry")}
+                    </Button>
+                  </div>
+                )}
+                {readOnlyScope && (
+                  <div className="mb-1 border-b pb-1">
+                    <ScopeGapBlock
+                      host={host}
+                      onReconnect={reconnectForProjectScope}
+                    >
+                      {t("projectUi.changingNeedsScope")}
+                    </ScopeGapBlock>
+                  </div>
+                )}
+                {/* Not gated on an empty list: membership rows render from
+                      their own query, so the catalog can still be in flight
+                      under a list that already looks complete. `canRead` keeps a
+                      DISABLED query — permanently "pending" — from reading as one. */}
+                {canRead && available.isPending && (
+                  <p className="px-1 py-1 text-xs text-muted-foreground">
+                    {t("projectUi.loading")}
+                  </p>
+                )}
+                {rows.length === 0 &&
+                  readError === null &&
+                  !(canRead && available.isPending) && (
+                    <p className="px-1 py-1 text-xs text-muted-foreground">
+                      {t("projectUi.noOpen")}
+                    </p>
+                  )}
+                {rows.length > 0 && (
+                  // py-2 contains the Checkbox touch-target's 8px vertical bleed
+                  // (after:-inset-y-2) — without it the pseudo adds scrollable
+                  // overflow and Windows draws a scrollbar for even one row. The
+                  // rail renders only with rows, so that padding never paints a
+                  // blank band under the loading and empty notices.
+                  <div
+                    className="max-h-64 overflow-y-auto py-2"
+                    onKeyDown={nav.onRowKeyDown}
+                  >
+                    {rows.map((project) => {
+                      const row = nav.rowProps(project);
+                      return (
+                        <ProjectRow
+                          key={project.id}
+                          project={project}
+                          checked={draft.has(project.id)}
+                          active={nav.isActive(project)}
+                          rowKey={row["data-row"]}
+                          rovingTab={row.tabIndex}
+                          lockedReason={rowLockedReason}
+                          noAccessReason={t("projectUi.noWriteAccess")}
+                          onToggle={(on) => toggleDraft(project.id, on)}
+                          onFocus={row.onFocus}
+                        />
+                      );
+                    })}
+                  </div>
+                )}
+                {/* The truncation note stands alone: a 50-cap catalog of only
+                      CLOSED boards renders zero rows, where a bare "no projects"
+                      would be a lie. */}
+                {(showApplyNote ||
+                  showTruncated ||
+                  showMembershipsTruncated) && (
+                  <div className="mt-1 border-t px-1 pt-1.5 text-[11px] text-muted-foreground">
+                    {showApplyNote && <p>{t("projectUi.changesOnClose")}</p>}
+                    {showTruncated && <p>{t("projectUi.someHidden")}</p>}
+                    {showMembershipsTruncated && (
+                      <p>{t("projectUi.someMembershipsHidden")}</p>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </Popover.Popup>
+        </Popover.Positioner>
+      </Popover.Portal>
+    </Popover.Root>
+  );
+  const chips = items.map((item) => (
+    <span
+      key={item.itemId}
+      className="inline-flex max-w-full items-center border px-1.5 py-0.5 text-[11px] text-muted-foreground"
+      title={projectLabel(item.project, t("projectUi.closed"))}
+    >
+      <span className="truncate">{projectLabel(item.project, t("projectUi.closed"))}</span>
+    </span>
+  ));
+
+  if (cells) {
+    // Keyed on the data, not the query status: a cached list outlives a failed
+    // background refetch (the popup owns the Retry), and the dash is a
+    // resolved-none claim, so only a settled empty read may show it.
+    const value = (() => {
+      switch (true) {
+        case items.length > 0:
+          return chips;
+        case loadingMemberships:
+          return <Skeleton className="h-5 w-24" aria-hidden />;
+        // A settled empty read never renders this: `empty` on the cell takes it.
+        default:
+          return (
+            <span className="text-[11px] text-muted-foreground">
+              {t("projectUi.unavailable")}
+            </span>
+          );
+      }
+    })();
+    return (
+      <>
+        {trigger}
+        <MetaValueCell
+          label={t("projectUi.projects")}
+          empty={memberships.isSuccess && items.length === 0}
+          busy={loadingMemberships}
+        >
+          {value}
+        </MetaValueCell>
+      </>
+    );
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {trigger}
+      {chips}
+    </div>
+  );
+}
+
+/** One board's checkbox row. A board the viewer can't change is held rather than
+ *  hidden: the reason hovers on the row and is read out from the sr-only node,
+ *  since a natively-disabled control announces neither. `lockedReason` holds EVERY
+ *  row — an unsettled memberships read, or a read-only token — and outranks the
+ *  per-board `viewerCanUpdate` one. */
+function ProjectRow({
+  project,
+  checked,
+  active,
+  rowKey,
+  rovingTab,
+  lockedReason,
+  noAccessReason,
+  onToggle,
+  onFocus,
+}: {
+  project: ProjectV2Ref;
+  checked: boolean;
+  active: boolean;
+  /** The row's `data-row` key, as the nav hook spells it — the key it queries by. */
+  rowKey: string;
+  /** Roving tabindex: one tab stop for the whole list, on the active row. */
+  rovingTab: number;
+  lockedReason?: string;
+  noAccessReason: string;
+  onToggle: (on: boolean) => void;
+  onFocus: () => void;
+}) {
+  const { t } = useTranslation();
+  const label = projectLabel(project, t("projectUi.closed"));
+  const held = (() => {
+    switch (true) {
+      case lockedReason !== undefined:
+        return lockedReason;
+      case !project.viewerCanUpdate:
+        return noAccessReason;
+      default:
+        return undefined;
+    }
+  })();
+  if (held !== undefined) {
+    return (
+      <div
+        aria-disabled
+        title={held}
+        className="flex cursor-not-allowed items-center gap-2 px-1 py-1.5 text-xs opacity-50"
+      >
+        <Checkbox checked={checked} disabled />
+        <span className="min-w-0 flex-1 truncate">{label}</span>
+        <span className="sr-only">{held}</span>
+      </div>
+    );
+  }
+  return (
+    <label
+      className={cn(
+        "flex cursor-pointer items-center gap-2 px-1 py-1.5 text-xs hover:bg-muted/60",
+        active && "bg-muted/60",
+      )}
+    >
+      <Checkbox
+        data-row={rowKey}
+        tabIndex={rovingTab}
+        checked={checked}
+        onCheckedChange={(v) => onToggle(v === true)}
+        onFocus={onFocus}
+      />
+      <span className="min-w-0 flex-1 truncate" title={label}>
+        {label}
+      </span>
+    </label>
+  );
+}
+
+/** A scope gap this picker can't work around, plus its remedy — the in-app
+ *  reconnect and the equivalent `gh` command for anyone who'd rather run it.
+ *  Two arms share it: a classic token with NEITHER project scope (the reads can't
+ *  be attempted at all) and one with only `read:project` (reads work, writes 403).
+ *  Both need the same `project` scope, so both get the same remedy; `children` is
+ *  the one sentence that differs. */
+export function ScopeGapBlock({
+  host,
+  onReconnect,
+  children,
+}: {
+  host: string;
+  onReconnect: () => void;
+  children: ReactNode;
+}) {
+  const { t } = useTranslation();
+  // A host outside the reconnect grammar never reaches a copyable command string
+  // (shell-syntax injection via a crafted remote) — only the command block is
+  // suppressed: the explanation and the button stay.
+  const hostSafe = isReconnectHostSafe(host);
+  const cmd = `gh auth refresh --hostname ${reconnectHostArg(host)} -s project`;
+  return (
+    <div className="px-1 py-1 text-xs">
+      <p className="text-muted-foreground">{children}</p>
+      <Button
+        variant="outline"
+        size="xs"
+        className="mt-2"
+        onClick={onReconnect}
+      >
+        {t("projectUi.reconnectGithub")}
+      </Button>
+      {hostSafe && (
+        <>
+          <p className="mt-2 text-muted-foreground">
+            {t("projectUi.runThenReopen")}
+          </p>
+          {/* Wraps rather than truncates: an Enterprise hostname outruns any popup
+              width, and a half-shown command reads as the whole one. */}
+          <div className="mt-1.5 flex items-start gap-2">
+            <code className="min-w-0 flex-1 break-all rounded bg-muted px-1.5 py-1 font-mono text-[11px]">
+              {cmd}
+            </code>
+            <CopyIconButton
+              text={cmd}
+              label={t("projectUi.copyCommand")}
+              toast={t("projectUi.commandCopied")}
+            />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

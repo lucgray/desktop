@@ -1,0 +1,58 @@
+name: changelog
+
+# Requires a changelog.d/ fragment when a PR changes code. "fragment" is a
+# required status check on master (repo ruleset), so this gate blocks the merge.
+# Escape hatches: the `no-changelog` label (exempts only the fragment
+# requirement — the format check always runs), or `skip-changelog` in the title.
+
+on:
+  pull_request:
+    # labeled/unlabeled/edited: no-changelog toggles and skip-changelog title
+    # edits must re-run this now-required check; default types cover neither.
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
+
+# One in-flight run per ref; label and title events can fire several runs at
+# one SHA, and only the newest should decide a required check.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fragment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Validate the FORMAT of every pending fragment (finished "- " bullet,
+      # 2-space wrapped-line indent, consumable filename), not just presence —
+      # a malformed fragment otherwise only surfaces when `pnpm release` trips
+      # over it at release time. Uses only node built-ins, no install needed.
+      - name: Validate changelog.d fragment format
+        run: node scripts/changelog-draft.mjs --check
+      # Step-level on purpose: hoisting this to the job would skip the format
+      # check above, letting a malformed fragment merge under the label.
+      - name: Require a changelog.d/ fragment for code changes
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-changelog') }}
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          changed=$(git diff --name-only "$BASE...$HEAD")
+          echo "Changed files (includes deletions):"
+          printf '%s\n' "$changed"
+          # The fragment must EXIST on the head commit: --diff-filter=d drops
+          # deletions, so a PR that only removes a fragment cannot satisfy the gate.
+          present=$(git diff --name-only --diff-filter=d "$BASE...$HEAD")
+          echo "Files present on the head commit (what the fragment check reads):"
+          printf '%s\n' "$present"
+          printf '%s\n' "$changed" > "$RUNNER_TEMP/changelog-changed.txt"
+          printf '%s\n' "$present" > "$RUNNER_TEMP/changelog-present.txt"
+          node scripts/check-changelog-fragment.mjs \
+            "$RUNNER_TEMP/changelog-changed.txt" "$RUNNER_TEMP/changelog-present.txt" "$TITLE"
